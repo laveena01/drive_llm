@@ -2,12 +2,12 @@
 
 """
 PART-1 updates:
-- Stage-2 initialized from Stage-1 checkpoint (dependency)
-- Remove min_dist leakage from Stage-2 prompt construction
+- Stage-2 initialized from Stage-1 weights (dependency)
+- Remove min_dist leakage from Stage-2 prompt construction (and oracle eval)
 - Fix 5-line format metric by enforcing 5-line output with a robust post-processor
-- Add paper-valid control metrics:
+- Add control metrics:
   - accel_mae, brake_mae, steering_accuracy
-- Keep your existing metrics: action_accuracy buckets, BLEU1, ROUGE-L, format compliance
+- Keep existing metrics: action_accuracy buckets, BLEU1, ROUGE-L, format compliance
 """
 
 import os
@@ -63,6 +63,19 @@ def _build_stage2_prompt_from_caption(caption: str) -> str:
     qa_question = "How should the car drive in this situation and why?"
     prompt = caption + f"\n\nQuestion: {qa_question}"
     return _ensure_paper_format(prompt)
+
+def _strip_min_dist(text: str) -> str:
+    """
+    Removes lines like:
+      'Minimum object distance: 8.1 m'
+    from oracle prompts to avoid leaking the label proxy.
+    """
+    return re.sub(
+        r"\n?Minimum object distance:\s*[0-9.]+\s*m\s*\n?",
+        "\n",
+        text,
+        flags=re.IGNORECASE,
+    )
 
 
 # ---------------------------
@@ -163,20 +176,24 @@ def _extract_reason(text: str) -> Optional[str]:
 
 def enforce_5_lines(text: str) -> Tuple[str, int]:
     """
-    Return (fixed_text, ok)
-    ok=1 if we could parse accel+brake+steer+reason from the model output, else 0.
+    Return (fixed_text, parse_ok)
+    parse_ok=1 if we could parse accel+brake+steer+reason from RAW model output, else 0.
     """
     accel = _extract_accel_percent(text)
     brake = _extract_brake_percent(text)
     steer = _extract_steer(text)
     reason = _extract_reason(text)
 
-    ok = 1 if (accel is not None and brake is not None and steer is not None and reason is not None) else 0
+    parse_ok = 1 if (accel is not None and brake is not None and steer is not None and reason is not None) else 0
 
-    if accel is None: accel = 0
-    if brake is None: brake = 0
-    if steer not in ("left", "straight", "right"): steer = "straight"
-    if not reason: reason = "N/A"
+    if accel is None:
+        accel = 0
+    if brake is None:
+        brake = 0
+    if steer not in ("left", "straight", "right"):
+        steer = "straight"
+    if not reason:
+        reason = "N/A"
 
     fixed = (
         "Here are my actions:\n"
@@ -185,13 +202,12 @@ def enforce_5_lines(text: str) -> Tuple[str, int]:
         f"- Steering: {steer}\n"
         f"Reason: {reason}\n"
     )
-    return fixed, ok
+    return fixed, parse_ok
 
 def _format_compliance_5line(text: str) -> int:
     if not text:
         return 0
     lines = [ln.rstrip("\n") for ln in (text or "").splitlines()]
-    # keep empty line filtering consistent with your earlier logic
     lines = [ln.strip() for ln in lines if ln.strip()]
     if len(lines) != 5:
         return 0
@@ -331,11 +347,12 @@ def train_stage1(captioning_path: str):
 
     print("[STAGE 1] Starting training...")
     trainer.train()
+
+    # Ensure stage1 dir is always loadable later
     trainer.save_model(STAGE1_OUTPUT_DIR)
     tokenizer.save_pretrained(STAGE1_OUTPUT_DIR)
 
     print("[STAGE 1] Training finished. Running evaluation...")
-
     eval_metrics = trainer.evaluate()
     print("\n[STAGE 1] Eval metrics:", eval_metrics)
 
@@ -380,19 +397,15 @@ def train_stage1(captioning_path: str):
 def train_stage2(model_stage1, tokenizer, qa_path: str):
     """
     PART-1:
-    - Stage-2 model initialized from Stage-1 checkpoint => dependency
-    - Stage-2 prompts do NOT include min_dist
+    - Stage-2 model initialized from Stage-1 weights => dependency
+    - Stage-2 prompts do NOT include min_dist (and oracle eval strips it)
     """
     print("\n" + "=" * 80)
     print("[STAGE 2] Driving QA finetuning started.")
     print(f"[STAGE 2] Loading QA data from: {qa_path}")
 
-    print(f"[STAGE 2] Loading Stage-2 model from Stage-1 checkpoint: {STAGE1_OUTPUT_DIR}")
-    # model_stage2 = AutoModelForSeq2SeqLM.from_pretrained(STAGE1_OUTPUT_DIR).to(model_stage1.device)
-
-
-    # GOOD: exact Stage-1 weights, no filesystem issues
-    model_stage2 = copy.deepcopy(model_stage1)
+    # Depend on Stage-1 weights
+    model_stage2 = copy.deepcopy(model_stage1).to(model_stage1.device)
     model_stage2.train()
 
     with open(qa_path, "r") as f:
@@ -443,8 +456,13 @@ def train_stage2(model_stage1, tokenizer, qa_path: str):
 
     print("[STAGE 2] Starting training...")
     trainer.train()
-    print("[STAGE 2] Training finished. Running evaluation (loss only)...")
 
+    # Ensure stage2 root is always loadable for inference
+    trainer.save_model(STAGE2_OUTPUT_DIR)
+    tokenizer.save_pretrained(STAGE2_OUTPUT_DIR)
+    print(f"[STAGE 2] Saved model+tokenizer to {STAGE2_OUTPUT_DIR}")
+
+    print("[STAGE 2] Training finished. Running evaluation (loss only)...")
     raw_eval = trainer.evaluate()
     print("\n[STAGE 2] Raw eval output:", raw_eval)
 
@@ -471,11 +489,14 @@ def train_stage2(model_stage1, tokenizer, qa_path: str):
         bleu_sum = 0.0
         rouge_sum = 0.0
 
-        fmt_sum = 0.0          # 5-line template compliance on FIXED output
-        parse_ok_sum = 0.0     # whether we could parse all fields from RAW output
+        fmt_sum = 0.0
+        parse_ok_sum = 0.0
 
         accel_mae_sum = 0.0
         brake_mae_sum = 0.0
+        accel_cnt = 0
+        brake_cnt = 0
+
         steer_correct = 0
         steer_total = 0
 
@@ -487,20 +508,19 @@ def train_stage2(model_stage1, tokenizer, qa_path: str):
             gt_text = sample["target"]
 
             if mode == "oracle_caption":
-                stage2_prompt = _ensure_paper_format(raw_input_text)
+                # strip min_dist to avoid leakage
+                stage2_prompt = _ensure_paper_format(_strip_min_dist(raw_input_text))
                 caption_used = None
             else:
                 vec_str = sample.get("vec_str", "")
                 s1_prompt = _build_stage1_prompt(vec_str)
                 caption_pred = _gen_text(model_stage1, s1_prompt, max_new_tokens=160, no_repeat_ngram_size=4)
                 caption_used = caption_pred
-
                 stage2_prompt = _build_stage2_prompt_from_caption(caption_pred)
 
             pred_raw = _gen_text(model_stage2, stage2_prompt, max_new_tokens=90, no_repeat_ngram_size=3)
             pred_fixed, parse_ok = enforce_5_lines(pred_raw)
 
-            # bucket metric (use FIXED so extraction always consistent)
             gt_action = _map_text_to_action_label(gt_text)
             pred_action = _map_text_to_action_label(pred_fixed)
 
@@ -509,7 +529,6 @@ def train_stage2(model_stage1, tokenizer, qa_path: str):
                 if gt_action == pred_action:
                     correct += 1
 
-            # text overlap: compare fixed output to gt (stable)
             bleu_sum += bleu1(pred_fixed, gt_text)
             rouge_sum += rouge_l_f1(pred_fixed, gt_text)
 
@@ -527,8 +546,10 @@ def train_stage2(model_stage1, tokenizer, qa_path: str):
 
             if gt_acc is not None and pr_acc is not None:
                 accel_mae_sum += abs(pr_acc - gt_acc)
+                accel_cnt += 1
             if gt_brk is not None and pr_brk is not None:
                 brake_mae_sum += abs(pr_brk - gt_brk)
+                brake_cnt += 1
 
             if gt_str is not None and pr_str is not None:
                 steer_total += 1
@@ -556,8 +577,8 @@ def train_stage2(model_stage1, tokenizer, qa_path: str):
             "rougeL_f1": float(rouge_sum / max(1, n)),
             "format_compliance": float(fmt_sum / max(1, n)),
             "parse_ok_rate": float(parse_ok_sum / max(1, n)),
-            "accel_mae": float(accel_mae_sum / max(1, n)),
-            "brake_mae": float(brake_mae_sum / max(1, n)),
+            "accel_mae": float(accel_mae_sum / max(1, accel_cnt)),
+            "brake_mae": float(brake_mae_sum / max(1, brake_cnt)),
             "steering_accuracy": float(steer_correct / max(1, steer_total)) if steer_total > 0 else 0.0,
             "n_samples": int(n),
             "n_action_samples": int(total),
