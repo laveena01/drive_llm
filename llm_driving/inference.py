@@ -8,10 +8,6 @@ from typing import Dict, List, Optional, Tuple
 from datasets import Dataset
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 
-from .config import (
-    QA_DATA_PATH,
-    STAGE2_OUTPUT_DIR,
-)
 
 PAPER_FORMAT_INSTRUCTION = (
     "\n\nYou are an AI Driver.\n"
@@ -122,21 +118,72 @@ def _gen(model, tokenizer, prompt: str, max_len: int = 192, max_new: int = 120) 
     )
     return tokenizer.decode(pred_ids[0], skip_special_tokens=True)
 
+def _has_hf_files(dir_path: str) -> bool:
+    # minimal "loadable" check
+    return (
+        os.path.isdir(dir_path)
+        and (
+            os.path.exists(os.path.join(dir_path, "config.json"))
+            or os.path.exists(os.path.join(dir_path, "adapter_config.json"))
+        )
+    )
+
+def _resolve_stage2_model_dir(run_dir_stage2: str) -> str:
+    """
+    Prefer:
+      1) run_dir_stage2/  (if it contains config.json)
+      2) latest checkpoint in run_dir_stage2/checkpoint-*/ (if that contains config.json)
+    """
+    run_dir_stage2 = run_dir_stage2.rstrip("/")
+
+    if _has_hf_files(run_dir_stage2) and os.path.exists(os.path.join(run_dir_stage2, "config.json")):
+        return run_dir_stage2
+
+    # fallback: latest checkpoint-*
+    if os.path.isdir(run_dir_stage2):
+        ckpts = []
+        for name in os.listdir(run_dir_stage2):
+            if name.startswith("checkpoint-"):
+                ckpt_dir = os.path.join(run_dir_stage2, name)
+                if os.path.exists(os.path.join(ckpt_dir, "config.json")):
+                    # parse global step
+                    try:
+                        step = int(name.split("-", 1)[1])
+                    except Exception:
+                        step = -1
+                    ckpts.append((step, ckpt_dir))
+        if ckpts:
+            ckpts.sort(key=lambda x: x[0])
+            return ckpts[-1][1]
+
+    # if we get here, path either doesn't exist or isn't a HF model folder
+    raise FileNotFoundError(
+        f"[INF] Could not find a loadable HF model at: {run_dir_stage2}\n"
+        f"Expected config.json in stage2/ or stage2/checkpoint-*/"
+    )
+
 def run_inference_two_stage(
-    run_dir_stage2: str = STAGE2_OUTPUT_DIR,
-    qa_path: str = QA_DATA_PATH,
+    run_dir_stage2: str,
+    qa_path: str,
     out_path: Optional[str] = None,
     limit: Optional[int] = None,
 ) -> Dict:
-    print("[INF] Loading Stage-2 model from:", run_dir_stage2)
-    tok2 = AutoTokenizer.from_pretrained(run_dir_stage2)
-    m2 = AutoModelForSeq2SeqLM.from_pretrained(run_dir_stage2)
+    # 1) resolve model dir robustly (root or latest checkpoint)
+    model_dir = _resolve_stage2_model_dir(run_dir_stage2)
+
+    print("[INF] Loading Stage-2 model from:", model_dir)
+    tok2 = AutoTokenizer.from_pretrained(model_dir, local_files_only=True)
+    m2 = AutoModelForSeq2SeqLM.from_pretrained(model_dir, local_files_only=True)
 
     if hasattr(m2, "cuda"):
         try:
             m2 = m2.cuda()
         except Exception:
             pass
+
+    # 2) load QA data from the SAME run_dir you passed (no config mismatch)
+    if not os.path.exists(qa_path):
+        raise FileNotFoundError(f"[INF] QA file not found: {qa_path}")
 
     print("[INF] Loading QA data:", qa_path)
     qa_data = _load_json(qa_path)
@@ -185,9 +232,11 @@ def run_inference_two_stage(
     print(f"[INF] action_accuracy={action_acc:.4f} on {total} labeled samples | parse_ok_rate={parse_ok_rate:.3f}")
 
     result = {
-        "metrics": {"action_accuracy": action_acc, "parse_ok_rate": float(parse_ok_rate)},
+        "metrics": {"action_accuracy": float(action_acc), "parse_ok_rate": float(parse_ok_rate)},
         "num_eval_samples": len(preds),
         "predictions": preds,
+        "model_dir_used": model_dir,
+        "qa_path_used": qa_path,
     }
 
     if out_path is None:

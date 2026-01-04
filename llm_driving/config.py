@@ -19,11 +19,35 @@ VECTOR_DIM = 7
 # -----------------------------
 MODEL_NAME = "google/flan-t5-base"
 
-# Run switches (useful for debugging)
+# Run switches
 RUN_STAGE1 = True
 RUN_STAGE2 = True
-
 SEED = 42
+
+# -----------------------------
+# Vector-prefix (PART-2)
+# -----------------------------
+USE_VECTOR_PREFIX = True          # <-- key switch
+PREFIX_LEN = 16                   # number of prefix tokens injected to encoder
+VEC_ENCODER_HIDDEN = 256
+VEC_ENCODER_LAYERS = 2
+VEC_ENCODER_HEADS = 4
+VEC_ENCODER_DROPOUT = 0.1
+
+# Whether to freeze base FLAN-T5 weights and train only (LoRA + vector encoder)
+FREEZE_BASE_MODEL = True
+
+# -----------------------------
+# LoRA (optional, PART-2)
+# -----------------------------
+USE_LORA = True
+LORA_R = 8
+LORA_ALPHA = 16
+LORA_DROPOUT = 0.05
+
+# For T5/FLAN-T5 these names are commonly present in attention projections.
+# If peft complains, we’ll adjust to your exact module names later.
+LORA_TARGET_MODULES = ["q", "v"]
 
 # -----------------------------
 # Stage 1: vector -> caption
@@ -32,21 +56,26 @@ STAGE1_EPOCHS = 10
 STAGE1_BATCH_SIZE = 2
 STAGE1_LR = 2e-5
 STAGE1_WEIGHT_DECAY = 0.0
-STAGE1_MAX_INPUT_LEN = 256
-STAGE1_MAX_TARGET_LEN = 256
+STAGE1_MAX_INPUT_LEN = 128
+STAGE1_MAX_TARGET_LEN = 192
+
+# Stage1 text prompt (vectors go via prefix)
+STAGE1_TEXT_PROMPT = "Describe the driving scene from object vectors."
 
 # -----------------------------
-# Stage 2: caption+question -> paper-style action output
+# Stage 2: caption+question -> action
 # -----------------------------
 STAGE2_EPOCHS = 8
 STAGE2_BATCH_SIZE = 2
 STAGE2_LR = 2e-5
 STAGE2_WEIGHT_DECAY = 0.0
-STAGE2_MAX_INPUT_LEN = 256
+STAGE2_MAX_INPUT_LEN = 192
 STAGE2_MAX_TARGET_LEN = 128
 
+STAGE2_QUESTION = "How should the car drive in this situation and why?"
+
 # -----------------------------
-# Generation params (eval/pred dumps)
+# Generation params
 # -----------------------------
 GEN_NUM_BEAMS = 4
 GEN_EARLY_STOPPING = True
@@ -57,25 +86,19 @@ GEN_MAX_NEW_TOKENS_STAGE1 = 160
 GEN_MAX_NEW_TOKENS_STAGE2 = 80
 
 # -----------------------------
-# Trainer logging / saving / eval
-# (you said ignore disk concerns, so defaults are not restrictive)
+# Logging/saving
 # -----------------------------
 LOGGING_STEPS = 50
-EVAL_STRATEGY = "epoch"         # or "steps"
-SAVE_STRATEGY = "epoch"         # or "steps"
-SAVE_TOTAL_LIMIT = 3            # keep a few checkpoints
+EVAL_STRATEGY = "epoch"
+SAVE_STRATEGY = "epoch"
+SAVE_TOTAL_LIMIT = 3
 
 # -----------------------------
-# Metrics toggles (we'll implement in training.py)
+# Metrics toggles
 # -----------------------------
-# Text similarity metrics
 COMPUTE_ROUGE = True
 COMPUTE_BLEU = True
-
-# Structured parsing metrics for paper-format outputs
 COMPUTE_PARSE_METRICS = True
-
-# Numeric/control metrics (MAE on pedal %, steering accuracy, etc.)
 COMPUTE_CONTROL_METRICS = True
 
 # -----------------------------

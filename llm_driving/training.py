@@ -1,13 +1,13 @@
 # llm_driving/training.py
 
 """
-PART-1 updates:
-- Stage-2 initialized from Stage-1 weights (dependency)
-- Remove min_dist leakage from Stage-2 prompt construction (and oracle eval)
-- Fix 5-line format metric by enforcing 5-line output with a robust post-processor
-- Add control metrics:
-  - accel_mae, brake_mae, steering_accuracy
-- Keep existing metrics: action_accuracy buckets, BLEU1, ROUGE-L, format compliance
+PART-2 (training only):
+- Use vector-prefix encoder (vectors -> prefix embeddings) instead of vector strings.
+- Optional LoRA on FLAN-T5, plus option to freeze base weights.
+- Stage-2 initialized from Stage-1 weights (still true).
+- Keep your Part-1 metrics & format enforcement.
+
+NOTE: inference not updated here (you said later).
 """
 
 import os
@@ -18,6 +18,10 @@ from typing import List, Dict, Tuple, Optional
 
 import numpy as np
 from datasets import Dataset
+
+import torch
+import torch.nn as nn
+
 from transformers import (
     AutoModelForSeq2SeqLM,
     AutoTokenizer,
@@ -29,7 +33,32 @@ from .config import (
     MODEL_NAME,
     STAGE1_OUTPUT_DIR,
     STAGE2_OUTPUT_DIR,
+    STAGE1_MAX_INPUT_LEN,
+    STAGE1_MAX_TARGET_LEN,
+    STAGE2_MAX_INPUT_LEN,
+    STAGE2_MAX_TARGET_LEN,
+    GEN_MAX_NEW_TOKENS_STAGE1,
+    GEN_MAX_NEW_TOKENS_STAGE2,
+    USE_VECTOR_PREFIX,
+    PREFIX_LEN,
+    MAX_OBJECTS,
+    VECTOR_DIM,
+    VEC_ENCODER_HIDDEN,
+    VEC_ENCODER_LAYERS,
+    VEC_ENCODER_HEADS,
+    VEC_ENCODER_DROPOUT,
+    FREEZE_BASE_MODEL,
+    USE_LORA,
+    LORA_R,
+    LORA_ALPHA,
+    LORA_DROPOUT,
+    LORA_TARGET_MODULES,
+    STAGE1_TEXT_PROMPT,
+    STAGE2_QUESTION,
 )
+
+from .vector_encoder import VectorPrefixEncoder, VectorEncoderConfig
+
 
 # ---------------------------
 # Helpers
@@ -56,20 +85,11 @@ def _ensure_paper_format(prompt: str) -> str:
         return p
     return p + PAPER_FORMAT_INSTRUCTION
 
-def _build_stage1_prompt(vec_str: str) -> str:
-    return f"Describe the driving scene from object vectors:\n{vec_str}"
-
 def _build_stage2_prompt_from_caption(caption: str) -> str:
-    qa_question = "How should the car drive in this situation and why?"
-    prompt = caption + f"\n\nQuestion: {qa_question}"
+    prompt = caption + f"\n\nQuestion: {STAGE2_QUESTION}"
     return _ensure_paper_format(prompt)
 
 def _strip_min_dist(text: str) -> str:
-    """
-    Removes lines like:
-      'Minimum object distance: 8.1 m'
-    from oracle prompts to avoid leaking the label proxy.
-    """
     return re.sub(
         r"\n?Minimum object distance:\s*[0-9.]+\s*m\s*\n?",
         "\n",
@@ -175,10 +195,6 @@ def _extract_reason(text: str) -> Optional[str]:
     return m.group(1).strip() if m else None
 
 def enforce_5_lines(text: str) -> Tuple[str, int]:
-    """
-    Return (fixed_text, parse_ok)
-    parse_ok=1 if we could parse accel+brake+steer+reason from RAW model output, else 0.
-    """
     accel = _extract_accel_percent(text)
     brake = _extract_brake_percent(text)
     steer = _extract_steer(text)
@@ -186,14 +202,10 @@ def enforce_5_lines(text: str) -> Tuple[str, int]:
 
     parse_ok = 1 if (accel is not None and brake is not None and steer is not None and reason is not None) else 0
 
-    if accel is None:
-        accel = 0
-    if brake is None:
-        brake = 0
-    if steer not in ("left", "straight", "right"):
-        steer = "straight"
-    if not reason:
-        reason = "N/A"
+    if accel is None: accel = 0
+    if brake is None: brake = 0
+    if steer not in ("left", "straight", "right"): steer = "straight"
+    if not reason: reason = "N/A"
 
     fixed = (
         "Here are my actions:\n"
@@ -228,10 +240,6 @@ def _format_compliance_5line(text: str) -> int:
     return 1
 
 
-# ---------------------------
-# Stage 2 proxy action metric
-# ---------------------------
-
 def _map_text_to_action_label(text: str) -> str:
     b = _extract_brake_percent(text)
     if b is None:
@@ -244,22 +252,105 @@ def _map_text_to_action_label(text: str) -> str:
 
 
 # ---------------------------
-# Tokenization
+# Vector-prefix wrapper model
 # ---------------------------
 
-def _tokenize_captioning(batch, tokenizer):
+class VectorPrefixSeq2Seq(nn.Module):
+    """
+    Wrap a HF seq2seq model:
+      - builds encoder inputs_embeds = [prefix(vectors), embed(input_ids)]
+      - passes through base model
+    """
+
+    def __init__(self, base_model: nn.Module, vector_encoder: VectorPrefixEncoder, prefix_len: int):
+        super().__init__()
+        self.base_model = base_model
+        self.vector_encoder = vector_encoder
+        self.prefix_len = prefix_len
+
+        # For Trainer logging expectations sometimes
+        self.config = getattr(base_model, "config", None)
+
+    def forward(self, input_ids=None, attention_mask=None, labels=None, vectors=None, num_objects=None, **kwargs):
+        kwargs.pop("num_items_in_batch", None)
+        if not USE_VECTOR_PREFIX:
+            return self.base_model(input_ids=input_ids, attention_mask=attention_mask, labels=labels, **kwargs)
+
+        if vectors is None or num_objects is None:
+            raise ValueError("USE_VECTOR_PREFIX=True but vectors/num_objects not provided to forward().")
+
+        # (B, P, d_model)
+        prefix = self.vector_encoder(vectors, num_objects)
+
+        # (B, T, d_model)
+        embed = self.base_model.get_input_embeddings()(input_ids)
+
+        inputs_embeds = torch.cat([prefix, embed], dim=1)
+
+        # prepend attention mask of ones for prefix tokens
+        B = input_ids.shape[0]
+        p_mask = torch.ones((B, self.prefix_len), dtype=attention_mask.dtype, device=attention_mask.device)
+        attn = torch.cat([p_mask, attention_mask], dim=1)
+
+        return self.base_model(inputs_embeds=inputs_embeds, attention_mask=attn, labels=labels, **kwargs)
+
+    @torch.no_grad()
+    def generate(self, input_ids=None, attention_mask=None, vectors=None, num_objects=None, **gen_kwargs):
+        if not USE_VECTOR_PREFIX:
+            return self.base_model.generate(input_ids=input_ids, attention_mask=attention_mask, **gen_kwargs)
+
+        prefix = self.vector_encoder(vectors, num_objects)
+        embed = self.base_model.get_input_embeddings()(input_ids)
+        inputs_embeds = torch.cat([prefix, embed], dim=1)
+
+        B = input_ids.shape[0]
+        p_mask = torch.ones((B, self.prefix_len), dtype=attention_mask.dtype, device=attention_mask.device)
+        attn = torch.cat([p_mask, attention_mask], dim=1)
+
+        return self.base_model.generate(inputs_embeds=inputs_embeds, attention_mask=attn, **gen_kwargs)
+
+    def save_all(self, save_dir: str, tokenizer: AutoTokenizer):
+        """
+        Training-only convenience save:
+        - base HF model is saved in save_dir (config.json etc)
+        - vector encoder weights saved as vector_encoder.pt
+        - vector meta saved as vector_encoder_meta.json
+        """
+        _ensure_dir(save_dir)
+        self.base_model.save_pretrained(save_dir)
+        tokenizer.save_pretrained(save_dir)
+
+        torch.save(self.vector_encoder.state_dict(), os.path.join(save_dir, "vector_encoder.pt"))
+        meta = {
+            "prefix_len": self.prefix_len,
+            "max_objects": MAX_OBJECTS,
+            "vector_dim": VECTOR_DIM,
+            "hidden_dim": VEC_ENCODER_HIDDEN,
+            "layers": VEC_ENCODER_LAYERS,
+            "heads": VEC_ENCODER_HEADS,
+            "dropout": VEC_ENCODER_DROPOUT,
+        }
+        with open(os.path.join(save_dir, "vector_encoder_meta.json"), "w") as f:
+            json.dump(meta, f, indent=2)
+
+
+# ---------------------------
+# Tokenization + collator
+# ---------------------------
+
+def _tokenize_batch_text(batch, tokenizer, max_in: int, max_tgt: int):
     model_inputs = tokenizer(
         batch["input"],
         truncation=True,
         padding="max_length",
-        max_length=192,
+        max_length=max_in,
     )
     with tokenizer.as_target_tokenizer():
         labels = tokenizer(
             batch["target"],
             truncation=True,
             padding="max_length",
-            max_length=192,
+            max_length=max_tgt,
         )["input_ids"]
 
     pad_id = tokenizer.pad_token_id
@@ -267,25 +358,62 @@ def _tokenize_captioning(batch, tokenizer):
     model_inputs["labels"] = labels
     return model_inputs
 
-def _tokenize_qa(batch, tokenizer):
-    model_inputs = tokenizer(
-        batch["input"],
-        truncation=True,
-        padding="max_length",
-        max_length=192,
-    )
-    with tokenizer.as_target_tokenizer():
-        labels = tokenizer(
-            batch["target"],
-            truncation=True,
-            padding="max_length",
-            max_length=192,
-        )["input_ids"]
 
-    pad_id = tokenizer.pad_token_id
-    labels = [[(tok if tok != pad_id else -100) for tok in seq] for seq in labels]
-    model_inputs["labels"] = labels
-    return model_inputs
+class VectorDataCollator:
+    def __init__(self):
+        pass
+
+    def __call__(self, features: List[Dict]) -> Dict[str, torch.Tensor]:
+        # HF tokenizer outputs lists already, convert to torch
+        batch = {}
+        for k in ["input_ids", "attention_mask", "labels"]:
+            batch[k] = torch.tensor([f[k] for f in features], dtype=torch.long)
+
+        # vectors + num_objects
+        if USE_VECTOR_PREFIX:
+            vecs = torch.tensor([f["vectors"] for f in features], dtype=torch.float32)
+            nobj = torch.tensor([f["num_objects"] for f in features], dtype=torch.long)
+            batch["vectors"] = vecs
+            batch["num_objects"] = nobj
+
+        return batch
+
+
+# ---------------------------
+# Model builder (LoRA + freeze)
+# ---------------------------
+
+def _maybe_apply_lora(base_model: nn.Module) -> nn.Module:
+    if not USE_LORA:
+        return base_model
+
+    try:
+        from peft import LoraConfig, get_peft_model, TaskType
+        lcfg = LoraConfig(
+            task_type=TaskType.SEQ_2_SEQ_LM,
+            r=LORA_R,
+            lora_alpha=LORA_ALPHA,
+            lora_dropout=LORA_DROPOUT,
+            target_modules=LORA_TARGET_MODULES,
+        )
+        model = get_peft_model(base_model, lcfg)
+        print("[LoRA] Enabled. Trainable params:", sum(p.numel() for p in model.parameters() if p.requires_grad))
+        return model
+    except Exception as e:
+        print("[LoRA] Could not enable LoRA (peft missing or target modules mismatch). Falling back. Error:", e)
+        return base_model
+
+
+def _maybe_freeze_base(model: nn.Module):
+    if not FREEZE_BASE_MODEL:
+        return
+    for n, p in model.named_parameters():
+        p.requires_grad = False
+
+    # If it's a PeftModel, LoRA params will still be trainable
+    for n, p in model.named_parameters():
+        if "lora_" in n:
+            p.requires_grad = True
 
 
 # ---------------------------
@@ -310,15 +438,47 @@ def train_stage1(captioning_path: str):
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 
-    def tokenize_fn(batch):
-        return _tokenize_captioning(batch, tokenizer)
+    def map_fn(batch):
+        # override input to a stable text prompt when using vector prefix
+        if USE_VECTOR_PREFIX:
+            batch = dict(batch)
+            batch["input"] = [STAGE1_TEXT_PROMPT for _ in batch["input"]]
+        return _tokenize_batch_text(batch, tokenizer, STAGE1_MAX_INPUT_LEN, STAGE1_MAX_TARGET_LEN)
 
     print("[STAGE 1] Tokenizing datasets...")
-    tokenized_train = train_ds.map(tokenize_fn, batched=True, remove_columns=["input", "target"])
-    tokenized_eval = eval_ds.map(tokenize_fn, batched=True, remove_columns=["input", "target"])
+    tokenized_train = train_ds.map(map_fn, batched=True)
+    tokenized_eval = eval_ds.map(map_fn, batched=True)
 
-    print(f"[STAGE 1] Loading model: {MODEL_NAME}")
-    model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME)
+    # Keep only needed columns
+    keep_cols = ["input_ids", "attention_mask", "labels"]
+    if USE_VECTOR_PREFIX:
+        keep_cols += ["vectors", "num_objects"]
+
+    tokenized_train = tokenized_train.remove_columns([c for c in tokenized_train.column_names if c not in keep_cols])
+    tokenized_eval = tokenized_eval.remove_columns([c for c in tokenized_eval.column_names if c not in keep_cols])
+
+    print(f"[STAGE 1] Loading base model: {MODEL_NAME}")
+    base = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME)
+    base = _maybe_apply_lora(base)
+    _maybe_freeze_base(base)
+
+    # Vector encoder (prefix)
+    if USE_VECTOR_PREFIX:
+        d_model = base.config.d_model
+        vec_cfg = VectorEncoderConfig(
+            max_objects=MAX_OBJECTS,
+            vector_dim=VECTOR_DIM,
+            hidden_dim=VEC_ENCODER_HIDDEN,
+            prefix_len=PREFIX_LEN,
+            t5_d_model=d_model,
+            n_layers=VEC_ENCODER_LAYERS,
+            n_heads=VEC_ENCODER_HEADS,
+            dropout=VEC_ENCODER_DROPOUT,
+        )
+        vec_enc = VectorPrefixEncoder(vec_cfg)
+        model = VectorPrefixSeq2Seq(base, vec_enc, PREFIX_LEN)
+    else:
+        model = base
 
     _ensure_dir(STAGE1_OUTPUT_DIR)
     print(f"[STAGE 1] Output directory: {STAGE1_OUTPUT_DIR}")
@@ -335,7 +495,11 @@ def train_stage1(captioning_path: str):
         logging_steps=50,
         save_steps=500,
         save_total_limit=2,
+        save_safetensors=False,
+        remove_unused_columns=False,  # IMPORTANT: keep vectors in batch
     )
+
+    collator = VectorDataCollator()
 
     trainer = Trainer(
         model=model,
@@ -343,14 +507,18 @@ def train_stage1(captioning_path: str):
         train_dataset=tokenized_train,
         eval_dataset=tokenized_eval,
         tokenizer=tokenizer,
+        data_collator=collator,
     )
 
     print("[STAGE 1] Starting training...")
     trainer.train()
 
-    # Ensure stage1 dir is always loadable later
-    trainer.save_model(STAGE1_OUTPUT_DIR)
-    tokenizer.save_pretrained(STAGE1_OUTPUT_DIR)
+    # Save (base model + tokenizer + vector encoder weights)
+    if isinstance(model, VectorPrefixSeq2Seq):
+        model.save_all(STAGE1_OUTPUT_DIR, tokenizer)
+    else:
+        trainer.save_model(STAGE1_OUTPUT_DIR)
+        tokenizer.save_pretrained(STAGE1_OUTPUT_DIR)
 
     print("[STAGE 1] Training finished. Running evaluation...")
     eval_metrics = trainer.evaluate()
@@ -359,33 +527,8 @@ def train_stage1(captioning_path: str):
     metrics_path = os.path.join(STAGE1_OUTPUT_DIR, "eval_metrics.json")
     with open(metrics_path, "w") as f:
         json.dump(eval_metrics, f, indent=2)
+
     print(f"[STAGE 1] Saved eval metrics to {metrics_path}")
-
-    print("[STAGE 1] Generating predictions on validation set...")
-    model.eval()
-    val_preds = []
-    for sample in eval_ds:
-        input_text = sample["input"]
-        gt_text = sample["target"]
-        inputs = tokenizer(input_text, return_tensors="pt", max_length=192, truncation=True).to(model.device)
-
-        pred_ids = model.generate(
-            **inputs,
-            max_new_tokens=160,
-            num_beams=4,
-            early_stopping=True,
-            no_repeat_ngram_size=4,
-            repetition_penalty=1.2,
-        )
-        pred_text = tokenizer.decode(pred_ids[0], skip_special_tokens=True)
-
-        val_preds.append({"input": input_text, "ground_truth": gt_text, "prediction": pred_text})
-
-    preds_path = os.path.join(STAGE1_OUTPUT_DIR, "val_predictions.json")
-    with open(preds_path, "w") as f:
-        json.dump(val_preds, f, indent=2)
-    print(f"[STAGE 1] Saved {len(val_preds)} validation predictions to {preds_path}")
-
     print("[STAGE 1] Done.\n" + "=" * 80)
     return model, tokenizer
 
@@ -395,17 +538,12 @@ def train_stage1(captioning_path: str):
 # ---------------------------
 
 def train_stage2(model_stage1, tokenizer, qa_path: str):
-    """
-    PART-1:
-    - Stage-2 model initialized from Stage-1 weights => dependency
-    - Stage-2 prompts do NOT include min_dist (and oracle eval strips it)
-    """
     print("\n" + "=" * 80)
     print("[STAGE 2] Driving QA finetuning started.")
     print(f"[STAGE 2] Loading QA data from: {qa_path}")
 
-    # Depend on Stage-1 weights
-    model_stage2 = copy.deepcopy(model_stage1).to(model_stage1.device)
+    # Depend on Stage-1 weights (exact)
+    model_stage2 = copy.deepcopy(model_stage1)
     model_stage2.train()
 
     with open(qa_path, "r") as f:
@@ -419,15 +557,21 @@ def train_stage2(model_stage1, tokenizer, qa_path: str):
     eval_ds = split_ds["test"]
     print(f"[STAGE 2] Train samples: {len(train_ds)}  |  Val samples: {len(eval_ds)}")
 
-    def tokenize_fn(batch):
-        batch_inp = batch["input"]
+    def map_fn(batch):
         batch = dict(batch)
-        batch["input"] = [_ensure_paper_format(x) for x in batch_inp]
-        return _tokenize_qa(batch, tokenizer)
+        batch["input"] = [_ensure_paper_format(x) for x in batch["input"]]
+        return _tokenize_batch_text(batch, tokenizer, STAGE2_MAX_INPUT_LEN, STAGE2_MAX_TARGET_LEN)
 
     print("[STAGE 2] Tokenizing datasets...")
-    tokenized_train = train_ds.map(tokenize_fn, batched=True, remove_columns=["input", "target"])
-    tokenized_eval = eval_ds.map(tokenize_fn, batched=True, remove_columns=["input", "target"])
+    tokenized_train = train_ds.map(map_fn, batched=True)
+    tokenized_eval = eval_ds.map(map_fn, batched=True)
+
+    keep_cols = ["input_ids", "attention_mask", "labels"]
+    if USE_VECTOR_PREFIX:
+        keep_cols += ["vectors", "num_objects"]
+
+    tokenized_train = tokenized_train.remove_columns([c for c in tokenized_train.column_names if c not in keep_cols])
+    tokenized_eval = tokenized_eval.remove_columns([c for c in tokenized_eval.column_names if c not in keep_cols])
 
     _ensure_dir(STAGE2_OUTPUT_DIR)
     print(f"[STAGE 2] Output directory: {STAGE2_OUTPUT_DIR}")
@@ -444,7 +588,11 @@ def train_stage2(model_stage1, tokenizer, qa_path: str):
         logging_steps=50,
         save_steps=500,
         save_total_limit=2,
+        save_safetensors=False,
+        remove_unused_columns=False,
     )
+
+    collator = VectorDataCollator()
 
     trainer = Trainer(
         model=model_stage2,
@@ -452,43 +600,68 @@ def train_stage2(model_stage1, tokenizer, qa_path: str):
         train_dataset=tokenized_train,
         eval_dataset=tokenized_eval,
         tokenizer=tokenizer,
+        data_collator=collator,
     )
 
     print("[STAGE 2] Starting training...")
     trainer.train()
 
-    # Ensure stage2 root is always loadable for inference
-    trainer.save_model(STAGE2_OUTPUT_DIR)
-    tokenizer.save_pretrained(STAGE2_OUTPUT_DIR)
-    print(f"[STAGE 2] Saved model+tokenizer to {STAGE2_OUTPUT_DIR}")
+    # Save stage2
+    if isinstance(model_stage2, VectorPrefixSeq2Seq):
+        model_stage2.save_all(STAGE2_OUTPUT_DIR, tokenizer)
+    else:
+        trainer.save_model(STAGE2_OUTPUT_DIR)
+        tokenizer.save_pretrained(STAGE2_OUTPUT_DIR)
 
-    print("[STAGE 2] Training finished. Running evaluation (loss only)...")
+    print("[STAGE 2] Saved model+tokenizer to", STAGE2_OUTPUT_DIR)
+
+    # ---- eval (loss) ----
     raw_eval = trainer.evaluate()
     print("\n[STAGE 2] Raw eval output:", raw_eval)
 
+    # ---- extra eval with generation (oracle_caption vs stage1_caption) ----
     model_stage1.eval()
     model_stage2.eval()
 
-    def _gen_text(model, prompt: str, max_new_tokens: int, no_repeat_ngram_size: int = 3) -> str:
+    def _gen_text(model, prompt: str, vectors_np, num_objects: int, max_new_tokens: int, no_repeat_ngram_size: int = 3) -> str:
         prompt = _ensure_paper_format(prompt)
-        inputs = tokenizer(prompt, return_tensors="pt", max_length=192, truncation=True).to(model_stage2.device)
-        pred_ids = model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            num_beams=4,
-            early_stopping=True,
-            no_repeat_ngram_size=no_repeat_ngram_size,
-            repetition_penalty=1.2,
-        )
+        inputs = tokenizer(prompt, return_tensors="pt", max_length=STAGE2_MAX_INPUT_LEN, truncation=True)
+
+        input_ids = inputs["input_ids"].to(next(model.parameters()).device)
+        attention_mask = inputs["attention_mask"].to(next(model.parameters()).device)
+
+        if USE_VECTOR_PREFIX:
+            v = torch.tensor([vectors_np], dtype=torch.float32, device=input_ids.device)
+            n = torch.tensor([num_objects], dtype=torch.long, device=input_ids.device)
+            pred_ids = model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                vectors=v,
+                num_objects=n,
+                max_new_tokens=max_new_tokens,
+                num_beams=4,
+                early_stopping=True,
+                no_repeat_ngram_size=no_repeat_ngram_size,
+                repetition_penalty=1.2,
+            )
+        else:
+            pred_ids = model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=max_new_tokens,
+                num_beams=4,
+                early_stopping=True,
+                no_repeat_ngram_size=no_repeat_ngram_size,
+                repetition_penalty=1.2,
+            )
+
         return tokenizer.decode(pred_ids[0], skip_special_tokens=True)
 
     def run_eval(mode: str) -> Tuple[Dict, List[Dict]]:
         correct = 0
         total = 0
-
         bleu_sum = 0.0
         rouge_sum = 0.0
-
         fmt_sum = 0.0
         parse_ok_sum = 0.0
 
@@ -506,19 +679,34 @@ def train_stage2(model_stage1, tokenizer, qa_path: str):
         for sample in eval_ds:
             raw_input_text = sample["input"]
             gt_text = sample["target"]
+            vectors_np = sample["vectors"]
+            num_obj = int(sample["num_objects"])
 
             if mode == "oracle_caption":
-                # strip min_dist to avoid leakage
                 stage2_prompt = _ensure_paper_format(_strip_min_dist(raw_input_text))
                 caption_used = None
             else:
-                vec_str = sample.get("vec_str", "")
-                s1_prompt = _build_stage1_prompt(vec_str)
-                caption_pred = _gen_text(model_stage1, s1_prompt, max_new_tokens=160, no_repeat_ngram_size=4)
+                # Stage1 caption from vectors
+                s1_prompt = STAGE1_TEXT_PROMPT
+                caption_pred = _gen_text(
+                    model_stage1,
+                    s1_prompt,
+                    vectors_np=vectors_np,
+                    num_objects=num_obj,
+                    max_new_tokens=GEN_MAX_NEW_TOKENS_STAGE1,
+                    no_repeat_ngram_size=4,
+                )
                 caption_used = caption_pred
                 stage2_prompt = _build_stage2_prompt_from_caption(caption_pred)
 
-            pred_raw = _gen_text(model_stage2, stage2_prompt, max_new_tokens=90, no_repeat_ngram_size=3)
+            pred_raw = _gen_text(
+                model_stage2,
+                stage2_prompt,
+                vectors_np=vectors_np,
+                num_objects=num_obj,
+                max_new_tokens=GEN_MAX_NEW_TOKENS_STAGE2,
+                no_repeat_ngram_size=3,
+            )
             pred_fixed, parse_ok = enforce_5_lines(pred_raw)
 
             gt_action = _map_text_to_action_label(gt_text)
@@ -531,11 +719,9 @@ def train_stage2(model_stage1, tokenizer, qa_path: str):
 
             bleu_sum += bleu1(pred_fixed, gt_text)
             rouge_sum += rouge_l_f1(pred_fixed, gt_text)
-
             fmt_sum += float(_format_compliance_5line(pred_fixed))
             parse_ok_sum += float(parse_ok)
 
-            # control metrics
             gt_acc = _extract_accel_percent(gt_text)
             gt_brk = _extract_brake_percent(gt_text)
             gt_str = _extract_steer(gt_text)
@@ -607,17 +793,12 @@ def train_stage2(model_stage1, tokenizer, qa_path: str):
     metrics_path = os.path.join(STAGE2_OUTPUT_DIR, "eval_metrics.json")
     with open(metrics_path, "w") as f:
         json.dump(eval_metrics, f, indent=2)
-    print(f"[STAGE 2] Saved eval metrics to {metrics_path}")
 
-    preds_path1 = os.path.join(STAGE2_OUTPUT_DIR, "val_predictions_oracle_caption.json")
-    with open(preds_path1, "w") as f:
+    with open(os.path.join(STAGE2_OUTPUT_DIR, "val_predictions_oracle_caption.json"), "w") as f:
         json.dump(oracle_outputs, f, indent=2)
-    print(f"[STAGE 2] Saved oracle-caption predictions to {preds_path1}")
 
-    preds_path2 = os.path.join(STAGE2_OUTPUT_DIR, "val_predictions_stage1_caption.json")
-    with open(preds_path2, "w") as f:
+    with open(os.path.join(STAGE2_OUTPUT_DIR, "val_predictions_stage1_caption.json"), "w") as f:
         json.dump(stage1_outputs, f, indent=2)
-    print(f"[STAGE 2] Saved stage1-caption predictions to {preds_path2}")
 
     print("[STAGE 2] Done.\n" + "=" * 80)
     return model_stage2

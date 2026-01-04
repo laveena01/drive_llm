@@ -2,13 +2,13 @@
 
 """
 Builds datasets for:
-1) Vector Captioning: (input: vector string) -> (target: lanGen caption)
-2) Driving QA (paper-style): (input: caption + question + format) -> (target: actions + reason)
+1) Vector Captioning: (vectors) -> (lanGen caption)
+2) Driving QA (paper-style): (caption + question + format) -> (actions + reason)
 
-PART-1 updates:
-- Remove min_dist leakage from Stage-2 input (still stored as metadata)
-- Keep vec_str for stage1_caption eval
-- Keep oracle caption only as debug field
+PART-2 updates:
+- Store numeric vectors + num_objects in JSON so we can use vector-prefix encoder.
+- Still keep vec_str (for debugging / baseline eval if needed).
+- No min_dist leakage in Stage-2 input (still stored as metadata).
 """
 
 from typing import List, Dict
@@ -71,12 +71,19 @@ def _make_samples_from_frames(
         num_objects = int(frame["num_objects"])
         caption = lanGen(frame)
 
+        # Save vec_str only for debugging/baseline; vectors are the real modality now.
         vec_str = vector_to_string(frame["vectors"], num_objects)
 
-        # --- Stage 1: vector -> caption ---
+        # Convert np.ndarray -> nested list for JSON
+        vectors_list = frame["vectors"].astype("float32").tolist()
+
+        # --- Stage 1: vectors -> caption ---
         captioning_samples.append({
-            "input": f"Describe the driving scene from object vectors:\n{vec_str}",
+            "input": "Describe the driving scene from object vectors:",  # text prompt only
             "target": caption,
+            "vectors": vectors_list,
+            "num_objects": num_objects,
+            "vec_str": vec_str,
         })
 
         # --- Stage 2: paper-style actions ---
@@ -88,11 +95,10 @@ def _make_samples_from_frames(
             min_dist = min(dists)
 
         qa_question = "How should the car drive in this situation and why?"
-
         accel, brake, steer, reason, policy_label = _policy_from_min_dist(use_n, min_dist)
         qa_target = _paper_target(accel, brake, steer, reason)
 
-        # PART-1: remove min_dist from the Stage-2 input (keep only caption + question + format)
+        # No leakage (caption only)
         qa_input = (
             "### OBSERVATION\n"
             f"{caption}\n\n"
@@ -106,7 +112,11 @@ def _make_samples_from_frames(
             "input": qa_input,
             "target": qa_target,
 
-            # Needed for stage1_caption eval: Stage1(vec_str)->caption_pred->Stage2
+            # vectors for vector-prefix usage in Stage-2
+            "vectors": vectors_list,
+            "num_objects": num_objects,
+
+            # For stage1_caption eval
             "vec_str": vec_str,
 
             # Debug only
