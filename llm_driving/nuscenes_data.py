@@ -46,10 +46,16 @@ def _yaw_from_quaternion(q: Quaternion) -> float:
 def get_object_vectors_for_sample(
     nusc: NuScenes,
     sample_token: str,
-) -> Tuple[np.ndarray, int]:
+) -> Tuple[np.ndarray, int, List[str]]:
     """
     Extract object vectors for a given sample token.
     Uses ego pose (LIDAR_TOP) to convert global boxes -> ego frame.
+    
+    Returns:
+        Tuple of (vectors, count, category_names)
+        - vectors: (MAX_OBJECTS, VECTOR_DIM) array
+        - count: number of valid objects
+        - category_names: list of category names for each object (for risk calculation)
     """
     sample = nusc.get("sample", sample_token)
 
@@ -63,6 +69,7 @@ def get_object_vectors_for_sample(
     ego_q_inv = ego_q.inverse
 
     vectors: List[List[float]] = []
+    categories: List[str] = []
 
     for ann_token in sample["anns"]:
         ann = nusc.get("sample_annotation", ann_token)
@@ -113,16 +120,24 @@ def get_object_vectors_for_sample(
             type_id = 3
 
         vectors.append([rel_x, rel_y, dist, rel_speed, heading, size, float(type_id)])
+        categories.append(category)
 
     # Sort by distance so MAX_OBJECTS are the nearest ones (much more stable)
-    vectors.sort(key=lambda v: v[2])
+    # Sort both vectors and categories together
+    if vectors:
+        sorted_pairs = sorted(zip(vectors, categories), key=lambda x: x[0][2])
+        vectors = [p[0] for p in sorted_pairs]
+        categories = [p[1] for p in sorted_pairs]
 
     padded = np.zeros((MAX_OBJECTS, VECTOR_DIM), dtype=np.float32)
     count = min(len(vectors), MAX_OBJECTS)
     if count > 0:
         padded[:count, :] = np.array(vectors[:count], dtype=np.float32)
+    
+    # Truncate categories to MAX_OBJECTS
+    categories = categories[:count]
 
-    return padded, count
+    return padded, count, categories
 
 
 def get_scene_frames_vectors(
@@ -135,7 +150,8 @@ def get_scene_frames_vectors(
       {
         "vectors": np.ndarray(MAX_OBJECTS, VECTOR_DIM),
         "num_objects": int,
-        "sample_token": str
+        "sample_token": str,
+        "categories": List[str]  # Added for risk calculation
       }
     """
     scene = nusc.scene[scene_idx]
@@ -150,12 +166,13 @@ def get_scene_frames_vectors(
         if max_frames is not None and frame_idx >= max_frames:
             break
 
-        vecs, num_obj = get_object_vectors_for_sample(nusc, token)
+        vecs, num_obj, categories = get_object_vectors_for_sample(nusc, token)
         frames.append(
             {
                 "vectors": vecs,
                 "num_objects": num_obj,
                 "sample_token": token,
+                "categories": categories,
             }
         )
 

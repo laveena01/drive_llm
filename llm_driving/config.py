@@ -2,10 +2,12 @@
 import os
 from datetime import datetime
 
+# os.sep = '\\'  # Force forward slashes
+
 # -----------------------------
 # nuScenes
 # -----------------------------
-NUSC_ROOT = "/u/student/2024/cs24mtech11010/nuscenes"
+NUSC_ROOT = "data"
 NUSC_VERSION = "v1.0-mini"          # later: "v1.0-trainval"
 
 # -----------------------------
@@ -13,6 +15,18 @@ NUSC_VERSION = "v1.0-mini"          # later: "v1.0-trainval"
 # -----------------------------
 MAX_OBJECTS = 10
 VECTOR_DIM = 7
+
+# -----------------------------
+# Risk Calculation (NEW)
+# -----------------------------
+DEFAULT_EGO_SPEED = 10.0  # m/s
+USE_ADVANCED_RISK = True  # Use multi-dimensional risk instead of simple distance-based policy
+RISK_WEIGHTS = {
+    'collision': 0.40,
+    'pedestrian': 0.30,
+    'ttc': 0.20,
+    'regulatory': 0.10,
+}
 
 # -----------------------------
 # model
