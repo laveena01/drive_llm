@@ -1,0 +1,290 @@
+diff --git a/.gitignore b/.gitignore
+index 740248f..4caac78 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1,3 +1,5 @@
+ /data/
+ /outputs/
+-/runs/
+\ No newline at end of file
++/runs/
++
++__pycache__
+\ No newline at end of file
+diff --git a/llm_driving/__init__.py b/llm_driving/__init__.py
+index ed8d2b7..0d4713c 100644
+--- a/llm_driving/__init__.py
++++ b/llm_driving/__init__.py
+@@ -9,4 +9,5 @@ Modules:
+ - langen: vector -> language (lanGen-style) functions
+ - datasets_builder: builds captioning + driving QA datasets
+ - training: training loops for Stage 1 (captioning) & Stage 2 (QA)
++- risk_calculator: multi-dimensional risk scoring with TTC and type weighting
+ """
+diff --git a/llm_driving/config.py b/llm_driving/config.py
+index 8141093..63f1338 100644
+--- a/llm_driving/config.py
++++ b/llm_driving/config.py
+@@ -14,6 +14,18 @@ NUSC_VERSION = "v1.0-mini"          # later: "v1.0-trainval"
+ MAX_OBJECTS = 10
+ VECTOR_DIM = 7
+ 
++# -----------------------------
++# Risk Calculation (NEW)
++# -----------------------------
++DEFAULT_EGO_SPEED = 10.0  # m/s
++USE_ADVANCED_RISK = True  # Use multi-dimensional risk instead of simple distance-based policy
++RISK_WEIGHTS = {
++    'collision': 0.40,
++    'pedestrian': 0.30,
++    'ttc': 0.20,
++    'regulatory': 0.10,
++}
++
+ # -----------------------------
+ # model
+ # -----------------------------
+diff --git a/llm_driving/datasets_builder.py b/llm_driving/datasets_builder.py
+index 10c0b6c..ab2e8ce 100644
+--- a/llm_driving/datasets_builder.py
++++ b/llm_driving/datasets_builder.py
+@@ -16,7 +16,8 @@ import json
+ 
+ from .nuscenes_data import get_scene_frames_vectors, init_nuscenes
+ from .langen import lanGen, vector_to_string
+-from .config import CAPTIONING_DATA_PATH, QA_DATA_PATH, MAX_OBJECTS
++from .config import CAPTIONING_DATA_PATH, QA_DATA_PATH, MAX_OBJECTS, USE_ADVANCED_RISK, DEFAULT_EGO_SPEED
++from .risk_calculator import calculate_risk_from_vectors, policy_from_risk, get_risk_summary_text
+ 
+ 
+ PAPER_FORMAT_INSTRUCTION = (
+@@ -46,6 +47,7 @@ def _paper_target(accel: int, brake: int, steer: str, reason: str) -> str:
+ 
+ 
+ def _policy_from_min_dist(num_objects: int, min_dist: float) -> tuple[int, int, str, str, str]:
++    """Legacy distance-based policy (kept for backward compatibility)."""
+     steer = "straight"
+ 
+     if num_objects == 0:
+@@ -61,6 +63,39 @@ def _policy_from_min_dist(num_objects: int, min_dist: float) -> tuple[int, int,
+         return 20, 0, steer, f"All objects are far enough (min {min_dist:.1f} m), continue.", "CONTINUE"
+ 
+ 
++def _get_policy(frame: dict) -> tuple[int, int, str, str, str, dict]:
++    """
++    Get driving policy using either advanced risk or legacy distance-based approach.
++    
++    Returns:
++        Tuple of (accel, brake, steer, reason, policy_label, risk_metadata)
++    """
++    num_objects = int(frame["num_objects"])
++    vectors = frame["vectors"]
++    use_n = min(num_objects, MAX_OBJECTS)
++    
++    if USE_ADVANCED_RISK:
++        # Use multi-dimensional risk assessment
++        risk_data = calculate_risk_from_vectors(
++            vectors=vectors,
++            num_objects=num_objects,
++            ego_speed=DEFAULT_EGO_SPEED,
++        )
++        accel, brake, steer, reason, policy_label = policy_from_risk(risk_data)
++        risk_metadata = risk_data.to_dict()
++    else:
++        # Legacy distance-based policy
++        if use_n == 0:
++            min_dist = 999.0
++        else:
++            dists = [float(vectors[i][2]) for i in range(use_n)]
++            min_dist = min(dists)
++        accel, brake, steer, reason, policy_label = _policy_from_min_dist(use_n, min_dist)
++        risk_metadata = {"min_dist": min_dist}
++    
++    return accel, brake, steer, reason, policy_label, risk_metadata
++
++
+ def _make_samples_from_frames(
+     frames: List[Dict],
+     captioning_samples: List[Dict],
+@@ -88,26 +123,38 @@ def _make_samples_from_frames(
+ 
+         # --- Stage 2: paper-style actions ---
+         use_n = min(num_objects, MAX_OBJECTS)
+-        if use_n == 0:
+-            min_dist = 999.0
+-        else:
+-            dists = [float(frame["vectors"][i][2]) for i in range(use_n)]
+-            min_dist = min(dists)
+-
++        
++        # Get policy using risk-aware or legacy approach
++        accel, brake, steer, reason, policy_label, risk_metadata = _get_policy(frame)
++        
+         qa_question = "How should the car drive in this situation and why?"
+-        accel, brake, steer, reason, policy_label = _policy_from_min_dist(use_n, min_dist)
+         qa_target = _paper_target(accel, brake, steer, reason)
+ 
++        # Build observation with optional risk information
++        observation = caption
++        if USE_ADVANCED_RISK and 'risk_level' in risk_metadata:
++            risk_summary = get_risk_summary_text(
++                calculate_risk_from_vectors(frame["vectors"], num_objects, DEFAULT_EGO_SPEED)
++            )
++            observation = f"{caption}\n{risk_summary}"
++
+         # No leakage (caption only)
+         qa_input = (
+             "### OBSERVATION\n"
+-            f"{caption}\n\n"
++            f"{observation}\n\n"
+             "### QUESTION\n"
+             f"{qa_question}\n\n"
+             "### OUTPUT FORMAT\n"
+             f"{PAPER_FORMAT_INSTRUCTION}"
+         )
+ 
++        # Extract min_dist for backward compatibility
++        if use_n == 0:
++            min_dist = 999.0
++        else:
++            dists = [float(frame["vectors"][i][2]) for i in range(use_n)]
++            min_dist = min(dists)
++
+         qa_samples.append({
+             "input": qa_input,
+             "target": qa_target,
+@@ -126,6 +173,9 @@ def _make_samples_from_frames(
+             "min_dist": float(min_dist),
+             "policy_label": policy_label,
+             "use_n": int(use_n),
++            
++            # Risk metadata (new)
++            "risk_metadata": risk_metadata,
+         })
+ 
+         if (idx + 1) % 50 == 0:
+diff --git a/llm_driving/langen.py b/llm_driving/langen.py
+index d157ec5..bd810bf 100644
+--- a/llm_driving/langen.py
++++ b/llm_driving/langen.py
+@@ -75,10 +75,14 @@ def lanGen(frame: dict) -> str:
+     frame must contain:
+         - "vectors": np.ndarray(MAX_OBJECTS, VECTOR_DIM)
+         - "num_objects": int
++    
++    Optional risk enhancement when frame contains:
++        - "risk_data": dict with risk assessment
+     """
+ 
+     num_objects = int(frame["num_objects"])
+     vectors = frame["vectors"]
++    risk_data = frame.get("risk_data", None)
+ 
+     lines: List[str] = []
+ 
+@@ -118,6 +122,23 @@ def lanGen(frame: dict) -> str:
+     # ---------- Ego + route (fixed placeholders) ----------
+     lines.append("My current speed is 10.0 m/s.")
+     lines.append("The route continues straight ahead.")
++    
++    # ---------- Risk information (if available) ----------
++    if risk_data is not None:
++        risk_level = risk_data.get('risk_level', 'UNKNOWN')
++        min_ttc = risk_data.get('min_ttc')
++        max_collision = risk_data.get('max_collision_risk', 0)
++        max_pedestrian = risk_data.get('max_pedestrian_risk', 0)
++        
++        risk_parts = [f"Risk assessment: {risk_level}."]
++        if min_ttc is not None:
++            risk_parts.append(f"Time-to-collision: {min_ttc:.1f}s.")
++        if max_collision >= 0.3:
++            risk_parts.append(f"Collision risk: {max_collision:.0%}.")
++        if max_pedestrian >= 0.3:
++            risk_parts.append(f"Pedestrian risk: {max_pedestrian:.0%}.")
++        
++        lines.append(" ".join(risk_parts))
+ 
+     return "\n".join(lines)
+ 
+diff --git a/llm_driving/nuscenes_data.py b/llm_driving/nuscenes_data.py
+index ae13c12..87bb6b3 100644
+--- a/llm_driving/nuscenes_data.py
++++ b/llm_driving/nuscenes_data.py
+@@ -46,10 +46,16 @@ def _yaw_from_quaternion(q: Quaternion) -> float:
+ def get_object_vectors_for_sample(
+     nusc: NuScenes,
+     sample_token: str,
+-) -> Tuple[np.ndarray, int]:
++) -> Tuple[np.ndarray, int, List[str]]:
+     """
+     Extract object vectors for a given sample token.
+     Uses ego pose (LIDAR_TOP) to convert global boxes -> ego frame.
++    
++    Returns:
++        Tuple of (vectors, count, category_names)
++        - vectors: (MAX_OBJECTS, VECTOR_DIM) array
++        - count: number of valid objects
++        - category_names: list of category names for each object (for risk calculation)
+     """
+     sample = nusc.get("sample", sample_token)
+ 
+@@ -63,6 +69,7 @@ def get_object_vectors_for_sample(
+     ego_q_inv = ego_q.inverse
+ 
+     vectors: List[List[float]] = []
++    categories: List[str] = []
+ 
+     for ann_token in sample["anns"]:
+         ann = nusc.get("sample_annotation", ann_token)
+@@ -113,16 +120,24 @@ def get_object_vectors_for_sample(
+             type_id = 3
+ 
+         vectors.append([rel_x, rel_y, dist, rel_speed, heading, size, float(type_id)])
++        categories.append(category)
+ 
+     # Sort by distance so MAX_OBJECTS are the nearest ones (much more stable)
+-    vectors.sort(key=lambda v: v[2])
++    # Sort both vectors and categories together
++    if vectors:
++        sorted_pairs = sorted(zip(vectors, categories), key=lambda x: x[0][2])
++        vectors = [p[0] for p in sorted_pairs]
++        categories = [p[1] for p in sorted_pairs]
+ 
+     padded = np.zeros((MAX_OBJECTS, VECTOR_DIM), dtype=np.float32)
+     count = min(len(vectors), MAX_OBJECTS)
+     if count > 0:
+         padded[:count, :] = np.array(vectors[:count], dtype=np.float32)
++    
++    # Truncate categories to MAX_OBJECTS
++    categories = categories[:count]
+ 
+-    return padded, count
++    return padded, count, categories
+ 
+ 
+ def get_scene_frames_vectors(
+@@ -135,7 +150,8 @@ def get_scene_frames_vectors(
+       {
+         "vectors": np.ndarray(MAX_OBJECTS, VECTOR_DIM),
+         "num_objects": int,
+-        "sample_token": str
++        "sample_token": str,
++        "categories": List[str]  # Added for risk calculation
+       }
+     """
+     scene = nusc.scene[scene_idx]
+@@ -150,12 +166,13 @@ def get_scene_frames_vectors(
+         if max_frames is not None and frame_idx >= max_frames:
+             break
+ 
+-        vecs, num_obj = get_object_vectors_for_sample(nusc, token)
++        vecs, num_obj, categories = get_object_vectors_for_sample(nusc, token)
+         frames.append(
+             {
+                 "vectors": vecs,
+                 "num_objects": num_obj,
+                 "sample_token": token,
++                "categories": categories,
+             }
+         )
+ 

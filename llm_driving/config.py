@@ -15,6 +15,18 @@ MAX_OBJECTS = 10
 VECTOR_DIM = 7
 
 # -----------------------------
+# Risk Calculation (NEW)
+# -----------------------------
+DEFAULT_EGO_SPEED = 10.0  # m/s
+USE_ADVANCED_RISK = True  # Use multi-dimensional risk instead of simple distance-based policy
+RISK_WEIGHTS = {
+    'collision': 0.40,
+    'pedestrian': 0.30,
+    'ttc': 0.20,
+    'regulatory': 0.10,
+}
+
+# -----------------------------
 # model
 # -----------------------------
 MODEL_NAME = "google/flan-t5-base"

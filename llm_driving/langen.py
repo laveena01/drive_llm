@@ -75,10 +75,14 @@ def lanGen(frame: dict) -> str:
     frame must contain:
         - "vectors": np.ndarray(MAX_OBJECTS, VECTOR_DIM)
         - "num_objects": int
+    
+    Optional risk enhancement when frame contains:
+        - "risk_data": dict with risk assessment
     """
 
     num_objects = int(frame["num_objects"])
     vectors = frame["vectors"]
+    risk_data = frame.get("risk_data", None)
 
     lines: List[str] = []
 
@@ -118,6 +122,23 @@ def lanGen(frame: dict) -> str:
     # ---------- Ego + route (fixed placeholders) ----------
     lines.append("My current speed is 10.0 m/s.")
     lines.append("The route continues straight ahead.")
+    
+    # ---------- Risk information (if available) ----------
+    if risk_data is not None:
+        risk_level = risk_data.get('risk_level', 'UNKNOWN')
+        min_ttc = risk_data.get('min_ttc')
+        max_collision = risk_data.get('max_collision_risk', 0)
+        max_pedestrian = risk_data.get('max_pedestrian_risk', 0)
+        
+        risk_parts = [f"Risk assessment: {risk_level}."]
+        if min_ttc is not None:
+            risk_parts.append(f"Time-to-collision: {min_ttc:.1f}s.")
+        if max_collision >= 0.3:
+            risk_parts.append(f"Collision risk: {max_collision:.0%}.")
+        if max_pedestrian >= 0.3:
+            risk_parts.append(f"Pedestrian risk: {max_pedestrian:.0%}.")
+        
+        lines.append(" ".join(risk_parts))
 
     return "\n".join(lines)
 

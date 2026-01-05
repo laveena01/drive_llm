@@ -16,7 +16,8 @@ import json
 
 from .nuscenes_data import get_scene_frames_vectors, init_nuscenes
 from .langen import lanGen, vector_to_string
-from .config import CAPTIONING_DATA_PATH, QA_DATA_PATH, MAX_OBJECTS
+from .config import CAPTIONING_DATA_PATH, QA_DATA_PATH, MAX_OBJECTS, USE_ADVANCED_RISK, DEFAULT_EGO_SPEED
+from .risk_calculator import calculate_risk_from_vectors, policy_from_risk, get_risk_summary_text
 
 
 PAPER_FORMAT_INSTRUCTION = (
@@ -46,6 +47,7 @@ def _paper_target(accel: int, brake: int, steer: str, reason: str) -> str:
 
 
 def _policy_from_min_dist(num_objects: int, min_dist: float) -> tuple[int, int, str, str, str]:
+    """Legacy distance-based policy (kept for backward compatibility)."""
     steer = "straight"
 
     if num_objects == 0:
@@ -59,6 +61,39 @@ def _policy_from_min_dist(num_objects: int, min_dist: float) -> tuple[int, int, 
         return 10, 10, steer, f"Objects are within caution range (min {min_dist:.1f} m), proceed carefully.", "CAUTION"
     else:
         return 20, 0, steer, f"All objects are far enough (min {min_dist:.1f} m), continue.", "CONTINUE"
+
+
+def _get_policy(frame: dict) -> tuple[int, int, str, str, str, dict]:
+    """
+    Get driving policy using either advanced risk or legacy distance-based approach.
+    
+    Returns:
+        Tuple of (accel, brake, steer, reason, policy_label, risk_metadata)
+    """
+    num_objects = int(frame["num_objects"])
+    vectors = frame["vectors"]
+    use_n = min(num_objects, MAX_OBJECTS)
+    
+    if USE_ADVANCED_RISK:
+        # Use multi-dimensional risk assessment
+        risk_data = calculate_risk_from_vectors(
+            vectors=vectors,
+            num_objects=num_objects,
+            ego_speed=DEFAULT_EGO_SPEED,
+        )
+        accel, brake, steer, reason, policy_label = policy_from_risk(risk_data)
+        risk_metadata = risk_data.to_dict()
+    else:
+        # Legacy distance-based policy
+        if use_n == 0:
+            min_dist = 999.0
+        else:
+            dists = [float(vectors[i][2]) for i in range(use_n)]
+            min_dist = min(dists)
+        accel, brake, steer, reason, policy_label = _policy_from_min_dist(use_n, min_dist)
+        risk_metadata = {"min_dist": min_dist}
+    
+    return accel, brake, steer, reason, policy_label, risk_metadata
 
 
 def _make_samples_from_frames(
@@ -88,25 +123,37 @@ def _make_samples_from_frames(
 
         # --- Stage 2: paper-style actions ---
         use_n = min(num_objects, MAX_OBJECTS)
-        if use_n == 0:
-            min_dist = 999.0
-        else:
-            dists = [float(frame["vectors"][i][2]) for i in range(use_n)]
-            min_dist = min(dists)
-
+        
+        # Get policy using risk-aware or legacy approach
+        accel, brake, steer, reason, policy_label, risk_metadata = _get_policy(frame)
+        
         qa_question = "How should the car drive in this situation and why?"
-        accel, brake, steer, reason, policy_label = _policy_from_min_dist(use_n, min_dist)
         qa_target = _paper_target(accel, brake, steer, reason)
+
+        # Build observation with optional risk information
+        observation = caption
+        if USE_ADVANCED_RISK and 'risk_level' in risk_metadata:
+            risk_summary = get_risk_summary_text(
+                calculate_risk_from_vectors(frame["vectors"], num_objects, DEFAULT_EGO_SPEED)
+            )
+            observation = f"{caption}\n{risk_summary}"
 
         # No leakage (caption only)
         qa_input = (
             "### OBSERVATION\n"
-            f"{caption}\n\n"
+            f"{observation}\n\n"
             "### QUESTION\n"
             f"{qa_question}\n\n"
             "### OUTPUT FORMAT\n"
             f"{PAPER_FORMAT_INSTRUCTION}"
         )
+
+        # Extract min_dist for backward compatibility
+        if use_n == 0:
+            min_dist = 999.0
+        else:
+            dists = [float(frame["vectors"][i][2]) for i in range(use_n)]
+            min_dist = min(dists)
 
         qa_samples.append({
             "input": qa_input,
@@ -126,6 +173,9 @@ def _make_samples_from_frames(
             "min_dist": float(min_dist),
             "policy_label": policy_label,
             "use_n": int(use_n),
+            
+            # Risk metadata (new)
+            "risk_metadata": risk_metadata,
         })
 
         if (idx + 1) % 50 == 0:
