@@ -437,11 +437,22 @@ def train_stage1(captioning_path: str):
         trainer.save_model(STAGE1_OUTPUT_DIR)
         tokenizer.save_pretrained(STAGE1_OUTPUT_DIR)
 
+    # Barrier: ensure all ranks wait for model save to complete
+    _barrier()
+
+    if _rank0_only(rank):
         # Heavy generation/eval ONLY when single GPU (world==1)
         if heavy_eval:
             logger.info("[STAGE 1] Training finished. Running evaluation...")
-            eval_metrics = trainer.evaluate()
-            logger.info("\n[STAGE 1] Eval metrics:", eval_metrics)
+
+            # In distributed mode, skip trainer.evaluate() to avoid deadlock
+            # (trainer.evaluate() has internal barriers that all ranks must participate in)
+            if world > 1:
+                logger.info("[STAGE 1] Skipping trainer.evaluate() in DDP mode to avoid deadlock")
+                eval_metrics = {"eval_loss": "N/A - DDP mode (would cause deadlock)"}
+            else:
+                eval_metrics = trainer.evaluate()
+                logger.info("\n[STAGE 1] Eval metrics:", eval_metrics)
 
             metrics_path = os.path.join(STAGE1_OUTPUT_DIR, "eval_metrics.json")
             with open(metrics_path, "w") as f:
@@ -590,10 +601,21 @@ def train_stage2(model_stage1, tokenizer, qa_path: str):
         tokenizer.save_pretrained(STAGE2_OUTPUT_DIR)
         logger.info(f"[STAGE 2] Saved model+tokenizer to {STAGE2_OUTPUT_DIR}")
 
+    # Barrier: ensure all ranks wait for model save to complete
+    _barrier()
+
+    if _rank0_only(rank):
         # loss-only eval is usually fine (fast); keep it
         logger.info("[STAGE 2] Training finished. Running evaluation (loss only)...")
-        raw_eval = trainer.evaluate()
-        logger.info("\n[STAGE 2] Raw eval output:", raw_eval)
+
+        # In distributed mode, skip trainer.evaluate() to avoid deadlock
+        # (trainer.evaluate() has internal barriers that all ranks must participate in)
+        if world > 1:
+            logger.info("[STAGE 2] Skipping trainer.evaluate() in DDP mode to avoid deadlock")
+            raw_eval = {"eval_loss": "N/A - DDP mode (would cause deadlock)"}
+        else:
+            raw_eval = trainer.evaluate()
+            logger.info("\n[STAGE 2] Raw eval output:", raw_eval)
 
         # Heavy generation eval ONLY when single GPU (world==1)
         if heavy_eval:
