@@ -22,6 +22,9 @@ import os
 from .nuscenes_data import get_scene_frames_vectors, init_nuscenes
 from .langen import lanGen, vector_to_string
 from .config import CAPTIONING_DATA_PATH, QA_DATA_PATH, MAX_OBJECTS
+from .logger import get_logger
+
+logger = get_logger("datasets_builder")
 
 
 PAPER_FORMAT_INSTRUCTION = (
@@ -77,7 +80,7 @@ def _make_samples_from_frames(
     captioning_samples: List[Dict],
     qa_samples: List[Dict],
 ) -> None:
-    print(f"[datasets_builder]   Converting {len(frames)} frames into captioning + QA samples...")
+    logger.info(f"[datasets_builder]   Converting {len(frames)} frames into captioning + QA samples...")
     for idx, frame in enumerate(frames):
         num_objects = int(frame["num_objects"])
         caption = lanGen(frame)
@@ -130,7 +133,7 @@ def _make_samples_from_frames(
         })
 
         if (idx + 1) % 50 == 0:
-            print(f"[datasets_builder]     Processed {idx + 1}/{len(frames)} frames in this scene...")
+            logger.info(f"[datasets_builder]     Processed {idx + 1}/{len(frames)} frames in this scene...")
 
 
 def build_datasets_full_mini(
@@ -144,26 +147,26 @@ def build_datasets_full_mini(
         # do nothing on non-rank0
         return [], []
 
-    print("[datasets_builder] Initializing nuScenes for dataset creation...")
+    logger.info("[datasets_builder] Initializing nuScenes for dataset creation...")
     nusc = init_nuscenes()
 
     captioning_samples: list[dict] = []
     qa_samples: list[dict] = []
 
     num_scenes = len(nusc.scene)
-    print(f"[datasets_builder] Building data from all {num_scenes} scenes (version={nusc.version}).")
-    print(f"[datasets_builder]   max_frames_per_scene = {max_frames_per_scene}")
+    logger.info(f"[datasets_builder] Building data from all {num_scenes} scenes (version={nusc.version}).")
+    logger.info(f"[datasets_builder]   max_frames_per_scene = {max_frames_per_scene}")
 
     for scene_idx in range(num_scenes):
-        print(f"\n[datasets_builder] Processing scene {scene_idx}/{num_scenes - 1}...")
+        logger.info(f"\n[datasets_builder] Processing scene {scene_idx}/{num_scenes - 1}...")
         frames = get_scene_frames_vectors(
             nusc,
             scene_idx=scene_idx,
             max_frames=max_frames_per_scene,
         )
-        print(f"[datasets_builder]   Retrieved {len(frames)} frames from scene {scene_idx}.")
+        logger.info(f"[datasets_builder]   Retrieved {len(frames)} frames from scene {scene_idx}.")
         _make_samples_from_frames(frames, captioning_samples, qa_samples)
-        print(
+        logger.info(
             f"[datasets_builder]   After scene {scene_idx}: "
             f"{len(captioning_samples)} captioning samples, {len(qa_samples)} QA samples."
         )
@@ -171,13 +174,13 @@ def build_datasets_full_mini(
     os.makedirs(os.path.dirname(captioning_path), exist_ok=True)
     os.makedirs(os.path.dirname(qa_path), exist_ok=True)
 
-    print(f"\n[datasets_builder] Saving captioning dataset to: {captioning_path}")
+    logger.info(f"\n[datasets_builder] Saving captioning dataset to: {captioning_path}")
     with open(captioning_path, "w") as f:
         json.dump(captioning_samples, f, indent=2)
 
-    print(f"[datasets_builder] Saving QA dataset to: {qa_path}")
+    logger.info(f"[datasets_builder] Saving QA dataset to: {qa_path}")
     with open(qa_path, "w") as f:
         json.dump(qa_samples, f, indent=2)
 
-    print(f"[datasets_builder] DONE. Captioning samples: {len(captioning_samples)} | QA samples: {len(qa_samples)}")
+    logger.info(f"[datasets_builder] DONE. Captioning samples: {len(captioning_samples)} | QA samples: {len(qa_samples)}")
     return captioning_samples, qa_samples

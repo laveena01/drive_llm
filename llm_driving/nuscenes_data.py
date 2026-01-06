@@ -21,6 +21,9 @@ from nuscenes.nuscenes import NuScenes
 from pyquaternion import Quaternion
 
 from .config import NUSC_ROOT, NUSC_VERSION, MAX_OBJECTS, VECTOR_DIM
+from .logger import get_logger
+
+logger = get_logger("nuscenes_data")
 
 
 def init_nuscenes() -> NuScenes:
@@ -31,16 +34,16 @@ def init_nuscenes() -> NuScenes:
 
     We explicitly disable those optional tasks if the devkit supports the args.
     """
-    print(f"[nuscenes_data] Initializing nuScenes with:")
-    print(f"  - dataroot = {NUSC_ROOT}")
-    print(f"  - version  = {NUSC_VERSION}")
+    logger.info(f"[nuscenes_data] Initializing nuScenes with:")
+    logger.info(f"  - dataroot = {NUSC_ROOT}")
+    logger.info(f"  - version  = {NUSC_VERSION}")
 
     base_kwargs = dict(version=NUSC_VERSION, dataroot=NUSC_ROOT, verbose=True)
 
     # Try the most explicit signature first (newer devkit)
     try:
         nusc = NuScenes(**base_kwargs, lidarseg=False, panoptic=False)
-        print("[nuscenes_data] nuScenes initialized (lidarseg=False, panoptic=False).\n")
+        logger.info("[nuscenes_data] nuScenes initialized (lidarseg=False, panoptic=False).\n")
         return nusc
     except TypeError:
         pass
@@ -48,7 +51,7 @@ def init_nuscenes() -> NuScenes:
     # Some devkit versions have lidarseg but not panoptic
     try:
         nusc = NuScenes(**base_kwargs, lidarseg=False)
-        print("[nuscenes_data] nuScenes initialized (lidarseg=False).\n")
+        logger.info("[nuscenes_data] nuScenes initialized (lidarseg=False).\n")
         return nusc
     except TypeError:
         pass
@@ -56,7 +59,7 @@ def init_nuscenes() -> NuScenes:
     # Fallback (old devkit) – may still crash if it *forces* lidarseg on trainval
     try:
         nusc = NuScenes(**base_kwargs)
-        print("[nuscenes_data] nuScenes initialized.\n")
+        logger.info("[nuscenes_data] nuScenes initialized.\n")
         return nusc
     except FileNotFoundError as e:
         # Give a very clear error if the devkit is forcing lidarseg without args support
@@ -166,7 +169,7 @@ def get_scene_frames_vectors(
     scene = nusc.scene[scene_idx]
     token = scene["first_sample_token"]
 
-    print(f"[nuscenes_data] Collecting frames for scene {scene_idx} (token={scene['token']})")
+    logger.info(f"[nuscenes_data] Collecting frames for scene {scene_idx} (token={scene['token']})")
 
     frames: List[Dict] = []
     frame_idx = 0
@@ -189,7 +192,7 @@ def get_scene_frames_vectors(
         frame_idx += 1
 
         if frame_idx % 20 == 0:
-            print(f"[nuscenes_data]  Processed {frame_idx} frames in scene {scene_idx}...")
+            logger.info(f"[nuscenes_data]  Processed {frame_idx} frames in scene {scene_idx}...")
 
-    print(f"[nuscenes_data] Extracted {len(frames)} frames for scene {scene_idx}")
+    logger.info(f"[nuscenes_data] Extracted {len(frames)} frames for scene {scene_idx}")
     return frames

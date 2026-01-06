@@ -12,6 +12,9 @@ from .config import (
     QA_DATA_PATH,
     STAGE2_OUTPUT_DIR,
 )
+from .logger import get_logger
+
+logger = get_logger("inference")
 
 PAPER_FORMAT_INSTRUCTION = (
     "\n\nYou are an AI Driver.\n"
@@ -128,7 +131,7 @@ def run_inference_two_stage(
     out_path: Optional[str] = None,
     limit: Optional[int] = None,
 ) -> Dict:
-    print("[INF] Loading Stage-2 model from:", run_dir_stage2)
+    logger.info("[INF] Loading Stage-2 model from:", run_dir_stage2)
     tok2 = AutoTokenizer.from_pretrained(run_dir_stage2)
     m2 = AutoModelForSeq2SeqLM.from_pretrained(run_dir_stage2)
 
@@ -138,7 +141,7 @@ def run_inference_two_stage(
         except Exception:
             pass
 
-    print("[INF] Loading QA data:", qa_path)
+    logger.info("[INF] Loading QA data:", qa_path)
     qa_data = _load_json(qa_path)
     if limit is not None:
         qa_data = qa_data[:limit]
@@ -182,7 +185,7 @@ def run_inference_two_stage(
 
     action_acc = (correct / total) if total > 0 else 0.0
     parse_ok_rate = parse_ok_sum / max(1, len(preds))
-    print(f"[INF] action_accuracy={action_acc:.4f} on {total} labeled samples | parse_ok_rate={parse_ok_rate:.3f}")
+    logger.info(f"[INF] action_accuracy={action_acc:.4f} on {total} labeled samples | parse_ok_rate={parse_ok_rate:.3f}")
 
     result = {
         "metrics": {"action_accuracy": action_acc, "parse_ok_rate": float(parse_ok_rate)},
@@ -194,5 +197,5 @@ def run_inference_two_stage(
         out_path = os.path.join(run_dir_stage2, "inference_outputs.json")
 
     _save_json(out_path, result)
-    print("[INF] Saved inference outputs to:", out_path)
+    logger.info("[INF] Saved inference outputs to:", out_path)
     return result

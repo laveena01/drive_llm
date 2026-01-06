@@ -25,6 +25,7 @@ from llm_driving.config import (
 from llm_driving.datasets_builder import build_datasets_full_mini
 from llm_driving.training import train_stage1, train_stage2
 from llm_driving import config as cfg
+from llm_driving.logger import setup_logger
 
 
 def _dist_info() -> tuple[int, int, int]:
@@ -39,12 +40,12 @@ def _dist_info() -> tuple[int, int, int]:
     return rank, world, local_rank
 
 
-def _rank0_print(rank: int, msg: str) -> None:
+def _rank0_log(logger, rank: int, msg: str) -> None:
     if rank == 0:
-        print(msg)
+        logger.info(msg)
 
 
-def _save_config_snapshot(rank: int) -> None:
+def _save_config_snapshot(logger, rank: int) -> None:
     """Save config snapshot once (rank0 only)."""
     if rank != 0:
         return
@@ -53,7 +54,7 @@ def _save_config_snapshot(rank: int) -> None:
     out_path = os.path.join(RUN_DIR, "config_snapshot.json")
     with open(out_path, "w") as f:
         json.dump(snapshot, f, indent=2)
-    print(f"[MAIN] Saved config snapshot to: {out_path}")
+    logger.info(f"[MAIN] Saved config snapshot to: {out_path}")
 
 
 def _wait_for_paths(paths: list[str], rank: int, poll_sec: float = 2.0, timeout_sec: int = 3600) -> None:
@@ -77,32 +78,36 @@ def main():
     # (Optional) reduces tokenizer thread spam / contention
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
-    if rank == 0:
-        print("=" * 90)
-        print("[MAIN] LLM driving pipeline started.")
-        print(f"[MAIN] RUN_ID : {RUN_ID}")
-        print(f"[MAIN] RUN_DIR: {RUN_DIR}")
-        print("-" * 90)
-        print(f"[MAIN] Captioning dataset path : {CAPTIONING_DATA_PATH}")
-        print(f"[MAIN] QA dataset path         : {QA_DATA_PATH}")
-        print(f"[MAIN] Distributed: rank={rank}/{world} (local_rank={local_rank})")
-        print("=" * 90)
+    # Setup logger with single consolidated log file in RUN_DIR
+    log_file = os.path.join(RUN_DIR, "training.log")
+    logger = setup_logger(name="llm_driving", log_file=log_file, rank=rank)
 
-    _save_config_snapshot(rank)
+    if rank == 0:
+        logger.info("=" * 90)
+        logger.info("[MAIN] LLM driving pipeline started.")
+        logger.info(f"[MAIN] RUN_ID : {RUN_ID}")
+        logger.info(f"[MAIN] RUN_DIR: {RUN_DIR}")
+        logger.info("-" * 90)
+        logger.info(f"[MAIN] Captioning dataset path : {CAPTIONING_DATA_PATH}")
+        logger.info(f"[MAIN] QA dataset path         : {QA_DATA_PATH}")
+        logger.info(f"[MAIN] Distributed: rank={rank}/{world} (local_rank={local_rank})")
+        logger.info("=" * 90)
+
+    _save_config_snapshot(logger, rank)
 
     # 1) Build datasets (rank0 only)
     if rank == 0:
-        print("\n[MAIN] Step 1/3: Building datasets ...")
+        logger.info("\n[MAIN] Step 1/3: Building datasets ...")
 
         if os.path.exists(CAPTIONING_DATA_PATH) and os.path.exists(QA_DATA_PATH):
-            print("[MAIN] Found existing dataset JSONs. Skipping dataset building.")
+            logger.info("[MAIN] Found existing dataset JSONs. Skipping dataset building.")
         else:
             captioning_samples, qa_samples = build_datasets_full_mini(
                 max_frames_per_scene=None,
                 captioning_path=CAPTIONING_DATA_PATH,
                 qa_path=QA_DATA_PATH,
             )
-            print(
+            logger.info(
                 f"[MAIN] Step 1/3 DONE: "
                 f"{len(captioning_samples)} captioning samples, "
                 f"{len(qa_samples)} QA samples."
@@ -113,25 +118,25 @@ def main():
 
     # 2) Stage 1
     if RUN_STAGE1:
-        _rank0_print(rank, "\n[MAIN] Step 2/3: Training Stage 1 (vector → caption)...")
+        _rank0_log(logger, rank, "\n[MAIN] Step 2/3: Training Stage 1 (vector → caption)...")
         model_stage1, tokenizer = train_stage1(CAPTIONING_DATA_PATH)
-        _rank0_print(rank, "[MAIN] Step 2/3 DONE: Stage 1 training finished.")
+        _rank0_log(logger, rank, "[MAIN] Step 2/3 DONE: Stage 1 training finished.")
     else:
         model_stage1, tokenizer = None, None
-        _rank0_print(rank, "\n[MAIN] Step 2/3: Skipping Stage 1 (RUN_STAGE1=False).")
+        _rank0_log(logger, rank, "\n[MAIN] Step 2/3: Skipping Stage 1 (RUN_STAGE1=False).")
 
     # 3) Stage 2
     if RUN_STAGE2:
-        _rank0_print(rank, "\n[MAIN] Step 3/3: Training Stage 2 (caption + question → action/answer)...")
+        _rank0_log(logger, rank, "\n[MAIN] Step 3/3: Training Stage 2 (caption + question → action/answer)...")
         _ = train_stage2(model_stage1, tokenizer, QA_DATA_PATH)
-        _rank0_print(rank, "[MAIN] Step 3/3 DONE: Stage 2 training finished.")
+        _rank0_log(logger, rank, "[MAIN] Step 3/3 DONE: Stage 2 training finished.")
     else:
-        _rank0_print(rank, "\n[MAIN] Step 3/3: Skipping Stage 2 (RUN_STAGE2=False).")
+        _rank0_log(logger, rank, "\n[MAIN] Step 3/3: Skipping Stage 2 (RUN_STAGE2=False).")
 
-    _rank0_print(rank, "\n[MAIN] Pipeline finished successfully.")
-    _rank0_print(rank, "=" * 90)
-    _rank0_print(rank, f"[MAIN] All outputs saved under: {RUN_DIR}")
-    _rank0_print(rank, "=" * 90)
+    _rank0_log(logger, rank, "\n[MAIN] Pipeline finished successfully.")
+    _rank0_log(logger, rank, "=" * 90)
+    _rank0_log(logger, rank, f"[MAIN] All outputs saved under: {RUN_DIR}")
+    _rank0_log(logger, rank, "=" * 90)
 
 
 if __name__ == "__main__":

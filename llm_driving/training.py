@@ -42,6 +42,9 @@ from .config import (
     STAGE1_OUTPUT_DIR,
     STAGE2_OUTPUT_DIR,
 )
+from .logger import get_logger
+
+logger = get_logger("training")
 
 # ---------------------------
 # DDP helpers
@@ -356,22 +359,22 @@ def train_stage1(captioning_path: str):
         disable_progress_bar()
 
     if _rank0_only(rank):
-        print("\n" + "=" * 80)
-        print("[STAGE 1] Vector → Caption training started.")
-        print(f"[STAGE 1] Loading captioning data from: {captioning_path}")
+        logger.info("\n" + "=" * 80)
+        logger.info("[STAGE 1] Vector → Caption training started.")
+        logger.info(f"[STAGE 1] Loading captioning data from: {captioning_path}")
 
     with open(captioning_path, "r") as f:
         data = json.load(f)
 
     full_ds = Dataset.from_list(data)
     if _rank0_only(rank):
-        print(f"[STAGE 1] Total samples: {len(full_ds)}")
+        logger.info(f"[STAGE 1] Total samples: {len(full_ds)}")
 
     split_ds = full_ds.train_test_split(test_size=0.2, seed=42)
     train_ds = split_ds["train"]
     eval_ds = split_ds["test"]
     if _rank0_only(rank):
-        print(f"[STAGE 1] Train samples: {len(train_ds)}  |  Val samples: {len(eval_ds)}")
+        logger.info(f"[STAGE 1] Train samples: {len(train_ds)}  |  Val samples: {len(eval_ds)}")
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 
@@ -379,17 +382,17 @@ def train_stage1(captioning_path: str):
         return _tokenize_captioning(batch, tokenizer)
 
     if _rank0_only(rank):
-        print("[STAGE 1] Tokenizing datasets...")
+        logger.info("[STAGE 1] Tokenizing datasets...")
     tokenized_train = train_ds.map(tokenize_fn, batched=True, remove_columns=["input", "target"])
     tokenized_eval = eval_ds.map(tokenize_fn, batched=True, remove_columns=["input", "target"])
 
     if _rank0_only(rank):
-        print(f"[STAGE 1] Loading model: {MODEL_NAME}")
+        logger.info(f"[STAGE 1] Loading model: {MODEL_NAME}")
     model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME)
 
     if _rank0_only(rank):
         _ensure_dir(STAGE1_OUTPUT_DIR)
-        print(f"[STAGE 1] Output directory: {STAGE1_OUTPUT_DIR}")
+        logger.info(f"[STAGE 1] Output directory: {STAGE1_OUTPUT_DIR}")
     _barrier()  # make sure dir exists before any rank uses it
 
     training_args = TrainingArguments(
@@ -421,7 +424,7 @@ def train_stage1(captioning_path: str):
     )
 
     if _rank0_only(rank):
-        print("[STAGE 1] Starting training...")
+        logger.info("[STAGE 1] Starting training...")
     trainer.train()
 
     # short sync so all ranks finish training before stage transition
@@ -436,16 +439,16 @@ def train_stage1(captioning_path: str):
 
         # Heavy generation/eval ONLY when single GPU (world==1)
         if heavy_eval:
-            print("[STAGE 1] Training finished. Running evaluation...")
+            logger.info("[STAGE 1] Training finished. Running evaluation...")
             eval_metrics = trainer.evaluate()
-            print("\n[STAGE 1] Eval metrics:", eval_metrics)
+            logger.info("\n[STAGE 1] Eval metrics:", eval_metrics)
 
             metrics_path = os.path.join(STAGE1_OUTPUT_DIR, "eval_metrics.json")
             with open(metrics_path, "w") as f:
                 json.dump(eval_metrics, f, indent=2)
-            print(f"[STAGE 1] Saved eval metrics to {metrics_path}")
+            logger.info(f"[STAGE 1] Saved eval metrics to {metrics_path}")
 
-            print("[STAGE 1] Generating predictions on validation set (rank0 only)...")
+            logger.info("[STAGE 1] Generating predictions on validation set (rank0 only)...")
             trained_model.eval()
             device = trained_model.device
 
@@ -475,15 +478,15 @@ def train_stage1(captioning_path: str):
             preds_path = os.path.join(STAGE1_OUTPUT_DIR, "val_predictions.json")
             with open(preds_path, "w") as f:
                 json.dump(val_preds, f, indent=2)
-            print(f"[STAGE 1] Saved {len(val_preds)} validation predictions to {preds_path}")
+            logger.info(f"[STAGE 1] Saved {len(val_preds)} validation predictions to {preds_path}")
         else:
             if world > 1:
-                print("[STAGE 1] (DDP) Skipping heavy generation/eval to avoid NCCL timeouts. "
+                logger.info("[STAGE 1] (DDP) Skipping heavy generation/eval to avoid NCCL timeouts. "
                       "Run single-GPU for val_predictions + detailed metrics.")
             elif _SKIP_HEAVY_EVAL:
-                print("[STAGE 1] SKIP_HEAVY_EVAL=1 => skipping heavy generation/eval.")
+                logger.info("[STAGE 1] SKIP_HEAVY_EVAL=1 => skipping heavy generation/eval.")
 
-        print("[STAGE 1] Done.\n" + "=" * 80)
+        logger.info("[STAGE 1] Done.\n" + "=" * 80)
 
     # short sync so stage2 starts together
     _barrier()
@@ -507,9 +510,9 @@ def train_stage2(model_stage1, tokenizer, qa_path: str):
         disable_progress_bar()
 
     if _rank0_only(rank):
-        print("\n" + "=" * 80)
-        print("[STAGE 2] Driving QA finetuning started.")
-        print(f"[STAGE 2] Loading QA data from: {qa_path}")
+        logger.info("\n" + "=" * 80)
+        logger.info("[STAGE 2] Driving QA finetuning started.")
+        logger.info(f"[STAGE 2] Loading QA data from: {qa_path}")
 
     model_stage1 = _unwrap_model(model_stage1)
 
@@ -522,13 +525,13 @@ def train_stage2(model_stage1, tokenizer, qa_path: str):
 
     full_ds = Dataset.from_list(data)
     if _rank0_only(rank):
-        print(f"[STAGE 2] Total samples: {len(full_ds)}")
+        logger.info(f"[STAGE 2] Total samples: {len(full_ds)}")
 
     split_ds = full_ds.train_test_split(test_size=0.2, seed=42)
     train_ds = split_ds["train"]
     eval_ds = split_ds["test"]
     if _rank0_only(rank):
-        print(f"[STAGE 2] Train samples: {len(train_ds)}  |  Val samples: {len(eval_ds)}")
+        logger.info(f"[STAGE 2] Train samples: {len(train_ds)}  |  Val samples: {len(eval_ds)}")
 
     def tokenize_fn(batch):
         batch_inp = batch["input"]
@@ -537,13 +540,13 @@ def train_stage2(model_stage1, tokenizer, qa_path: str):
         return _tokenize_qa(batch, tokenizer)
 
     if _rank0_only(rank):
-        print("[STAGE 2] Tokenizing datasets...")
+        logger.info("[STAGE 2] Tokenizing datasets...")
     tokenized_train = train_ds.map(tokenize_fn, batched=True, remove_columns=["input", "target"])
     tokenized_eval = eval_ds.map(tokenize_fn, batched=True, remove_columns=["input", "target"])
 
     if _rank0_only(rank):
         _ensure_dir(STAGE2_OUTPUT_DIR)
-        print(f"[STAGE 2] Output directory: {STAGE2_OUTPUT_DIR}")
+        logger.info(f"[STAGE 2] Output directory: {STAGE2_OUTPUT_DIR}")
     _barrier()
 
     training_args = TrainingArguments(
@@ -574,7 +577,7 @@ def train_stage2(model_stage1, tokenizer, qa_path: str):
     )
 
     if _rank0_only(rank):
-        print("[STAGE 2] Starting training...")
+        logger.info("[STAGE 2] Starting training...")
     trainer.train()
 
     # short sync so all ranks finish training
@@ -585,12 +588,12 @@ def train_stage2(model_stage1, tokenizer, qa_path: str):
     if _rank0_only(rank):
         trainer.save_model(STAGE2_OUTPUT_DIR)
         tokenizer.save_pretrained(STAGE2_OUTPUT_DIR)
-        print(f"[STAGE 2] Saved model+tokenizer to {STAGE2_OUTPUT_DIR}")
+        logger.info(f"[STAGE 2] Saved model+tokenizer to {STAGE2_OUTPUT_DIR}")
 
         # loss-only eval is usually fine (fast); keep it
-        print("[STAGE 2] Training finished. Running evaluation (loss only)...")
+        logger.info("[STAGE 2] Training finished. Running evaluation (loss only)...")
         raw_eval = trainer.evaluate()
-        print("\n[STAGE 2] Raw eval output:", raw_eval)
+        logger.info("\n[STAGE 2] Raw eval output:", raw_eval)
 
         # Heavy generation eval ONLY when single GPU (world==1)
         if heavy_eval:
@@ -717,13 +720,13 @@ def train_stage2(model_stage1, tokenizer, qa_path: str):
                 }
                 return metrics, outputs
 
-            print("[STAGE 2] Computing metrics: oracle_caption...")
+            logger.info("[STAGE 2] Computing metrics: oracle_caption...")
             oracle_metrics, oracle_outputs = run_eval("oracle_caption")
-            print("[STAGE 2] oracle_caption metrics:", oracle_metrics)
+            logger.info("[STAGE 2] oracle_caption metrics:", oracle_metrics)
 
-            print("[STAGE 2] Computing metrics: stage1_caption...")
+            logger.info("[STAGE 2] Computing metrics: stage1_caption...")
             stage1_metrics, stage1_outputs = run_eval("stage1_caption")
-            print("[STAGE 2] stage1_caption metrics:", stage1_metrics)
+            logger.info("[STAGE 2] stage1_caption metrics:", stage1_metrics)
 
             eval_metrics: Dict = {}
             if isinstance(raw_eval, dict):
@@ -739,25 +742,25 @@ def train_stage2(model_stage1, tokenizer, qa_path: str):
             metrics_path = os.path.join(STAGE2_OUTPUT_DIR, "eval_metrics.json")
             with open(metrics_path, "w") as f:
                 json.dump(eval_metrics, f, indent=2)
-            print(f"[STAGE 2] Saved eval metrics to {metrics_path}")
+            logger.info(f"[STAGE 2] Saved eval metrics to {metrics_path}")
 
             preds_path1 = os.path.join(STAGE2_OUTPUT_DIR, "val_predictions_oracle_caption.json")
             with open(preds_path1, "w") as f:
                 json.dump(oracle_outputs, f, indent=2)
-            print(f"[STAGE 2] Saved oracle-caption predictions to {preds_path1}")
+            logger.info(f"[STAGE 2] Saved oracle-caption predictions to {preds_path1}")
 
             preds_path2 = os.path.join(STAGE2_OUTPUT_DIR, "val_predictions_stage1_caption.json")
             with open(preds_path2, "w") as f:
                 json.dump(stage1_outputs, f, indent=2)
-            print(f"[STAGE 2] Saved stage1-caption predictions to {preds_path2}")
+            logger.info(f"[STAGE 2] Saved stage1-caption predictions to {preds_path2}")
         else:
             if world > 1:
-                print("[STAGE 2] (DDP) Skipping heavy generation-eval metrics to avoid NCCL timeouts. "
+                logger.info("[STAGE 2] (DDP) Skipping heavy generation-eval metrics to avoid NCCL timeouts. "
                       "Run single-GPU for detailed metrics JSON + predictions.")
             elif _SKIP_HEAVY_EVAL:
-                print("[STAGE 2] SKIP_HEAVY_EVAL=1 => skipping heavy generation-eval metrics.")
+                logger.info("[STAGE 2] SKIP_HEAVY_EVAL=1 => skipping heavy generation-eval metrics.")
 
-        print("[STAGE 2] Done.\n" + "=" * 80)
+        logger.info("[STAGE 2] Done.\n" + "=" * 80)
 
     # short sync so all ranks exit together
     _barrier()

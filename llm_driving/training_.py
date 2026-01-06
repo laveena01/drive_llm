@@ -39,6 +39,9 @@ from .config import (
     STAGE1_OUTPUT_DIR,
     STAGE2_OUTPUT_DIR,
 )
+from .logger import get_logger
+
+logger = get_logger("training")
 
 # ---------------------------
 # Helpers
@@ -244,35 +247,35 @@ def _tokenize_qa(batch, tokenizer):
 # ---------------------------
 
 def train_stage1(captioning_path: str):
-    print("\n" + "=" * 80)
-    print("[STAGE 1] Vector → Caption training started.")
-    print(f"[STAGE 1] Loading captioning data from: {captioning_path}")
+    logger.info("\n" + "=" * 80)
+    logger.info("[STAGE 1] Vector → Caption training started.")
+    logger.info(f"[STAGE 1] Loading captioning data from: {captioning_path}")
 
     with open(captioning_path, "r") as f:
         data = json.load(f)
 
     full_ds = Dataset.from_list(data)
-    print(f"[STAGE 1] Total samples: {len(full_ds)}")
+    logger.info(f"[STAGE 1] Total samples: {len(full_ds)}")
 
     split_ds = full_ds.train_test_split(test_size=0.2, seed=42)
     train_ds = split_ds["train"]
     eval_ds = split_ds["test"]
-    print(f"[STAGE 1] Train samples: {len(train_ds)}  |  Val samples: {len(eval_ds)}")
+    logger.info(f"[STAGE 1] Train samples: {len(train_ds)}  |  Val samples: {len(eval_ds)}")
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 
     def tokenize_fn(batch):
         return _tokenize_captioning(batch, tokenizer)
 
-    print("[STAGE 1] Tokenizing datasets...")
+    logger.info("[STAGE 1] Tokenizing datasets...")
     tokenized_train = train_ds.map(tokenize_fn, batched=True, remove_columns=["input", "target"])
     tokenized_eval = eval_ds.map(tokenize_fn, batched=True, remove_columns=["input", "target"])
 
-    print(f"[STAGE 1] Loading model: {MODEL_NAME}")
+    logger.info(f"[STAGE 1] Loading model: {MODEL_NAME}")
     model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME)
 
     _ensure_dir(STAGE1_OUTPUT_DIR)
-    print(f"[STAGE 1] Output directory: {STAGE1_OUTPUT_DIR}")
+    logger.info(f"[STAGE 1] Output directory: {STAGE1_OUTPUT_DIR}")
 
     training_args = TrainingArguments(
         output_dir=STAGE1_OUTPUT_DIR,
@@ -299,19 +302,19 @@ def train_stage1(captioning_path: str):
         tokenizer=tokenizer,
     )
 
-    print("[STAGE 1] Starting training...")
+    logger.info("[STAGE 1] Starting training...")
     trainer.train()
-    print("[STAGE 1] Training finished. Running evaluation...")
+    logger.info("[STAGE 1] Training finished. Running evaluation...")
 
     eval_metrics = trainer.evaluate()
-    print("\n[STAGE 1] Eval metrics:", eval_metrics)
+    logger.info("\n[STAGE 1] Eval metrics:", eval_metrics)
 
     metrics_path = os.path.join(STAGE1_OUTPUT_DIR, "eval_metrics.json")
     with open(metrics_path, "w") as f:
         json.dump(eval_metrics, f, indent=2)
-    print(f"[STAGE 1] Saved eval metrics to {metrics_path}")
+    logger.info(f"[STAGE 1] Saved eval metrics to {metrics_path}")
 
-    print("[STAGE 1] Generating predictions on validation set...")
+    logger.info("[STAGE 1] Generating predictions on validation set...")
     model.eval()
     val_preds = []
     for sample in eval_ds:
@@ -334,7 +337,7 @@ def train_stage1(captioning_path: str):
     preds_path = os.path.join(STAGE1_OUTPUT_DIR, "val_predictions.json")
     with open(preds_path, "w") as f:
         json.dump(val_preds, f, indent=2)
-    print(f"[STAGE 1] Saved {len(val_preds)} validation predictions to {preds_path}")
+    logger.info(f"[STAGE 1] Saved {len(val_preds)} validation predictions to {preds_path}")
 
     # quick sanity
     if len(eval_ds) > 0:
@@ -343,12 +346,12 @@ def train_stage1(captioning_path: str):
         pred_ids = model.generate(**inputs, max_new_tokens=160, num_beams=4, early_stopping=True)
         pred_text = tokenizer.decode(pred_ids[0], skip_special_tokens=True)
 
-        print("\n[STAGE 1 TEST SAMPLE]")
-        print("INPUT:\n", s0["input"])
-        print("\nPRED CAPTION:\n", pred_text)
-        print("\nGT CAPTION:\n", s0["target"])
+        logger.info("\n[STAGE 1 TEST SAMPLE]")
+        logger.info("INPUT:\n", s0["input"])
+        logger.info("\nPRED CAPTION:\n", pred_text)
+        logger.info("\nGT CAPTION:\n", s0["target"])
 
-    print("[STAGE 1] Done.\n" + "=" * 80)
+    logger.info("[STAGE 1] Done.\n" + "=" * 80)
     return model, tokenizer
 
 
@@ -361,23 +364,23 @@ def train_stage2(model_stage1, tokenizer, qa_path: str):
     model_stage1: trained stage-1 model (vector->caption) used for stage1_caption evaluation.
     Stage-2 model is trained from base pretrained MODEL_NAME weights.
     """
-    print("\n" + "=" * 80)
-    print("[STAGE 2] Driving QA finetuning started.")
-    print(f"[STAGE 2] Loading QA data from: {qa_path}")
+    logger.info("\n" + "=" * 80)
+    logger.info("[STAGE 2] Driving QA finetuning started.")
+    logger.info(f"[STAGE 2] Loading QA data from: {qa_path}")
 
-    print(f"[STAGE 2] Loading Stage-2 model from base: {MODEL_NAME}")
+    logger.info(f"[STAGE 2] Loading Stage-2 model from base: {MODEL_NAME}")
     model_stage2 = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME).to(model_stage1.device)
 
     with open(qa_path, "r") as f:
         data = json.load(f)
 
     full_ds = Dataset.from_list(data)
-    print(f"[STAGE 2] Total samples: {len(full_ds)}")
+    logger.info(f"[STAGE 2] Total samples: {len(full_ds)}")
 
     split_ds = full_ds.train_test_split(test_size=0.2, seed=42)
     train_ds = split_ds["train"]
     eval_ds = split_ds["test"]
-    print(f"[STAGE 2] Train samples: {len(train_ds)}  |  Val samples: {len(eval_ds)}")
+    logger.info(f"[STAGE 2] Train samples: {len(train_ds)}  |  Val samples: {len(eval_ds)}")
 
     def tokenize_fn(batch):
         # ensure paper-format instruction is present during training too
@@ -386,12 +389,12 @@ def train_stage2(model_stage1, tokenizer, qa_path: str):
         batch["input"] = [_ensure_paper_format(x) for x in batch_inp]
         return _tokenize_qa(batch, tokenizer)
 
-    print("[STAGE 2] Tokenizing datasets...")
+    logger.info("[STAGE 2] Tokenizing datasets...")
     tokenized_train = train_ds.map(tokenize_fn, batched=True, remove_columns=["input", "target"])
     tokenized_eval = eval_ds.map(tokenize_fn, batched=True, remove_columns=["input", "target"])
 
     _ensure_dir(STAGE2_OUTPUT_DIR)
-    print(f"[STAGE 2] Output directory: {STAGE2_OUTPUT_DIR}")
+    logger.info(f"[STAGE 2] Output directory: {STAGE2_OUTPUT_DIR}")
 
     training_args = TrainingArguments(
         output_dir=STAGE2_OUTPUT_DIR,
@@ -418,12 +421,12 @@ def train_stage2(model_stage1, tokenizer, qa_path: str):
         tokenizer=tokenizer,
     )
 
-    print("[STAGE 2] Starting training...")
+    logger.info("[STAGE 2] Starting training...")
     trainer.train()
-    print("[STAGE 2] Training finished. Running evaluation (loss only)...")
+    logger.info("[STAGE 2] Training finished. Running evaluation (loss only)...")
 
     raw_eval = trainer.evaluate()
-    print("\n[STAGE 2] Raw eval output:", raw_eval)
+    logger.info("\n[STAGE 2] Raw eval output:", raw_eval)
 
     model_stage1.eval()
     model_stage2.eval()
@@ -504,13 +507,13 @@ def train_stage2(model_stage1, tokenizer, qa_path: str):
         }
         return metrics, outputs
 
-    print("[STAGE 2] Computing metrics: oracle_caption...")
+    logger.info("[STAGE 2] Computing metrics: oracle_caption...")
     oracle_metrics, oracle_outputs = run_eval("oracle_caption")
-    print("[STAGE 2] oracle_caption metrics:", oracle_metrics)
+    logger.info("[STAGE 2] oracle_caption metrics:", oracle_metrics)
 
-    print("[STAGE 2] Computing metrics: stage1_caption...")
+    logger.info("[STAGE 2] Computing metrics: stage1_caption...")
     stage1_metrics, stage1_outputs = run_eval("stage1_caption")
-    print("[STAGE 2] stage1_caption metrics:", stage1_metrics)
+    logger.info("[STAGE 2] stage1_caption metrics:", stage1_metrics)
 
     eval_metrics: Dict = {}
     if isinstance(raw_eval, dict):
@@ -526,30 +529,30 @@ def train_stage2(model_stage1, tokenizer, qa_path: str):
     metrics_path = os.path.join(STAGE2_OUTPUT_DIR, "eval_metrics.json")
     with open(metrics_path, "w") as f:
         json.dump(eval_metrics, f, indent=2)
-    print(f"[STAGE 2] Saved eval metrics to {metrics_path}")
+    logger.info(f"[STAGE 2] Saved eval metrics to {metrics_path}")
 
     preds_path1 = os.path.join(STAGE2_OUTPUT_DIR, "val_predictions_oracle_caption.json")
     with open(preds_path1, "w") as f:
         json.dump(oracle_outputs, f, indent=2)
-    print(f"[STAGE 2] Saved oracle-caption predictions to {preds_path1}")
+    logger.info(f"[STAGE 2] Saved oracle-caption predictions to {preds_path1}")
 
     preds_path2 = os.path.join(STAGE2_OUTPUT_DIR, "val_predictions_stage1_caption.json")
     with open(preds_path2, "w") as f:
         json.dump(stage1_outputs, f, indent=2)
-    print(f"[STAGE 2] Saved stage1-caption predictions to {preds_path2}")
+    logger.info(f"[STAGE 2] Saved stage1-caption predictions to {preds_path2}")
 
     if len(oracle_outputs) > 0:
-        print("\n[STAGE 2 TEST SAMPLE - oracle_caption]")
-        print("PROMPT:\n", oracle_outputs[0]["input"])
-        print("\nPRED:\n", oracle_outputs[0]["prediction"])
-        print("\nGT:\n", oracle_outputs[0]["ground_truth"])
+        logger.info("\n[STAGE 2 TEST SAMPLE - oracle_caption]")
+        logger.info("PROMPT:\n", oracle_outputs[0]["input"])
+        logger.info("\nPRED:\n", oracle_outputs[0]["prediction"])
+        logger.info("\nGT:\n", oracle_outputs[0]["ground_truth"])
 
     if len(stage1_outputs) > 0:
-        print("\n[STAGE 2 TEST SAMPLE - stage1_caption]")
-        print("PROMPT:\n", stage1_outputs[0]["input"])
-        print("\nCAPTION USED:\n", stage1_outputs[0]["caption_used"])
-        print("\nPRED:\n", stage1_outputs[0]["prediction"])
-        print("\nGT:\n", stage1_outputs[0]["ground_truth"])
+        logger.info("\n[STAGE 2 TEST SAMPLE - stage1_caption]")
+        logger.info("PROMPT:\n", stage1_outputs[0]["input"])
+        logger.info("\nCAPTION USED:\n", stage1_outputs[0]["caption_used"])
+        logger.info("\nPRED:\n", stage1_outputs[0]["prediction"])
+        logger.info("\nGT:\n", stage1_outputs[0]["ground_truth"])
 
-    print("[STAGE 2] Done.\n" + "=" * 80)
+    logger.info("[STAGE 2] Done.\n" + "=" * 80)
     return model_stage2
