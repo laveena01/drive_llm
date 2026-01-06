@@ -24,12 +24,49 @@ from .config import NUSC_ROOT, NUSC_VERSION, MAX_OBJECTS, VECTOR_DIM
 
 
 def init_nuscenes() -> NuScenes:
+    """
+    IMPORTANT:
+    Some nuScenes-devkit versions try to load lidarseg/panoptic for v1.0-trainval
+    and will crash if those folders are not present.
+
+    We explicitly disable those optional tasks if the devkit supports the args.
+    """
     print(f"[nuscenes_data] Initializing nuScenes with:")
     print(f"  - dataroot = {NUSC_ROOT}")
     print(f"  - version  = {NUSC_VERSION}")
-    nusc = NuScenes(version=NUSC_VERSION, dataroot=NUSC_ROOT, verbose=True)
-    print("[nuscenes_data] nuScenes initialized successfully.\n")
-    return nusc
+
+    base_kwargs = dict(version=NUSC_VERSION, dataroot=NUSC_ROOT, verbose=True)
+
+    # Try the most explicit signature first (newer devkit)
+    try:
+        nusc = NuScenes(**base_kwargs, lidarseg=False, panoptic=False)
+        print("[nuscenes_data] nuScenes initialized (lidarseg=False, panoptic=False).\n")
+        return nusc
+    except TypeError:
+        pass
+
+    # Some devkit versions have lidarseg but not panoptic
+    try:
+        nusc = NuScenes(**base_kwargs, lidarseg=False)
+        print("[nuscenes_data] nuScenes initialized (lidarseg=False).\n")
+        return nusc
+    except TypeError:
+        pass
+
+    # Fallback (old devkit) – may still crash if it *forces* lidarseg on trainval
+    try:
+        nusc = NuScenes(**base_kwargs)
+        print("[nuscenes_data] nuScenes initialized.\n")
+        return nusc
+    except FileNotFoundError as e:
+        # Give a very clear error if the devkit is forcing lidarseg without args support
+        raise FileNotFoundError(
+            f"{e}\n\n"
+            "Your nuScenes devkit is trying to load lidarseg/panoptic labels, but they are missing.\n"
+            "Fix options:\n"
+            "  1) Install a newer nuscenes-devkit that supports lidarseg=False/panoptic=False, OR\n"
+            "  2) Download the lidarseg (and/or panoptic) folders for your version.\n"
+        )
 
 
 def _yaw_from_quaternion(q: Quaternion) -> float:
@@ -37,8 +74,6 @@ def _yaw_from_quaternion(q: Quaternion) -> float:
     Return yaw (rotation around z) from quaternion.
     nuScenes uses (w, x, y, z).
     """
-    # Quaternion yaw extraction:
-    # yaw = atan2(2(wz + xy), 1 - 2(y^2 + z^2))
     w, x, y, z = q.w, q.x, q.y, q.z
     return float(np.arctan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z)))
 
@@ -67,41 +102,32 @@ def get_object_vectors_for_sample(
     for ann_token in sample["anns"]:
         ann = nusc.get("sample_annotation", ann_token)
 
-        # --- Global box translation/orientation ---
         obj_t = np.array(ann["translation"], dtype=np.float32)
         obj_q = Quaternion(ann["rotation"])
 
-        # --- Transform position: global -> ego frame ---
-        rel_global = obj_t - ego_t  # still global axes
-        rel_ego = ego_q_inv.rotate(rel_global)  # now ego axes
+        rel_global = obj_t - ego_t
+        rel_ego = ego_q_inv.rotate(rel_global)
 
         rel_x = float(rel_ego[0])
         rel_y = float(rel_ego[1])
         dist = float(np.sqrt(rel_x * rel_x + rel_y * rel_y + 1e-6))
 
-        # --- Velocity (global) -> ego frame magnitude ---
         rel_speed = 0.0
         try:
             vx, vy, vz = nusc.box_velocity(ann_token)
             if not np.any(np.isnan([vx, vy, vz])):
                 v_global = np.array([vx, vy, vz], dtype=np.float32)
                 v_ego = ego_q_inv.rotate(v_global)
-                rel_speed = float(np.linalg.norm(v_ego[:2]))  # horizontal speed
+                rel_speed = float(np.linalg.norm(v_ego[:2]))
         except Exception:
             rel_speed = 0.0
 
-        # --- Heading: object yaw in ego frame ---
-        # Convert object orientation into ego frame: q_ego_inv * q_obj
         obj_q_ego = ego_q_inv * obj_q
-        heading = _yaw_from_quaternion(obj_q_ego)  # radians
+        heading = _yaw_from_quaternion(obj_q_ego)
 
-        # --- Size proxy ---
-        # ann["size"] = [w, l, h] in nuScenes (width, length, height)
-        # We'll use avg of width & length (stable scalar)
         w, l, h = ann["size"]
         size = float((float(w) + float(l)) / 2.0)
 
-        # --- Type id ---
         category = ann["category_name"]
         if "vehicle" in category:
             type_id = 0
@@ -114,7 +140,6 @@ def get_object_vectors_for_sample(
 
         vectors.append([rel_x, rel_y, dist, rel_speed, heading, size, float(type_id)])
 
-    # Sort by distance so MAX_OBJECTS are the nearest ones (much more stable)
     vectors.sort(key=lambda v: v[2])
 
     padded = np.zeros((MAX_OBJECTS, VECTOR_DIM), dtype=np.float32)

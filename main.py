@@ -1,88 +1,137 @@
 # main.py
-
 """
-Entry point for the nuScenes-mini + LLM driving toy pipeline.
+Entry point for the nuScenes + LLM driving toy pipeline.
 
 Pipeline:
-1) Build datasets (Stage 1 captioning + Stage 2 QA) from nuScenes-mini.
-2) Train Stage 1 model: vector -> caption.
-3) Train Stage 2 model: caption + question -> driving answer.
+1) Build datasets (Stage 1 captioning + Stage 2 QA)
+2) Train Stage 1: vector -> caption
+3) Train Stage 2: caption + question -> driving answer
 
-All run artifacts (datasets + outputs) are saved under runs/<RUN_ID>/...
+All run artifacts are saved under runs/<RUN_ID>/...
 """
 
 import json
 import os
+import time
 
 from llm_driving.config import (
     RUN_ID,
     RUN_DIR,
     CAPTIONING_DATA_PATH,
     QA_DATA_PATH,
+    RUN_STAGE1,
+    RUN_STAGE2,
 )
 from llm_driving.datasets_builder import build_datasets_full_mini
 from llm_driving.training import train_stage1, train_stage2
 from llm_driving import config as cfg
 
 
-def _save_config_snapshot():
+def _dist_info() -> tuple[int, int, int]:
     """
-    Save a snapshot of current config values for reproducibility.
-    (Only uppercase fields are saved.)
+    Works for torchrun:
+      RANK, WORLD_SIZE, LOCAL_RANK are exported.
+    If not launched with torchrun, defaults to single process.
     """
+    rank = int(os.environ.get("RANK", "0"))
+    world = int(os.environ.get("WORLD_SIZE", "1"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    return rank, world, local_rank
+
+
+def _rank0_print(rank: int, msg: str) -> None:
+    if rank == 0:
+        print(msg)
+
+
+def _save_config_snapshot(rank: int) -> None:
+    """Save config snapshot once (rank0 only)."""
+    if rank != 0:
+        return
     snapshot = {k: getattr(cfg, k) for k in dir(cfg) if k.isupper()}
-    out_path = f"{RUN_DIR}/config_snapshot.json"
+    os.makedirs(RUN_DIR, exist_ok=True)
+    out_path = os.path.join(RUN_DIR, "config_snapshot.json")
     with open(out_path, "w") as f:
         json.dump(snapshot, f, indent=2)
     print(f"[MAIN] Saved config snapshot to: {out_path}")
 
 
+def _wait_for_paths(paths: list[str], rank: int, poll_sec: float = 2.0, timeout_sec: int = 3600) -> None:
+    """
+    Non-rank0 workers wait until dataset JSONs exist (rank0 builds them).
+    Timeout avoids hanging forever if rank0 crashed.
+    """
+    t0 = time.time()
+    while True:
+        if all(os.path.exists(p) for p in paths):
+            return
+        if time.time() - t0 > timeout_sec:
+            missing = [p for p in paths if not os.path.exists(p)]
+            raise TimeoutError(f"[MAIN][rank={rank}] Timed out waiting for: {missing}")
+        time.sleep(poll_sec)
+
+
 def main():
-    print("=" * 90)
-    print("[MAIN] LLM driving pipeline started.")
-    print(f"[MAIN] RUN_ID : {RUN_ID}")
-    print(f"[MAIN] RUN_DIR: {RUN_DIR}")
-    print("-" * 90)
-    print(f"[MAIN] Captioning dataset path : {CAPTIONING_DATA_PATH}")
-    print(f"[MAIN] QA dataset path         : {QA_DATA_PATH}")
-    print("=" * 90)
+    rank, world, local_rank = _dist_info()
 
-    # Save config snapshot early
-    _save_config_snapshot()
+    # (Optional) reduces tokenizer thread spam / contention
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
-    # 1) Build datasets using all scenes in nuScenes-mini
-   # 1) Build datasets using all scenes in nuScenes-mini
-    print("\n[MAIN] Step 1/3: Building datasets from nuScenes-mini...")
+    if rank == 0:
+        print("=" * 90)
+        print("[MAIN] LLM driving pipeline started.")
+        print(f"[MAIN] RUN_ID : {RUN_ID}")
+        print(f"[MAIN] RUN_DIR: {RUN_DIR}")
+        print("-" * 90)
+        print(f"[MAIN] Captioning dataset path : {CAPTIONING_DATA_PATH}")
+        print(f"[MAIN] QA dataset path         : {QA_DATA_PATH}")
+        print(f"[MAIN] Distributed: rank={rank}/{world} (local_rank={local_rank})")
+        print("=" * 90)
 
-    if os.path.exists(CAPTIONING_DATA_PATH) and os.path.exists(QA_DATA_PATH):
-        print("[MAIN] Found existing dataset JSONs. Skipping dataset building.")
+    _save_config_snapshot(rank)
+
+    # 1) Build datasets (rank0 only)
+    if rank == 0:
+        print("\n[MAIN] Step 1/3: Building datasets ...")
+
+        if os.path.exists(CAPTIONING_DATA_PATH) and os.path.exists(QA_DATA_PATH):
+            print("[MAIN] Found existing dataset JSONs. Skipping dataset building.")
+        else:
+            captioning_samples, qa_samples = build_datasets_full_mini(
+                max_frames_per_scene=None,
+                captioning_path=CAPTIONING_DATA_PATH,
+                qa_path=QA_DATA_PATH,
+            )
+            print(
+                f"[MAIN] Step 1/3 DONE: "
+                f"{len(captioning_samples)} captioning samples, "
+                f"{len(qa_samples)} QA samples."
+            )
+
+    # Everyone waits until JSONs exist
+    _wait_for_paths([CAPTIONING_DATA_PATH, QA_DATA_PATH], rank)
+
+    # 2) Stage 1
+    if RUN_STAGE1:
+        _rank0_print(rank, "\n[MAIN] Step 2/3: Training Stage 1 (vector → caption)...")
+        model_stage1, tokenizer = train_stage1(CAPTIONING_DATA_PATH)
+        _rank0_print(rank, "[MAIN] Step 2/3 DONE: Stage 1 training finished.")
     else:
-        captioning_samples, qa_samples = build_datasets_full_mini(
-            max_frames_per_scene=None,   # use all frames in each scene
-            captioning_path=CAPTIONING_DATA_PATH,
-            qa_path=QA_DATA_PATH,
-        )
-        print(
-            f"[MAIN] Step 1/3 DONE: "
-            f"{len(captioning_samples)} captioning samples, "
-            f"{len(qa_samples)} QA samples."
-        )
+        model_stage1, tokenizer = None, None
+        _rank0_print(rank, "\n[MAIN] Step 2/3: Skipping Stage 1 (RUN_STAGE1=False).")
 
+    # 3) Stage 2
+    if RUN_STAGE2:
+        _rank0_print(rank, "\n[MAIN] Step 3/3: Training Stage 2 (caption + question → action/answer)...")
+        _ = train_stage2(model_stage1, tokenizer, QA_DATA_PATH)
+        _rank0_print(rank, "[MAIN] Step 3/3 DONE: Stage 2 training finished.")
+    else:
+        _rank0_print(rank, "\n[MAIN] Step 3/3: Skipping Stage 2 (RUN_STAGE2=False).")
 
-    # 2) Stage 1: Vector -> Caption pretraining
-    print("\n[MAIN] Step 2/3: Training Stage 1 (vector → caption)...")
-    model_stage1, tokenizer = train_stage1(CAPTIONING_DATA_PATH)
-    print("[MAIN] Step 2/3 DONE: Stage 1 training finished.")
-
-    # 3) Stage 2: Driving QA finetuning
-    print("\n[MAIN] Step 3/3: Training Stage 2 (caption + question → action/answer)...")
-    _ = train_stage2(model_stage1, tokenizer, QA_DATA_PATH)
-    print("[MAIN] Step 3/3 DONE: Stage 2 training finished.")
-
-    print("\n[MAIN] Pipeline finished successfully.")
-    print("=" * 90)
-    print(f"[MAIN] All outputs saved under: {RUN_DIR}")
-    print("=" * 90)
+    _rank0_print(rank, "\n[MAIN] Pipeline finished successfully.")
+    _rank0_print(rank, "=" * 90)
+    _rank0_print(rank, f"[MAIN] All outputs saved under: {RUN_DIR}")
+    _rank0_print(rank, "=" * 90)
 
 
 if __name__ == "__main__":

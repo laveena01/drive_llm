@@ -9,10 +9,15 @@ PART-1 updates:
 - Remove min_dist leakage from Stage-2 input (still stored as metadata)
 - Keep vec_str for stage1_caption eval
 - Keep oracle caption only as debug field
+
+DDP/torchrun safety:
+- This file is meant to be called ONLY by rank0 (main.py already does that).
+- Extra guard included anyway: if rank != 0, we return immediately.
 """
 
 from typing import List, Dict
 import json
+import os
 
 from .nuscenes_data import get_scene_frames_vectors, init_nuscenes
 from .langen import lanGen, vector_to_string
@@ -29,6 +34,12 @@ PAPER_FORMAT_INSTRUCTION = (
     "Reason: <one short sentence>\n"
     "Do NOT ask questions. Do NOT add extra text.\n"
 )
+
+
+def _dist_rank_world() -> tuple[int, int]:
+    rank = int(os.environ.get("RANK", "0"))
+    world = int(os.environ.get("WORLD_SIZE", "1"))
+    return rank, world
 
 
 def _paper_target(accel: int, brake: int, steer: str, reason: str) -> str:
@@ -65,7 +76,7 @@ def _make_samples_from_frames(
     frames: List[Dict],
     captioning_samples: List[Dict],
     qa_samples: List[Dict],
-):
+) -> None:
     print(f"[datasets_builder]   Converting {len(frames)} frames into captioning + QA samples...")
     for idx, frame in enumerate(frames):
         num_objects = int(frame["num_objects"])
@@ -79,7 +90,7 @@ def _make_samples_from_frames(
             "target": caption,
         })
 
-        # --- Stage 2: paper-style actions ---
+        # --- Stage 2: paper-style actions (policy label derived from min distance) ---
         use_n = min(num_objects, MAX_OBJECTS)
         if use_n == 0:
             min_dist = 999.0
@@ -127,14 +138,20 @@ def build_datasets_full_mini(
     captioning_path: str = CAPTIONING_DATA_PATH,
     qa_path: str = QA_DATA_PATH,
 ) -> tuple[list, list]:
-    print("[datasets_builder] Initializing nuScenes for full-mini dataset creation...")
+    # Safety: dataset build should be rank0 only (main.py already ensures this)
+    rank, world = _dist_rank_world()
+    if rank != 0:
+        # do nothing on non-rank0
+        return [], []
+
+    print("[datasets_builder] Initializing nuScenes for dataset creation...")
     nusc = init_nuscenes()
 
     captioning_samples: list[dict] = []
     qa_samples: list[dict] = []
 
     num_scenes = len(nusc.scene)
-    print(f"[datasets_builder] Building data from all {num_scenes} scenes in nuScenes-mini.")
+    print(f"[datasets_builder] Building data from all {num_scenes} scenes (version={nusc.version}).")
     print(f"[datasets_builder]   max_frames_per_scene = {max_frames_per_scene}")
 
     for scene_idx in range(num_scenes):
@@ -146,8 +163,13 @@ def build_datasets_full_mini(
         )
         print(f"[datasets_builder]   Retrieved {len(frames)} frames from scene {scene_idx}.")
         _make_samples_from_frames(frames, captioning_samples, qa_samples)
-        print(f"[datasets_builder]   After scene {scene_idx}: "
-              f"{len(captioning_samples)} captioning samples, {len(qa_samples)} QA samples.")
+        print(
+            f"[datasets_builder]   After scene {scene_idx}: "
+            f"{len(captioning_samples)} captioning samples, {len(qa_samples)} QA samples."
+        )
+
+    os.makedirs(os.path.dirname(captioning_path), exist_ok=True)
+    os.makedirs(os.path.dirname(qa_path), exist_ok=True)
 
     print(f"\n[datasets_builder] Saving captioning dataset to: {captioning_path}")
     with open(captioning_path, "w") as f:

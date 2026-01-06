@@ -8,6 +8,13 @@ PART-1 updates:
 - Add control metrics:
   - accel_mae, brake_mae, steering_accuracy
 - Keep existing metrics: action_accuracy buckets, BLEU1, ROUGE-L, format compliance
+
+DDP/torchrun fixes (IMPORTANT):
+- Only rank0 writes files / runs heavy generation-eval loops
+- All ranks still call trainer.train()
+- Barriers are only used for short synchronization (not long generation loops)
+- Heavy generation-eval is automatically DISABLED when WORLD_SIZE > 1 to avoid NCCL timeouts
+- Disable safetensors checkpointing to avoid shared-tensor save crash for T5
 """
 
 import os
@@ -17,7 +24,12 @@ import copy
 from typing import List, Dict, Tuple, Optional
 
 import numpy as np
+import torch
+import torch.distributed as dist
+
 from datasets import Dataset
+from datasets.utils.logging import disable_progress_bar
+
 from transformers import (
     AutoModelForSeq2SeqLM,
     AutoTokenizer,
@@ -30,6 +42,50 @@ from .config import (
     STAGE1_OUTPUT_DIR,
     STAGE2_OUTPUT_DIR,
 )
+
+# ---------------------------
+# DDP helpers
+# ---------------------------
+
+def _dist_info() -> Tuple[int, int]:
+    rank = int(os.environ.get("RANK", "0"))
+    world = int(os.environ.get("WORLD_SIZE", "1"))
+    return rank, world
+
+def _is_dist() -> bool:
+    return dist.is_available() and dist.is_initialized()
+
+def _barrier() -> None:
+    if _is_dist():
+        dist.barrier()
+
+def _rank0_only(rank: int) -> bool:
+    return rank == 0
+
+def _unwrap_model(m):
+    # Trainer may wrap into DDP. We always want the base module for deepcopy/generate/save.
+    return m.module if hasattr(m, "module") else m
+
+
+# ---------------------------
+# Heavy-eval gating (fix NCCL timeouts)
+# ---------------------------
+
+# User override: export SKIP_HEAVY_EVAL=1
+_SKIP_HEAVY_EVAL = os.environ.get("SKIP_HEAVY_EVAL", "0") == "1"
+
+def _heavy_eval_enabled(world: int) -> bool:
+    """
+    Heavy eval = generation loops + big json dumps.
+    - Disabled automatically under torchrun (world > 1) to avoid NCCL barrier timeouts.
+    - Enabled on single GPU unless user forces skip.
+    """
+    if world > 1:
+        return False
+    if _SKIP_HEAVY_EVAL:
+        return False
+    return True
+
 
 # ---------------------------
 # Helpers
@@ -293,35 +349,48 @@ def _tokenize_qa(batch, tokenizer):
 # ---------------------------
 
 def train_stage1(captioning_path: str):
-    print("\n" + "=" * 80)
-    print("[STAGE 1] Vector → Caption training started.")
-    print(f"[STAGE 1] Loading captioning data from: {captioning_path}")
+    rank, world = _dist_info()
+    heavy_eval = _heavy_eval_enabled(world)
+
+    if not _rank0_only(rank):
+        disable_progress_bar()
+
+    if _rank0_only(rank):
+        print("\n" + "=" * 80)
+        print("[STAGE 1] Vector → Caption training started.")
+        print(f"[STAGE 1] Loading captioning data from: {captioning_path}")
 
     with open(captioning_path, "r") as f:
         data = json.load(f)
 
     full_ds = Dataset.from_list(data)
-    print(f"[STAGE 1] Total samples: {len(full_ds)}")
+    if _rank0_only(rank):
+        print(f"[STAGE 1] Total samples: {len(full_ds)}")
 
     split_ds = full_ds.train_test_split(test_size=0.2, seed=42)
     train_ds = split_ds["train"]
     eval_ds = split_ds["test"]
-    print(f"[STAGE 1] Train samples: {len(train_ds)}  |  Val samples: {len(eval_ds)}")
+    if _rank0_only(rank):
+        print(f"[STAGE 1] Train samples: {len(train_ds)}  |  Val samples: {len(eval_ds)}")
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 
     def tokenize_fn(batch):
         return _tokenize_captioning(batch, tokenizer)
 
-    print("[STAGE 1] Tokenizing datasets...")
+    if _rank0_only(rank):
+        print("[STAGE 1] Tokenizing datasets...")
     tokenized_train = train_ds.map(tokenize_fn, batched=True, remove_columns=["input", "target"])
     tokenized_eval = eval_ds.map(tokenize_fn, batched=True, remove_columns=["input", "target"])
 
-    print(f"[STAGE 1] Loading model: {MODEL_NAME}")
+    if _rank0_only(rank):
+        print(f"[STAGE 1] Loading model: {MODEL_NAME}")
     model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME)
 
-    _ensure_dir(STAGE1_OUTPUT_DIR)
-    print(f"[STAGE 1] Output directory: {STAGE1_OUTPUT_DIR}")
+    if _rank0_only(rank):
+        _ensure_dir(STAGE1_OUTPUT_DIR)
+        print(f"[STAGE 1] Output directory: {STAGE1_OUTPUT_DIR}")
+    _barrier()  # make sure dir exists before any rank uses it
 
     training_args = TrainingArguments(
         output_dir=STAGE1_OUTPUT_DIR,
@@ -335,6 +404,12 @@ def train_stage1(captioning_path: str):
         logging_steps=50,
         save_steps=500,
         save_total_limit=2,
+        # avoid T5 shared-tensor safetensors crash
+        save_safetensors=False,
+        # DDP stability
+        ddp_find_unused_parameters=False,
+        # reduce external logging noise
+        report_to=[],
     )
 
     trainer = Trainer(
@@ -345,49 +420,74 @@ def train_stage1(captioning_path: str):
         tokenizer=tokenizer,
     )
 
-    print("[STAGE 1] Starting training...")
+    if _rank0_only(rank):
+        print("[STAGE 1] Starting training...")
     trainer.train()
 
-    # Ensure stage1 dir is always loadable later
-    trainer.save_model(STAGE1_OUTPUT_DIR)
-    tokenizer.save_pretrained(STAGE1_OUTPUT_DIR)
+    # short sync so all ranks finish training before stage transition
+    _barrier()
 
-    print("[STAGE 1] Training finished. Running evaluation...")
-    eval_metrics = trainer.evaluate()
-    print("\n[STAGE 1] Eval metrics:", eval_metrics)
+    trained_model = _unwrap_model(trainer.model)
 
-    metrics_path = os.path.join(STAGE1_OUTPUT_DIR, "eval_metrics.json")
-    with open(metrics_path, "w") as f:
-        json.dump(eval_metrics, f, indent=2)
-    print(f"[STAGE 1] Saved eval metrics to {metrics_path}")
+    # Rank0-only: save always (fast)
+    if _rank0_only(rank):
+        trainer.save_model(STAGE1_OUTPUT_DIR)
+        tokenizer.save_pretrained(STAGE1_OUTPUT_DIR)
 
-    print("[STAGE 1] Generating predictions on validation set...")
-    model.eval()
-    val_preds = []
-    for sample in eval_ds:
-        input_text = sample["input"]
-        gt_text = sample["target"]
-        inputs = tokenizer(input_text, return_tensors="pt", max_length=192, truncation=True).to(model.device)
+        # Heavy generation/eval ONLY when single GPU (world==1)
+        if heavy_eval:
+            print("[STAGE 1] Training finished. Running evaluation...")
+            eval_metrics = trainer.evaluate()
+            print("\n[STAGE 1] Eval metrics:", eval_metrics)
 
-        pred_ids = model.generate(
-            **inputs,
-            max_new_tokens=160,
-            num_beams=4,
-            early_stopping=True,
-            no_repeat_ngram_size=4,
-            repetition_penalty=1.2,
-        )
-        pred_text = tokenizer.decode(pred_ids[0], skip_special_tokens=True)
+            metrics_path = os.path.join(STAGE1_OUTPUT_DIR, "eval_metrics.json")
+            with open(metrics_path, "w") as f:
+                json.dump(eval_metrics, f, indent=2)
+            print(f"[STAGE 1] Saved eval metrics to {metrics_path}")
 
-        val_preds.append({"input": input_text, "ground_truth": gt_text, "prediction": pred_text})
+            print("[STAGE 1] Generating predictions on validation set (rank0 only)...")
+            trained_model.eval()
+            device = trained_model.device
 
-    preds_path = os.path.join(STAGE1_OUTPUT_DIR, "val_predictions.json")
-    with open(preds_path, "w") as f:
-        json.dump(val_preds, f, indent=2)
-    print(f"[STAGE 1] Saved {len(val_preds)} validation predictions to {preds_path}")
+            val_preds = []
+            for sample in eval_ds:
+                input_text = sample["input"]
+                gt_text = sample["target"]
+                inputs = tokenizer(
+                    input_text,
+                    return_tensors="pt",
+                    max_length=192,
+                    truncation=True
+                ).to(device)
 
-    print("[STAGE 1] Done.\n" + "=" * 80)
-    return model, tokenizer
+                with torch.no_grad():
+                    pred_ids = trained_model.generate(
+                        **inputs,
+                        max_new_tokens=160,
+                        num_beams=4,
+                        early_stopping=True,
+                        no_repeat_ngram_size=4,
+                        repetition_penalty=1.2,
+                    )
+                pred_text = tokenizer.decode(pred_ids[0], skip_special_tokens=True)
+                val_preds.append({"input": input_text, "ground_truth": gt_text, "prediction": pred_text})
+
+            preds_path = os.path.join(STAGE1_OUTPUT_DIR, "val_predictions.json")
+            with open(preds_path, "w") as f:
+                json.dump(val_preds, f, indent=2)
+            print(f"[STAGE 1] Saved {len(val_preds)} validation predictions to {preds_path}")
+        else:
+            if world > 1:
+                print("[STAGE 1] (DDP) Skipping heavy generation/eval to avoid NCCL timeouts. "
+                      "Run single-GPU for val_predictions + detailed metrics.")
+            elif _SKIP_HEAVY_EVAL:
+                print("[STAGE 1] SKIP_HEAVY_EVAL=1 => skipping heavy generation/eval.")
+
+        print("[STAGE 1] Done.\n" + "=" * 80)
+
+    # short sync so stage2 starts together
+    _barrier()
+    return trained_model, tokenizer
 
 
 # ---------------------------
@@ -396,15 +496,24 @@ def train_stage1(captioning_path: str):
 
 def train_stage2(model_stage1, tokenizer, qa_path: str):
     """
-    PART-1:
-    - Stage-2 model initialized from Stage-1 weights => dependency
-    - Stage-2 prompts do NOT include min_dist (and oracle eval strips it)
+    - Stage-2 model initialized from Stage-1 weights
+    - Stage-2 prompts do NOT include min_dist (oracle eval strips it)
+    - Heavy generation eval is disabled under DDP (world>1) to avoid NCCL timeouts
     """
-    print("\n" + "=" * 80)
-    print("[STAGE 2] Driving QA finetuning started.")
-    print(f"[STAGE 2] Loading QA data from: {qa_path}")
+    rank, world = _dist_info()
+    heavy_eval = _heavy_eval_enabled(world)
 
-    # Depend on Stage-1 weights
+    if not _rank0_only(rank):
+        disable_progress_bar()
+
+    if _rank0_only(rank):
+        print("\n" + "=" * 80)
+        print("[STAGE 2] Driving QA finetuning started.")
+        print(f"[STAGE 2] Loading QA data from: {qa_path}")
+
+    model_stage1 = _unwrap_model(model_stage1)
+
+    # Stage-2 initialized from Stage-1 weights
     model_stage2 = copy.deepcopy(model_stage1).to(model_stage1.device)
     model_stage2.train()
 
@@ -412,12 +521,14 @@ def train_stage2(model_stage1, tokenizer, qa_path: str):
         data = json.load(f)
 
     full_ds = Dataset.from_list(data)
-    print(f"[STAGE 2] Total samples: {len(full_ds)}")
+    if _rank0_only(rank):
+        print(f"[STAGE 2] Total samples: {len(full_ds)}")
 
     split_ds = full_ds.train_test_split(test_size=0.2, seed=42)
     train_ds = split_ds["train"]
     eval_ds = split_ds["test"]
-    print(f"[STAGE 2] Train samples: {len(train_ds)}  |  Val samples: {len(eval_ds)}")
+    if _rank0_only(rank):
+        print(f"[STAGE 2] Train samples: {len(train_ds)}  |  Val samples: {len(eval_ds)}")
 
     def tokenize_fn(batch):
         batch_inp = batch["input"]
@@ -425,12 +536,15 @@ def train_stage2(model_stage1, tokenizer, qa_path: str):
         batch["input"] = [_ensure_paper_format(x) for x in batch_inp]
         return _tokenize_qa(batch, tokenizer)
 
-    print("[STAGE 2] Tokenizing datasets...")
+    if _rank0_only(rank):
+        print("[STAGE 2] Tokenizing datasets...")
     tokenized_train = train_ds.map(tokenize_fn, batched=True, remove_columns=["input", "target"])
     tokenized_eval = eval_ds.map(tokenize_fn, batched=True, remove_columns=["input", "target"])
 
-    _ensure_dir(STAGE2_OUTPUT_DIR)
-    print(f"[STAGE 2] Output directory: {STAGE2_OUTPUT_DIR}")
+    if _rank0_only(rank):
+        _ensure_dir(STAGE2_OUTPUT_DIR)
+        print(f"[STAGE 2] Output directory: {STAGE2_OUTPUT_DIR}")
+    _barrier()
 
     training_args = TrainingArguments(
         output_dir=STAGE2_OUTPUT_DIR,
@@ -444,6 +558,11 @@ def train_stage2(model_stage1, tokenizer, qa_path: str):
         logging_steps=50,
         save_steps=500,
         save_total_limit=2,
+        # avoid T5 shared-tensor safetensors crash
+        save_safetensors=False,
+        # DDP stability
+        ddp_find_unused_parameters=False,
+        report_to=[],
     )
 
     trainer = Trainer(
@@ -454,170 +573,192 @@ def train_stage2(model_stage1, tokenizer, qa_path: str):
         tokenizer=tokenizer,
     )
 
-    print("[STAGE 2] Starting training...")
+    if _rank0_only(rank):
+        print("[STAGE 2] Starting training...")
     trainer.train()
 
-    # Ensure stage2 root is always loadable for inference
-    trainer.save_model(STAGE2_OUTPUT_DIR)
-    tokenizer.save_pretrained(STAGE2_OUTPUT_DIR)
-    print(f"[STAGE 2] Saved model+tokenizer to {STAGE2_OUTPUT_DIR}")
+    # short sync so all ranks finish training
+    _barrier()
 
-    print("[STAGE 2] Training finished. Running evaluation (loss only)...")
-    raw_eval = trainer.evaluate()
-    print("\n[STAGE 2] Raw eval output:", raw_eval)
+    trained_stage2 = _unwrap_model(trainer.model)
 
-    model_stage1.eval()
-    model_stage2.eval()
+    if _rank0_only(rank):
+        trainer.save_model(STAGE2_OUTPUT_DIR)
+        tokenizer.save_pretrained(STAGE2_OUTPUT_DIR)
+        print(f"[STAGE 2] Saved model+tokenizer to {STAGE2_OUTPUT_DIR}")
 
-    def _gen_text(model, prompt: str, max_new_tokens: int, no_repeat_ngram_size: int = 3) -> str:
-        prompt = _ensure_paper_format(prompt)
-        inputs = tokenizer(prompt, return_tensors="pt", max_length=192, truncation=True).to(model_stage2.device)
-        pred_ids = model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            num_beams=4,
-            early_stopping=True,
-            no_repeat_ngram_size=no_repeat_ngram_size,
-            repetition_penalty=1.2,
-        )
-        return tokenizer.decode(pred_ids[0], skip_special_tokens=True)
+        # loss-only eval is usually fine (fast); keep it
+        print("[STAGE 2] Training finished. Running evaluation (loss only)...")
+        raw_eval = trainer.evaluate()
+        print("\n[STAGE 2] Raw eval output:", raw_eval)
 
-    def run_eval(mode: str) -> Tuple[Dict, List[Dict]]:
-        correct = 0
-        total = 0
+        # Heavy generation eval ONLY when single GPU (world==1)
+        if heavy_eval:
+            model_stage1.eval()
+            trained_stage2.eval()
 
-        bleu_sum = 0.0
-        rouge_sum = 0.0
+            def _gen_text(model, prompt: str, max_new_tokens: int, no_repeat_ngram_size: int = 3) -> str:
+                prompt = _ensure_paper_format(prompt)
+                inputs = tokenizer(
+                    prompt,
+                    return_tensors="pt",
+                    max_length=192,
+                    truncation=True
+                ).to(trained_stage2.device)
+                with torch.no_grad():
+                    pred_ids = model.generate(
+                        **inputs,
+                        max_new_tokens=max_new_tokens,
+                        num_beams=4,
+                        early_stopping=True,
+                        no_repeat_ngram_size=no_repeat_ngram_size,
+                        repetition_penalty=1.2,
+                    )
+                return tokenizer.decode(pred_ids[0], skip_special_tokens=True)
 
-        fmt_sum = 0.0
-        parse_ok_sum = 0.0
+            def run_eval(mode: str) -> Tuple[Dict, List[Dict]]:
+                correct = 0
+                total = 0
 
-        accel_mae_sum = 0.0
-        brake_mae_sum = 0.0
-        accel_cnt = 0
-        brake_cnt = 0
+                bleu_sum = 0.0
+                rouge_sum = 0.0
 
-        steer_correct = 0
-        steer_total = 0
+                fmt_sum = 0.0
+                parse_ok_sum = 0.0
 
-        n = 0
-        outputs: List[Dict] = []
+                accel_mae_sum = 0.0
+                brake_mae_sum = 0.0
+                accel_cnt = 0
+                brake_cnt = 0
 
-        for sample in eval_ds:
-            raw_input_text = sample["input"]
-            gt_text = sample["target"]
+                steer_correct = 0
+                steer_total = 0
 
-            if mode == "oracle_caption":
-                # strip min_dist to avoid leakage
-                stage2_prompt = _ensure_paper_format(_strip_min_dist(raw_input_text))
-                caption_used = None
-            else:
-                vec_str = sample.get("vec_str", "")
-                s1_prompt = _build_stage1_prompt(vec_str)
-                caption_pred = _gen_text(model_stage1, s1_prompt, max_new_tokens=160, no_repeat_ngram_size=4)
-                caption_used = caption_pred
-                stage2_prompt = _build_stage2_prompt_from_caption(caption_pred)
+                n = 0
+                outputs: List[Dict] = []
 
-            pred_raw = _gen_text(model_stage2, stage2_prompt, max_new_tokens=90, no_repeat_ngram_size=3)
-            pred_fixed, parse_ok = enforce_5_lines(pred_raw)
+                for sample in eval_ds:
+                    raw_input_text = sample["input"]
+                    gt_text = sample["target"]
 
-            gt_action = _map_text_to_action_label(gt_text)
-            pred_action = _map_text_to_action_label(pred_fixed)
+                    if mode == "oracle_caption":
+                        stage2_prompt = _ensure_paper_format(_strip_min_dist(raw_input_text))
+                        caption_used = None
+                    else:
+                        vec_str = sample.get("vec_str", "")
+                        s1_prompt = _build_stage1_prompt(vec_str)
+                        caption_pred = _gen_text(model_stage1, s1_prompt, max_new_tokens=160, no_repeat_ngram_size=4)
+                        caption_used = caption_pred
+                        stage2_prompt = _build_stage2_prompt_from_caption(caption_pred)
 
-            if gt_action != "OTHER":
-                total += 1
-                if gt_action == pred_action:
-                    correct += 1
+                    pred_raw = _gen_text(trained_stage2, stage2_prompt, max_new_tokens=90, no_repeat_ngram_size=3)
+                    pred_fixed, parse_ok = enforce_5_lines(pred_raw)
 
-            bleu_sum += bleu1(pred_fixed, gt_text)
-            rouge_sum += rouge_l_f1(pred_fixed, gt_text)
+                    gt_action = _map_text_to_action_label(gt_text)
+                    pred_action = _map_text_to_action_label(pred_fixed)
 
-            fmt_sum += float(_format_compliance_5line(pred_fixed))
-            parse_ok_sum += float(parse_ok)
+                    if gt_action != "OTHER":
+                        total += 1
+                        if gt_action == pred_action:
+                            correct += 1
 
-            # control metrics
-            gt_acc = _extract_accel_percent(gt_text)
-            gt_brk = _extract_brake_percent(gt_text)
-            gt_str = _extract_steer(gt_text)
+                    bleu_sum += bleu1(pred_fixed, gt_text)
+                    rouge_sum += rouge_l_f1(pred_fixed, gt_text)
 
-            pr_acc = _extract_accel_percent(pred_fixed)
-            pr_brk = _extract_brake_percent(pred_fixed)
-            pr_str = _extract_steer(pred_fixed)
+                    fmt_sum += float(_format_compliance_5line(pred_fixed))
+                    parse_ok_sum += float(parse_ok)
 
-            if gt_acc is not None and pr_acc is not None:
-                accel_mae_sum += abs(pr_acc - gt_acc)
-                accel_cnt += 1
-            if gt_brk is not None and pr_brk is not None:
-                brake_mae_sum += abs(pr_brk - gt_brk)
-                brake_cnt += 1
+                    gt_acc = _extract_accel_percent(gt_text)
+                    gt_brk = _extract_brake_percent(gt_text)
+                    gt_str = _extract_steer(gt_text)
 
-            if gt_str is not None and pr_str is not None:
-                steer_total += 1
-                if gt_str == pr_str:
-                    steer_correct += 1
+                    pr_acc = _extract_accel_percent(pred_fixed)
+                    pr_brk = _extract_brake_percent(pred_fixed)
+                    pr_str = _extract_steer(pred_fixed)
 
-            n += 1
+                    if gt_acc is not None and pr_acc is not None:
+                        accel_mae_sum += abs(pr_acc - gt_acc)
+                        accel_cnt += 1
+                    if gt_brk is not None and pr_brk is not None:
+                        brake_mae_sum += abs(pr_brk - gt_brk)
+                        brake_cnt += 1
 
-            outputs.append({
-                "mode": mode,
-                "input": stage2_prompt if mode != "oracle_caption" else raw_input_text,
-                "ground_truth": gt_text,
-                "prediction_raw": pred_raw,
-                "prediction_fixed": pred_fixed,
-                "gt_action": gt_action,
-                "pred_action": pred_action,
-                "format_ok": int(_format_compliance_5line(pred_fixed)),
-                "parse_ok": int(parse_ok),
-                "caption_used": caption_used,
-            })
+                    if gt_str is not None and pr_str is not None:
+                        steer_total += 1
+                        if gt_str == pr_str:
+                            steer_correct += 1
 
-        metrics = {
-            "action_accuracy": float(correct / total) if total > 0 else 0.0,
-            "bleu1": float(bleu_sum / max(1, n)),
-            "rougeL_f1": float(rouge_sum / max(1, n)),
-            "format_compliance": float(fmt_sum / max(1, n)),
-            "parse_ok_rate": float(parse_ok_sum / max(1, n)),
-            "accel_mae": float(accel_mae_sum / max(1, accel_cnt)),
-            "brake_mae": float(brake_mae_sum / max(1, brake_cnt)),
-            "steering_accuracy": float(steer_correct / max(1, steer_total)) if steer_total > 0 else 0.0,
-            "n_samples": int(n),
-            "n_action_samples": int(total),
-        }
-        return metrics, outputs
+                    n += 1
 
-    print("[STAGE 2] Computing metrics: oracle_caption...")
-    oracle_metrics, oracle_outputs = run_eval("oracle_caption")
-    print("[STAGE 2] oracle_caption metrics:", oracle_metrics)
+                    outputs.append({
+                        "mode": mode,
+                        "input": stage2_prompt if mode != "oracle_caption" else raw_input_text,
+                        "ground_truth": gt_text,
+                        "prediction_raw": pred_raw,
+                        "prediction_fixed": pred_fixed,
+                        "gt_action": gt_action,
+                        "pred_action": pred_action,
+                        "format_ok": int(_format_compliance_5line(pred_fixed)),
+                        "parse_ok": int(parse_ok),
+                        "caption_used": caption_used,
+                    })
 
-    print("[STAGE 2] Computing metrics: stage1_caption...")
-    stage1_metrics, stage1_outputs = run_eval("stage1_caption")
-    print("[STAGE 2] stage1_caption metrics:", stage1_metrics)
+                metrics = {
+                    "action_accuracy": float(correct / total) if total > 0 else 0.0,
+                    "bleu1": float(bleu_sum / max(1, n)),
+                    "rougeL_f1": float(rouge_sum / max(1, n)),
+                    "format_compliance": float(fmt_sum / max(1, n)),
+                    "parse_ok_rate": float(parse_ok_sum / max(1, n)),
+                    "accel_mae": float(accel_mae_sum / max(1, accel_cnt)),
+                    "brake_mae": float(brake_mae_sum / max(1, brake_cnt)),
+                    "steering_accuracy": float(steer_correct / max(1, steer_total)) if steer_total > 0 else 0.0,
+                    "n_samples": int(n),
+                    "n_action_samples": int(total),
+                }
+                return metrics, outputs
 
-    eval_metrics: Dict = {}
-    if isinstance(raw_eval, dict):
-        for k, v in raw_eval.items():
-            try:
-                eval_metrics[k] = float(v)
-            except Exception:
-                eval_metrics[k] = v
+            print("[STAGE 2] Computing metrics: oracle_caption...")
+            oracle_metrics, oracle_outputs = run_eval("oracle_caption")
+            print("[STAGE 2] oracle_caption metrics:", oracle_metrics)
 
-    eval_metrics["oracle_caption"] = oracle_metrics
-    eval_metrics["stage1_caption"] = stage1_metrics
+            print("[STAGE 2] Computing metrics: stage1_caption...")
+            stage1_metrics, stage1_outputs = run_eval("stage1_caption")
+            print("[STAGE 2] stage1_caption metrics:", stage1_metrics)
 
-    metrics_path = os.path.join(STAGE2_OUTPUT_DIR, "eval_metrics.json")
-    with open(metrics_path, "w") as f:
-        json.dump(eval_metrics, f, indent=2)
-    print(f"[STAGE 2] Saved eval metrics to {metrics_path}")
+            eval_metrics: Dict = {}
+            if isinstance(raw_eval, dict):
+                for k, v in raw_eval.items():
+                    try:
+                        eval_metrics[k] = float(v)
+                    except Exception:
+                        eval_metrics[k] = v
 
-    preds_path1 = os.path.join(STAGE2_OUTPUT_DIR, "val_predictions_oracle_caption.json")
-    with open(preds_path1, "w") as f:
-        json.dump(oracle_outputs, f, indent=2)
-    print(f"[STAGE 2] Saved oracle-caption predictions to {preds_path1}")
+            eval_metrics["oracle_caption"] = oracle_metrics
+            eval_metrics["stage1_caption"] = stage1_metrics
 
-    preds_path2 = os.path.join(STAGE2_OUTPUT_DIR, "val_predictions_stage1_caption.json")
-    with open(preds_path2, "w") as f:
-        json.dump(stage1_outputs, f, indent=2)
-    print(f"[STAGE 2] Saved stage1-caption predictions to {preds_path2}")
+            metrics_path = os.path.join(STAGE2_OUTPUT_DIR, "eval_metrics.json")
+            with open(metrics_path, "w") as f:
+                json.dump(eval_metrics, f, indent=2)
+            print(f"[STAGE 2] Saved eval metrics to {metrics_path}")
 
-    print("[STAGE 2] Done.\n" + "=" * 80)
-    return model_stage2
+            preds_path1 = os.path.join(STAGE2_OUTPUT_DIR, "val_predictions_oracle_caption.json")
+            with open(preds_path1, "w") as f:
+                json.dump(oracle_outputs, f, indent=2)
+            print(f"[STAGE 2] Saved oracle-caption predictions to {preds_path1}")
+
+            preds_path2 = os.path.join(STAGE2_OUTPUT_DIR, "val_predictions_stage1_caption.json")
+            with open(preds_path2, "w") as f:
+                json.dump(stage1_outputs, f, indent=2)
+            print(f"[STAGE 2] Saved stage1-caption predictions to {preds_path2}")
+        else:
+            if world > 1:
+                print("[STAGE 2] (DDP) Skipping heavy generation-eval metrics to avoid NCCL timeouts. "
+                      "Run single-GPU for detailed metrics JSON + predictions.")
+            elif _SKIP_HEAVY_EVAL:
+                print("[STAGE 2] SKIP_HEAVY_EVAL=1 => skipping heavy generation-eval metrics.")
+
+        print("[STAGE 2] Done.\n" + "=" * 80)
+
+    # short sync so all ranks exit together
+    _barrier()
+    return trained_stage2
