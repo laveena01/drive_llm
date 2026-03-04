@@ -3,32 +3,38 @@
 """
 Utilities for loading nuScenes and extracting object-level vectors.
 
-Vector format per object:
-[rel_x, rel_y, dist, rel_speed, heading, size, type_id]
+Vector format per object (UPDATED for Option A):
+[rel_x, rel_y, dist, rel_vx, rel_vy, heading, size, type_id]
 
 Where:
 - rel_x, rel_y are in EGO frame (meters)
 - dist is sqrt(rel_x^2 + rel_y^2)
-- rel_speed is magnitude (m/s) (ego-frame magnitude)
-- heading is yaw angle (radians) of the object's box in ego frame
+- rel_vx, rel_vy are object's velocity components in EGO frame (m/s)
+- heading is yaw angle (radians) of the object's box in ego frame (orientation, not velocity direction)
 - size is avg(length, width) proxy (meters)
 - type_id: 0 car, 1 pedestrian, 2 traffic_light, 3 other
 """
 
 from typing import List, Dict, Optional, Tuple
 import numpy as np
+import logging
+
 from nuscenes.nuscenes import NuScenes
 from pyquaternion import Quaternion
 
 from .config import NUSC_ROOT, NUSC_VERSION, MAX_OBJECTS, VECTOR_DIM
 
+logger = logging.getLogger("llm_driving")
+
 
 def init_nuscenes() -> NuScenes:
-    print(f"[nuscenes_data] Initializing nuScenes with:")
-    print(f"  - dataroot = {NUSC_ROOT}")
-    print(f"  - version  = {NUSC_VERSION}")
+    logger.info("[nuscenes_data] Initializing nuScenes with:")
+    logger.info(f"  - dataroot = {NUSC_ROOT}")
+    logger.info(f"  - version  = {NUSC_VERSION}")
+
     nusc = NuScenes(version=NUSC_VERSION, dataroot=NUSC_ROOT, verbose=True)
-    print("[nuscenes_data] nuScenes initialized successfully.\n")
+
+    logger.info("[nuscenes_data] nuScenes initialized successfully.")
     return nusc
 
 
@@ -37,8 +43,6 @@ def _yaw_from_quaternion(q: Quaternion) -> float:
     Return yaw (rotation around z) from quaternion.
     nuScenes uses (w, x, y, z).
     """
-    # Quaternion yaw extraction:
-    # yaw = atan2(2(wz + xy), 1 - 2(y^2 + z^2))
     w, x, y, z = q.w, q.x, q.y, q.z
     return float(np.arctan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z)))
 
@@ -50,16 +54,15 @@ def get_object_vectors_for_sample(
     """
     Extract object vectors for a given sample token.
     Uses ego pose (LIDAR_TOP) to convert global boxes -> ego frame.
-    
+
     Returns:
         Tuple of (vectors, count, category_names)
         - vectors: (MAX_OBJECTS, VECTOR_DIM) array
         - count: number of valid objects
-        - category_names: list of category names for each object (for risk calculation)
+        - category_names: list of category names for each object (optional use)
     """
     sample = nusc.get("sample", sample_token)
 
-    # Use LIDAR_TOP sample_data for ego pose (standard in nuScenes)
     lidar_sd_token = sample["data"]["LIDAR_TOP"]
     lidar_sd = nusc.get("sample_data", lidar_sd_token)
     ego_pose = nusc.get("ego_pose", lidar_sd["ego_pose_token"])
@@ -74,37 +77,34 @@ def get_object_vectors_for_sample(
     for ann_token in sample["anns"]:
         ann = nusc.get("sample_annotation", ann_token)
 
-        # --- Global box translation/orientation ---
         obj_t = np.array(ann["translation"], dtype=np.float32)
         obj_q = Quaternion(ann["rotation"])
 
         # --- Transform position: global -> ego frame ---
-        rel_global = obj_t - ego_t  # still global axes
-        rel_ego = ego_q_inv.rotate(rel_global)  # now ego axes
+        rel_global = obj_t - ego_t
+        rel_ego = ego_q_inv.rotate(rel_global)
 
         rel_x = float(rel_ego[0])
         rel_y = float(rel_ego[1])
         dist = float(np.sqrt(rel_x * rel_x + rel_y * rel_y + 1e-6))
 
-        # --- Velocity (global) -> ego frame magnitude ---
-        rel_speed = 0.0
+        # --- Velocity: global -> ego frame components (UPDATED) ---
+        rel_vx, rel_vy = 0.0, 0.0
         try:
             vx, vy, vz = nusc.box_velocity(ann_token)
             if not np.any(np.isnan([vx, vy, vz])):
                 v_global = np.array([vx, vy, vz], dtype=np.float32)
                 v_ego = ego_q_inv.rotate(v_global)
-                rel_speed = float(np.linalg.norm(v_ego[:2]))  # horizontal speed
+                rel_vx = float(v_ego[0])
+                rel_vy = float(v_ego[1])
         except Exception:
-            rel_speed = 0.0
+            rel_vx, rel_vy = 0.0, 0.0
 
-        # --- Heading: object yaw in ego frame ---
-        # Convert object orientation into ego frame: q_ego_inv * q_obj
+        # --- Heading: object yaw in ego frame (orientation) ---
         obj_q_ego = ego_q_inv * obj_q
-        heading = _yaw_from_quaternion(obj_q_ego)  # radians
+        heading = _yaw_from_quaternion(obj_q_ego)
 
         # --- Size proxy ---
-        # ann["size"] = [w, l, h] in nuScenes (width, length, height)
-        # We'll use avg of width & length (stable scalar)
         w, l, h = ann["size"]
         size = float((float(w) + float(l)) / 2.0)
 
@@ -119,11 +119,11 @@ def get_object_vectors_for_sample(
         else:
             type_id = 3
 
-        vectors.append([rel_x, rel_y, dist, rel_speed, heading, size, float(type_id)])
+        # UPDATED vector: [x, y, dist, vx, vy, heading, size, type_id]
+        vectors.append([rel_x, rel_y, dist, rel_vx, rel_vy, heading, size, float(type_id)])
         categories.append(category)
 
-    # Sort by distance so MAX_OBJECTS are the nearest ones (much more stable)
-    # Sort both vectors and categories together
+    # Sort by distance so MAX_OBJECTS are nearest ones
     if vectors:
         sorted_pairs = sorted(zip(vectors, categories), key=lambda x: x[0][2])
         vectors = [p[0] for p in sorted_pairs]
@@ -133,10 +133,8 @@ def get_object_vectors_for_sample(
     count = min(len(vectors), MAX_OBJECTS)
     if count > 0:
         padded[:count, :] = np.array(vectors[:count], dtype=np.float32)
-    
-    # Truncate categories to MAX_OBJECTS
-    categories = categories[:count]
 
+    categories = categories[:count]
     return padded, count, categories
 
 
@@ -151,13 +149,16 @@ def get_scene_frames_vectors(
         "vectors": np.ndarray(MAX_OBJECTS, VECTOR_DIM),
         "num_objects": int,
         "sample_token": str,
-        "categories": List[str]  # Added for risk calculation
+        "categories": List[str]
       }
     """
     scene = nusc.scene[scene_idx]
     token = scene["first_sample_token"]
 
-    print(f"[nuscenes_data] Collecting frames for scene {scene_idx} (token={scene['token']})")
+    logger.info(
+        f"[nuscenes_data] Collecting frames for scene {scene_idx} "
+        f"(scene_token={scene['token']}, max_frames={max_frames})"
+    )
 
     frames: List[Dict] = []
     frame_idx = 0
@@ -181,7 +182,7 @@ def get_scene_frames_vectors(
         frame_idx += 1
 
         if frame_idx % 20 == 0:
-            print(f"[nuscenes_data]  Processed {frame_idx} frames in scene {scene_idx}...")
+            logger.info(f"[nuscenes_data]  Processed {frame_idx} frames in scene {scene_idx}...")
 
-    print(f"[nuscenes_data] Extracted {len(frames)} frames for scene {scene_idx}")
+    logger.info(f"[nuscenes_data] Extracted {len(frames)} frames for scene {scene_idx}")
     return frames

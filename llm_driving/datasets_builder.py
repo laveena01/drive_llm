@@ -14,11 +14,15 @@ PART-1 updates:
 from typing import List, Dict
 from collections import Counter
 import json
+import logging
 
 from .nuscenes_data import get_scene_frames_vectors, init_nuscenes
 from .langen import lanGen, vector_to_string
 from .config import CAPTIONING_DATA_PATH, QA_DATA_PATH, MAX_OBJECTS
+# from llm_driving.risk_calculator import calculate_risk_from_vectors, get_risk_summary_text
+from llm_driving.risk_calculator import calculate_risk_from_vectors, get_risk_summary_text, policy_from_risk
 
+logger = logging.getLogger("llm_driving")
 
 # Track policy decisions for logging
 _policy_log: List[Dict] = []
@@ -107,21 +111,66 @@ def _make_samples_from_frames(
     qa_samples: List[Dict],
     scene_idx: int = 0,
 ):
-    print(f"[datasets_builder]   Converting {len(frames)} frames into captioning + QA samples...")
+    logger.info(f"[datasets_builder]   Converting {len(frames)} frames into captioning + QA samples...")
     for idx, frame in enumerate(frames):
         num_objects = int(frame["num_objects"])
-        caption = lanGen(frame)
+        use_n = min(num_objects, MAX_OBJECTS)
 
+        # Phase-1: compute TTC-based risk + summary text
+        # risk_data = calculate_risk_from_vectors(
+        #     vectors=frame["vectors"],
+        #     use_n=use_n,
+        #     ego_speed=None,
+        #     traffic_light=None,
+        # )
+        # risk_text = get_risk_summary_text(risk_data)
+
+        # # Make risk visible to lanGen (it checks frame.get("risk_data"))
+        # frame["risk_data"] = {
+        #     "risk_level": risk_data.risk_level,
+        #     "max_collision_risk": risk_data.max_collision_risk,
+        #     "max_pedestrian_risk": risk_data.max_pedestrian_risk,
+        #     "min_ttc": risk_data.min_ttc,
+        #     "avg_total_risk": risk_data.avg_total_risk,
+        #     "regulatory_risk":0.0,
+        #     "uncertainty_risk": 0.0,
+        #     # "regulatory_risk": risk_data.regulatory_risk,
+        #     # "uncertainty_risk": risk_data.uncertainty_risk,
+        # }
+
+        risk_data = calculate_risk_from_vectors(
+            vectors=frame["vectors"],
+            use_n=use_n,
+            ego_speed=None,
+            traffic_light=None,
+        )
+        risk_text = get_risk_summary_text(risk_data)
+
+        # --- Stage-1 caption should NOT see risk_data ---
+        frame_for_caption = dict(frame)          # shallow copy is enough here
+        frame_for_caption.pop("risk_data", None) # ensure no risk_data leaks
+        caption = lanGen(frame_for_caption)
+
+        # --- After caption is created, attach risk_data for Stage-2 + storage ---
+        frame["risk_data"] = {
+            "risk_level": risk_data.risk_level,
+            "max_collision_risk": risk_data.max_collision_risk,
+            "max_pedestrian_risk": risk_data.max_pedestrian_risk,
+            "min_ttc": risk_data.min_ttc,
+            "avg_total_risk": risk_data.avg_total_risk,
+            "regulatory_risk": 0.0,
+            "uncertainty_risk": 0.0,
+        }
+        # caption = lanGen(frame)
         vec_str = vector_to_string(frame["vectors"], num_objects)
 
         # --- Stage 1: vector -> caption ---
         captioning_samples.append({
             "input": f"Describe the driving scene from object vectors:\n{vec_str}",
-            "target": caption,
+            "target": caption ,
         })
 
         # --- Stage 2: paper-style actions ---
-        use_n = min(num_objects, MAX_OBJECTS)
         if use_n == 0:
             min_dist = 999.0
         else:
@@ -131,18 +180,35 @@ def _make_samples_from_frames(
         qa_question = "How should the car drive in this situation and why?"
 
         global_frame_idx = len(qa_samples)  # unique frame index across all scenes
-        accel, brake, steer, reason, policy_label = _policy_from_min_dist(use_n, min_dist, frame_idx=global_frame_idx)
+        # accel, brake, steer, reason, policy_label = _policy_from_min_dist(
+        #     use_n, min_dist, frame_idx=global_frame_idx
+        # )
+        accel, brake, steer, reason, policy_label = policy_from_risk(risk_data)
+        _policy_log.append({
+        "frame_idx": global_frame_idx,
+        "num_objects": use_n,
+        "min_dist": float(min_dist),
+        "risk_level": risk_data.risk_level,
+        "decision": policy_label,
+        "accel": accel,
+        "brake": brake,
+    })
         qa_target = _paper_target(accel, brake, steer, reason)
 
-        # Log individual risk decisions (every 10th frame to avoid spam)
+        # Log individual decisions (every 10th frame to avoid spam)
         if idx % 10 == 0:
-            risk = _policy_log[-1]["risk_level"] if _policy_log else "?"
-            print(f"    [RISK] Scene {scene_idx} Frame {idx}: objects={use_n}, min_dist={min_dist:.1f}m -> {risk} risk -> {policy_label}")
+            last_risk = _policy_log[-1]["risk_level"] if _policy_log else "?"
+            logger.info(
+                f"    [RISK] Scene {scene_idx} Frame {idx}: "
+                f"objects={use_n}, min_dist={min_dist:.1f}m -> {last_risk} risk -> {policy_label}"
+            )
 
-        # PART-1: remove min_dist from the Stage-2 input (keep only caption + question + format)
+        # Stage-2 input includes RISK block
         qa_input = (
             "### OBSERVATION\n"
             f"{caption}\n\n"
+            "### RISK\n"
+            f"{risk_text}\n\n"
             "### QUESTION\n"
             f"{qa_question}\n\n"
             "### OUTPUT FORMAT\n"
@@ -159,6 +225,11 @@ def _make_samples_from_frames(
             # Debug only
             "oracle_caption_debug": caption,
 
+            # Phase-1 additions
+            "risk_text": risk_text,
+            "risk_data": frame["risk_data"],
+            "risk_level": risk_data.risk_level,
+
             # Metadata (not leaked into prompt)
             "min_dist": float(min_dist),
             "policy_label": policy_label,
@@ -166,59 +237,59 @@ def _make_samples_from_frames(
         })
 
         if (idx + 1) % 50 == 0:
-            print(f"[datasets_builder]     Processed {idx + 1}/{len(frames)} frames in this scene...")
+            logger.info(f"[datasets_builder]     Processed {idx + 1}/{len(frames)} frames in this scene...")
 
 
 def _print_policy_summary():
     """Print a summary of all policy decisions made during dataset building."""
     if not _policy_log:
-        print("[POLICY SUMMARY] No policy decisions logged.")
+        logger.info("[POLICY SUMMARY] No policy decisions logged.")
         return
 
-    print("\n" + "=" * 80)
-    print("[POLICY SUMMARY] Risk Assessment Outcomes")
-    print("=" * 80)
+    logger.info("\n" + "=" * 80)
+    logger.info("[POLICY SUMMARY] Risk Assessment Outcomes")
+    logger.info("=" * 80)
 
-    # Count by risk level
     risk_counts = Counter(p["risk_level"] for p in _policy_log)
     decision_counts = Counter(p["decision"] for p in _policy_log)
 
     total = len(_policy_log)
-    print(f"\nTotal frames processed: {total}")
+    logger.info(f"\nTotal frames processed: {total}")
 
-    print("\n--- Risk Level Distribution ---")
-    for level in ["CRITICAL", "HIGH", "MEDIUM", "LOW"]:
+    logger.info("\n--- Risk Level Distribution ---")
+    for level in ["CRITICAL", "HIGH", "MODERATE", "LOW", "MINIMAL"]:
         count = risk_counts.get(level, 0)
         pct = (count / total) * 100 if total > 0 else 0
         bar = "█" * int(pct / 2)
-        print(f"  {level:10s}: {count:4d} ({pct:5.1f}%) {bar}")
+        logger.info(f"  {level:10s}: {count:4d} ({pct:5.1f}%) {bar}")
 
-    print("\n--- Decision Distribution ---")
+    logger.info("\n--- Decision Distribution ---")
     for decision in ["BRAKE", "CAUTION", "CONTINUE"]:
         count = decision_counts.get(decision, 0)
         pct = (count / total) * 100 if total > 0 else 0
         bar = "█" * int(pct / 2)
-        print(f"  {decision:10s}: {count:4d} ({pct:5.1f}%) {bar}")
+        logger.info(f"  {decision:10s}: {count:4d} ({pct:5.1f}%) {bar}")
 
     # Distance statistics
     dists = [p["min_dist"] for p in _policy_log if p["min_dist"] < 900]
     if dists:
         import numpy as np
-        print("\n--- Distance Statistics (objects present) ---")
-        print(f"  Min distance:  {min(dists):.2f} m")
-        print(f"  Max distance:  {max(dists):.2f} m")
-        print(f"  Mean distance: {np.mean(dists):.2f} m")
-        print(f"  Median distance: {np.median(dists):.2f} m")
+        logger.info("\n--- Distance Statistics (objects present) ---")
+        logger.info(f"  Min distance:  {min(dists):.2f} m")
+        logger.info(f"  Max distance:  {max(dists):.2f} m")
+        logger.info(f"  Mean distance: {np.mean(dists):.2f} m")
+        logger.info(f"  Median distance: {np.median(dists):.2f} m")
 
-    # Show some example critical/high risk frames
     critical_frames = [p for p in _policy_log if p["risk_level"] in ["CRITICAL", "HIGH"]]
     if critical_frames:
-        print(f"\n--- Sample High-Risk Frames (showing up to 5) ---")
+        logger.info(f"\n--- Sample High-Risk Frames (showing up to 5) ---")
         for p in critical_frames[:5]:
-            print(f"  Frame {p['frame_idx']}: {p['num_objects']} objects, min_dist={p['min_dist']:.1f}m "
-                  f"-> {p['risk_level']} -> Brake={p['brake']}%")
+            logger.info(
+                f"  Frame {p['frame_idx']}: {p['num_objects']} objects, min_dist={p['min_dist']:.1f}m "
+                f"-> {p['risk_level']} -> Brake={p['brake']}%"
+            )
 
-    print("=" * 80 + "\n")
+    logger.info("=" * 80 + "\n")
 
 
 def build_datasets_full_mini(
@@ -229,38 +300,39 @@ def build_datasets_full_mini(
     global _policy_log
     _policy_log = []  # Reset for fresh run
 
-    print("[datasets_builder] Initializing nuScenes for full-mini dataset creation...")
+    logger.info("[datasets_builder] Initializing nuScenes for full-mini dataset creation...")
     nusc = init_nuscenes()
 
     captioning_samples: list[dict] = []
     qa_samples: list[dict] = []
 
     num_scenes = len(nusc.scene)
-    print(f"[datasets_builder] Building data from all {num_scenes} scenes in nuScenes-mini.")
-    print(f"[datasets_builder]   max_frames_per_scene = {max_frames_per_scene}")
+    logger.info(f"[datasets_builder] Building data from all {num_scenes} scenes in nuScenes-mini.")
+    logger.info(f"[datasets_builder]   max_frames_per_scene = {max_frames_per_scene}")
 
     for scene_idx in range(num_scenes):
-        print(f"\n[datasets_builder] Processing scene {scene_idx}/{num_scenes - 1}...")
+        logger.info(f"\n[datasets_builder] Processing scene {scene_idx}/{num_scenes - 1}...")
         frames = get_scene_frames_vectors(
             nusc,
             scene_idx=scene_idx,
             max_frames=max_frames_per_scene,
         )
-        print(f"[datasets_builder]   Retrieved {len(frames)} frames from scene {scene_idx}.")
+        logger.info(f"[datasets_builder]   Retrieved {len(frames)} frames from scene {scene_idx}.")
         _make_samples_from_frames(frames, captioning_samples, qa_samples, scene_idx=scene_idx)
-        print(f"[datasets_builder]   After scene {scene_idx}: "
-              f"{len(captioning_samples)} captioning samples, {len(qa_samples)} QA samples.")
+        logger.info(
+            f"[datasets_builder]   After scene {scene_idx}: "
+            f"{len(captioning_samples)} captioning samples, {len(qa_samples)} QA samples."
+        )
 
-    # Print risk assessment summary
     _print_policy_summary()
 
-    print(f"\n[datasets_builder] Saving captioning dataset to: {captioning_path}")
+    logger.info(f"\n[datasets_builder] Saving captioning dataset to: {captioning_path}")
     with open(captioning_path, "w") as f:
         json.dump(captioning_samples, f, indent=2)
 
-    print(f"[datasets_builder] Saving QA dataset to: {qa_path}")
+    logger.info(f"[datasets_builder] Saving QA dataset to: {qa_path}")
     with open(qa_path, "w") as f:
         json.dump(qa_samples, f, indent=2)
 
-    print(f"[datasets_builder] DONE. Captioning samples: {len(captioning_samples)} | QA samples: {len(qa_samples)}")
+    logger.info(f"[datasets_builder] DONE. Captioning samples: {len(captioning_samples)} | QA samples: {len(qa_samples)}")
     return captioning_samples, qa_samples

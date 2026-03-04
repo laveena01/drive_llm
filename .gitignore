@@ -1,5 +1,5 @@
 /data/
 /outputs/
 /runs/
-
+/runs_trainval
 __pycache__

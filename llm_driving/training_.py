@@ -72,13 +72,16 @@ def _build_stage1_prompt(vec_str: str) -> str:
 
 def _build_stage2_prompt_from_caption(caption: str, min_dist: Optional[float]) -> str:
     qa_question = "How should the car drive in this situation and why?"
-    min_dist_line = ""
-    if min_dist is not None:
-        min_dist_line = f"\nMinimum object distance: {float(min_dist):.1f} m\n\n"
+    risk_block = ""
+    if risk_text:
+        risk_block = f"\n\n### RISK\n{risk_text}\n"
+
     prompt = (
-        caption
-        + min_dist_line
-        + f"Question: {qa_question}"
+        "### OBSERVATION\n"
+        f"{caption}"
+        f"{risk_block}\n\n"
+        "### QUESTION\n"
+        f"{qa_question}\n\n"
     )
     return _ensure_paper_format(prompt)
 
@@ -460,13 +463,14 @@ def train_stage2(model_stage1, tokenizer, qa_path: str):
                 caption_used = None
             else:
                 vec_str = sample.get("vec_str", "")
-                min_dist = sample.get("min_dist", None)
+                # min_dist = sample.get("min_dist", None)
+                risk_text = sample.get("risk_text", "")
 
                 s1_prompt = _build_stage1_prompt(vec_str)
                 caption_pred = _gen_text(model_stage1, s1_prompt, max_new_tokens=160, no_repeat_ngram_size=4)
                 caption_used = caption_pred
 
-                stage2_prompt = _build_stage2_prompt_from_caption(caption_pred, min_dist)
+                stage2_prompt = _build_stage2_prompt_from_caption(caption_pred, risk_text = risk_text)
 
             pred_text = _gen_text(model_stage2, stage2_prompt, max_new_tokens=90, no_repeat_ngram_size=3)
 

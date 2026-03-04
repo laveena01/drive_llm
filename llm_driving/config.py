@@ -7,19 +7,22 @@ from datetime import datetime
 # -----------------------------
 # nuScenes
 # -----------------------------
-NUSC_ROOT = "data"
+NUSC_ROOT = "/u/student/2021/cs21resch15003/nuscenes"
 NUSC_VERSION = "v1.0-mini"          # later: "v1.0-trainval"
 
 # -----------------------------
 # vectors
 # -----------------------------
 MAX_OBJECTS = 10
-VECTOR_DIM = 7
+VECTOR_DIM = 8
 
 # -----------------------------
 # Risk Calculation (NEW)
 # -----------------------------
 DEFAULT_EGO_SPEED = 10.0  # m/s
+RISK_FRONT_CONE_DEG = 45.0   # consider objects within +/- this angle in front
+RISK_LATERAL_BAND_M = 3.0    # consider objects with |rel_y| <= this as "in-path"
+RISK_REQUIRE_IN_FRONT = True # require rel_x > 0 for TTC/collision
 USE_ADVANCED_RISK = True  # Use multi-dimensional risk instead of simple distance-based policy
 RISK_WEIGHTS = {
     'collision': 0.40,
@@ -106,6 +109,9 @@ LOGGING_STEPS = 50
 EVAL_STRATEGY = "epoch"
 SAVE_STRATEGY = "epoch"
 SAVE_TOTAL_LIMIT = 3
+LOG_LEVEL = "INFO"          # "DEBUG", "INFO", "WARNING", "ERROR"
+LOG_FILE_NAME = "train.log" # stored under RUN_DIR
+DISABLE_TQDM = False     
 
 # -----------------------------
 # Metrics toggles

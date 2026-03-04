@@ -1,19 +1,10 @@
 # llm_driving/training.py
 
-"""
-PART-1 updates:
-- Stage-2 initialized from Stage-1 checkpoint (dependency)
-- Remove min_dist leakage from Stage-2 prompt construction
-- Fix 5-line format metric by enforcing 5-line output with a robust post-processor
-- Add paper-valid control metrics:
-  - accel_mae, brake_mae, steering_accuracy
-- Keep your existing metrics: action_accuracy buckets, BLEU1, ROUGE-L, format compliance
-"""
-
 import os
 import json
 import re
 import copy
+import logging
 from typing import List, Dict, Tuple, Optional
 from collections import Counter
 
@@ -31,6 +22,8 @@ from .config import (
     STAGE1_OUTPUT_DIR,
     STAGE2_OUTPUT_DIR,
 )
+
+logger = logging.getLogger("llm_driving")
 
 # ---------------------------
 # Helpers
@@ -60,9 +53,19 @@ def _ensure_paper_format(prompt: str) -> str:
 def _build_stage1_prompt(vec_str: str) -> str:
     return f"Describe the driving scene from object vectors:\n{vec_str}"
 
-def _build_stage2_prompt_from_caption(caption: str) -> str:
+def _build_stage2_prompt_from_caption(caption: str, risk_text: str = "") -> str:
     qa_question = "How should the car drive in this situation and why?"
-    prompt = caption + f"\n\nQuestion: {qa_question}"
+    risk_block = ""
+    if risk_text:
+        risk_block = f"\n\n### RISK\n{risk_text}\n"
+
+    prompt = (
+        "### OBSERVATION\n"
+        f"{caption}"
+        f"{risk_block}\n\n"
+        "### QUESTION\n"
+        f"{qa_question}\n\n"
+    )
     return _ensure_paper_format(prompt)
 
 
@@ -163,10 +166,6 @@ def _extract_reason(text: str) -> Optional[str]:
     return m.group(1).strip() if m else None
 
 def enforce_5_lines(text: str) -> Tuple[str, int]:
-    """
-    Return (fixed_text, ok)
-    ok=1 if we could parse accel+brake+steer+reason from the model output, else 0.
-    """
     accel = _extract_accel_percent(text)
     brake = _extract_brake_percent(text)
     steer = _extract_steer(text)
@@ -192,7 +191,6 @@ def _format_compliance_5line(text: str) -> int:
     if not text:
         return 0
     lines = [ln.rstrip("\n") for ln in (text or "").splitlines()]
-    # keep empty line filtering consistent with your earlier logic
     lines = [ln.strip() for ln in lines if ln.strip()]
     if len(lines) != 5:
         return 0
@@ -228,70 +226,52 @@ def _map_text_to_action_label(text: str) -> str:
     return "CONTINUE"
 
 
-def _map_brake_to_risk(brake_pct: Optional[int]) -> str:
-    """Map brake percentage to risk level for logging."""
-    if brake_pct is None:
-        return "UNKNOWN"
-    if brake_pct >= 70:
-        return "CRITICAL"
-    if brake_pct >= 30:
-        return "HIGH"
-    if brake_pct >= 5:
-        return "MEDIUM"
-    return "LOW"
-
-
 def _print_eval_risk_summary(outputs: List[Dict], mode: str):
-    """Print risk assessment summary from evaluation outputs."""
-    print(f"\n{'=' * 60}")
-    print(f"[RISK OUTCOMES] Evaluation Mode: {mode}")
-    print(f"{'=' * 60}")
+    logger.info(f"\n{'=' * 60}")
+    logger.info(f"[RISK OUTCOMES] Evaluation Mode: {mode}")
+    logger.info(f"{'=' * 60}")
 
-    # Extract ground truth and predicted actions
     gt_actions = [o["gt_action"] for o in outputs]
     pred_actions = [o["pred_action"] for o in outputs]
 
     gt_counts = Counter(gt_actions)
     pred_counts = Counter(pred_actions)
 
-    print(f"\nTotal samples: {len(outputs)}")
+    logger.info(f"\nTotal samples: {len(outputs)}")
 
-    print("\n--- Ground Truth Action Distribution ---")
+    logger.info("\n--- Ground Truth Action Distribution ---")
     for action in ["BRAKE", "CAUTION", "CONTINUE", "OTHER"]:
         count = gt_counts.get(action, 0)
         pct = (count / len(outputs)) * 100 if outputs else 0
         bar = "█" * int(pct / 2)
-        print(f"  {action:10s}: {count:4d} ({pct:5.1f}%) {bar}")
+        logger.info(f"  {action:10s}: {count:4d} ({pct:5.1f}%) {bar}")
 
-    print("\n--- Predicted Action Distribution ---")
+    logger.info("\n--- Predicted Action Distribution ---")
     for action in ["BRAKE", "CAUTION", "CONTINUE", "OTHER"]:
         count = pred_counts.get(action, 0)
         pct = (count / len(outputs)) * 100 if outputs else 0
         bar = "█" * int(pct / 2)
-        print(f"  {action:10s}: {count:4d} ({pct:5.1f}%) {bar}")
+        logger.info(f"  {action:10s}: {count:4d} ({pct:5.1f}%) {bar}")
 
-    # Confusion summary
-    print("\n--- Action Prediction Confusion ---")
+    logger.info("\n--- Action Prediction Confusion ---")
     correct = sum(1 for o in outputs if o["gt_action"] == o["pred_action"] and o["gt_action"] != "OTHER")
     total_valid = sum(1 for o in outputs if o["gt_action"] != "OTHER")
-    print(f"  Correct: {correct}/{total_valid} = {correct/max(1,total_valid)*100:.1f}%")
+    logger.info(f"  Correct: {correct}/{total_valid} = {correct/max(1,total_valid)*100:.1f}%")
 
-    # Per-class accuracy
     for action in ["BRAKE", "CAUTION", "CONTINUE"]:
         gt_this = [o for o in outputs if o["gt_action"] == action]
         if gt_this:
             correct_this = sum(1 for o in gt_this if o["pred_action"] == action)
-            print(f"  {action}: {correct_this}/{len(gt_this)} = {correct_this/len(gt_this)*100:.1f}% recall")
+            logger.info(f"  {action}: {correct_this}/{len(gt_this)} = {correct_this/len(gt_this)*100:.1f}% recall")
 
-    # Show misclassified high-risk samples
     missed_brakes = [o for o in outputs if o["gt_action"] == "BRAKE" and o["pred_action"] != "BRAKE"]
     if missed_brakes:
-        print(f"\n--- Missed BRAKE Decisions (showing up to 3) ---")
+        logger.info(f"\n--- Missed BRAKE Decisions (showing up to 3) ---")
         for o in missed_brakes[:3]:
-            print(f"  GT: BRAKE, Pred: {o['pred_action']}")
-            print(f"    Raw output: {o.get('prediction_raw', 'N/A')[:100]}...")
+            logger.info(f"  GT: BRAKE, Pred: {o['pred_action']}")
+            logger.info(f"    Raw output: {o.get('prediction_raw', 'N/A')[:100]}...")
 
-    print(f"{'=' * 60}\n")
+    logger.info(f"{'=' * 60}\n")
 
 
 # ---------------------------
@@ -303,14 +283,14 @@ def _tokenize_captioning(batch, tokenizer):
         batch["input"],
         truncation=True,
         padding="max_length",
-        max_length=192,
+        max_length=320,
     )
     with tokenizer.as_target_tokenizer():
         labels = tokenizer(
             batch["target"],
             truncation=True,
             padding="max_length",
-            max_length=192,
+            max_length=320,
         )["input_ids"]
 
     pad_id = tokenizer.pad_token_id
@@ -323,7 +303,7 @@ def _tokenize_qa(batch, tokenizer):
         batch["input"],
         truncation=True,
         padding="max_length",
-        max_length=192,
+        max_length=384,
     )
     with tokenizer.as_target_tokenizer():
         labels = tokenizer(
@@ -344,35 +324,42 @@ def _tokenize_qa(batch, tokenizer):
 # ---------------------------
 
 def train_stage1(captioning_path: str):
-    print("\n" + "=" * 80)
-    print("[STAGE 1] Vector → Caption training started.")
-    print(f"[STAGE 1] Loading captioning data from: {captioning_path}")
+    logger.info("\n" + "=" * 80)
+    logger.info("[STAGE 1] Vector → Caption training started.")
+    logger.info(f"[STAGE 1] Loading captioning data from: {captioning_path}")
 
     with open(captioning_path, "r") as f:
         data = json.load(f)
 
     full_ds = Dataset.from_list(data)
-    print(f"[STAGE 1] Total samples: {len(full_ds)}")
+    logger.info(f"[STAGE 1] Total samples: {len(full_ds)}")
 
     split_ds = full_ds.train_test_split(test_size=0.2, seed=42)
     train_ds = split_ds["train"]
     eval_ds = split_ds["test"]
-    print(f"[STAGE 1] Train samples: {len(train_ds)}  |  Val samples: {len(eval_ds)}")
+    logger.info(f"[STAGE 1] Train samples: {len(train_ds)}  |  Val samples: {len(eval_ds)}")
+
+    # quick sanity: risk coverage in stage-1 targets (non-empty risk_text field)
+    try:
+        has_risk = sum(1 for x in data if (x.get("risk_text") or "").strip())
+        logger.info(f"[STAGE 1] Samples with risk_text: {has_risk}/{len(data)} ({has_risk/max(1,len(data))*100:.1f}%)")
+    except Exception:
+        logger.debug("[STAGE 1] Could not compute risk_text coverage.", exc_info=True)
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 
     def tokenize_fn(batch):
         return _tokenize_captioning(batch, tokenizer)
 
-    print("[STAGE 1] Tokenizing datasets...")
+    logger.info("[STAGE 1] Tokenizing datasets...")
     tokenized_train = train_ds.map(tokenize_fn, batched=True, remove_columns=["input", "target"])
     tokenized_eval = eval_ds.map(tokenize_fn, batched=True, remove_columns=["input", "target"])
 
-    print(f"[STAGE 1] Loading model: {MODEL_NAME}")
+    logger.info(f"[STAGE 1] Loading model: {MODEL_NAME}")
     model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME)
 
     _ensure_dir(STAGE1_OUTPUT_DIR)
-    print(f"[STAGE 1] Output directory: {STAGE1_OUTPUT_DIR}")
+    logger.info(f"[STAGE 1] Output directory: {STAGE1_OUTPUT_DIR}")
 
     training_args = TrainingArguments(
         output_dir=STAGE1_OUTPUT_DIR,
@@ -396,47 +383,49 @@ def train_stage1(captioning_path: str):
         tokenizer=tokenizer,
     )
 
-    print("[STAGE 1] Starting training...")
+    logger.info("[STAGE 1] Starting training...")
     trainer.train()
     trainer.save_model(STAGE1_OUTPUT_DIR)
     tokenizer.save_pretrained(STAGE1_OUTPUT_DIR)
 
-    print("[STAGE 1] Training finished. Running evaluation...")
-
+    logger.info("[STAGE 1] Training finished. Running evaluation...")
     eval_metrics = trainer.evaluate()
-    print("\n[STAGE 1] Eval metrics:", eval_metrics)
+    logger.info(f"[STAGE 1] Eval metrics: {eval_metrics}")
 
     metrics_path = os.path.join(STAGE1_OUTPUT_DIR, "eval_metrics.json")
     with open(metrics_path, "w") as f:
         json.dump(eval_metrics, f, indent=2)
-    print(f"[STAGE 1] Saved eval metrics to {metrics_path}")
+    logger.info(f"[STAGE 1] Saved eval metrics to {metrics_path}")
 
-    print("[STAGE 1] Generating predictions on validation set...")
+    logger.info("[STAGE 1] Generating predictions on validation set...")
     model.eval()
     val_preds = []
-    for sample in eval_ds:
+    for i, sample in enumerate(eval_ds):
         input_text = sample["input"]
         gt_text = sample["target"]
-        inputs = tokenizer(input_text, return_tensors="pt", max_length=192, truncation=True).to(model.device)
-
-        pred_ids = model.generate(
-            **inputs,
-            max_new_tokens=160,
-            num_beams=4,
-            early_stopping=True,
-            no_repeat_ngram_size=4,
-            repetition_penalty=1.2,
-        )
-        pred_text = tokenizer.decode(pred_ids[0], skip_special_tokens=True)
+        try:
+            inputs = tokenizer(input_text, return_tensors="pt", max_length=320, truncation=True).to(model.device)
+            pred_ids = model.generate(
+                **inputs,
+                max_new_tokens=260,
+                num_beams=4,
+                early_stopping=True,
+                no_repeat_ngram_size=4,
+                repetition_penalty=1.2,
+            )
+            pred_text = tokenizer.decode(pred_ids[0], skip_special_tokens=True)
+        except Exception:
+            logger.exception(f"[STAGE 1] Generation failed on val sample idx={i}.")
+            pred_text = ""
 
         val_preds.append({"input": input_text, "ground_truth": gt_text, "prediction": pred_text})
 
     preds_path = os.path.join(STAGE1_OUTPUT_DIR, "val_predictions.json")
     with open(preds_path, "w") as f:
         json.dump(val_preds, f, indent=2)
-    print(f"[STAGE 1] Saved {len(val_preds)} validation predictions to {preds_path}")
+    logger.info(f"[STAGE 1] Saved {len(val_preds)} validation predictions to {preds_path}")
 
-    print("[STAGE 1] Done.\n" + "=" * 80)
+    logger.info("[STAGE 1] Done.\n" + "=" * 80)
     return model, tokenizer
 
 
@@ -445,20 +434,11 @@ def train_stage1(captioning_path: str):
 # ---------------------------
 
 def train_stage2(model_stage1, tokenizer, qa_path: str):
-    """
-    PART-1:
-    - Stage-2 model initialized from Stage-1 checkpoint => dependency
-    - Stage-2 prompts do NOT include min_dist
-    """
-    print("\n" + "=" * 80)
-    print("[STAGE 2] Driving QA finetuning started.")
-    print(f"[STAGE 2] Loading QA data from: {qa_path}")
+    logger.info("\n" + "=" * 80)
+    logger.info("[STAGE 2] Driving QA finetuning started.")
+    logger.info(f"[STAGE 2] Loading QA data from: {qa_path}")
+    logger.info(f"[STAGE 2] Initializing Stage-2 model from Stage-1 checkpoint dir: {STAGE1_OUTPUT_DIR}")
 
-    print(f"[STAGE 2] Loading Stage-2 model from Stage-1 checkpoint: {STAGE1_OUTPUT_DIR}")
-    # model_stage2 = AutoModelForSeq2SeqLM.from_pretrained(STAGE1_OUTPUT_DIR).to(model_stage1.device)
-
-
-    # GOOD: exact Stage-1 weights, no filesystem issues
     model_stage2 = copy.deepcopy(model_stage1)
     model_stage2.train()
 
@@ -466,12 +446,21 @@ def train_stage2(model_stage1, tokenizer, qa_path: str):
         data = json.load(f)
 
     full_ds = Dataset.from_list(data)
-    print(f"[STAGE 2] Total samples: {len(full_ds)}")
+    logger.info(f"[STAGE 2] Total samples: {len(full_ds)}")
+
+    # sanity: risk coverage in stage-2 dataset
+    try:
+        has_risk_text = sum(1 for x in data if (x.get("risk_text") or "").strip())
+        has_risk_level = sum(1 for x in data if (x.get("risk_level") or "").strip())
+        logger.info(f"[STAGE 2] Samples with risk_text : {has_risk_text}/{len(data)} ({has_risk_text/max(1,len(data))*100:.1f}%)")
+        logger.info(f"[STAGE 2] Samples with risk_level: {has_risk_level}/{len(data)} ({has_risk_level/max(1,len(data))*100:.1f}%)")
+    except Exception:
+        logger.debug("[STAGE 2] Could not compute risk coverage.", exc_info=True)
 
     split_ds = full_ds.train_test_split(test_size=0.2, seed=42)
     train_ds = split_ds["train"]
     eval_ds = split_ds["test"]
-    print(f"[STAGE 2] Train samples: {len(train_ds)}  |  Val samples: {len(eval_ds)}")
+    logger.info(f"[STAGE 2] Train samples: {len(train_ds)}  |  Val samples: {len(eval_ds)}")
 
     def tokenize_fn(batch):
         batch_inp = batch["input"]
@@ -479,12 +468,12 @@ def train_stage2(model_stage1, tokenizer, qa_path: str):
         batch["input"] = [_ensure_paper_format(x) for x in batch_inp]
         return _tokenize_qa(batch, tokenizer)
 
-    print("[STAGE 2] Tokenizing datasets...")
+    logger.info("[STAGE 2] Tokenizing datasets...")
     tokenized_train = train_ds.map(tokenize_fn, batched=True, remove_columns=["input", "target"])
     tokenized_eval = eval_ds.map(tokenize_fn, batched=True, remove_columns=["input", "target"])
 
     _ensure_dir(STAGE2_OUTPUT_DIR)
-    print(f"[STAGE 2] Output directory: {STAGE2_OUTPUT_DIR}")
+    logger.info(f"[STAGE 2] Output directory: {STAGE2_OUTPUT_DIR}")
 
     training_args = TrainingArguments(
         output_dir=STAGE2_OUTPUT_DIR,
@@ -508,19 +497,20 @@ def train_stage2(model_stage1, tokenizer, qa_path: str):
         tokenizer=tokenizer,
     )
 
-    print("[STAGE 2] Starting training...")
+    logger.info("[STAGE 2] Starting training...")
     trainer.train()
-    print("[STAGE 2] Training finished. Running evaluation (loss only)...")
+    logger.info("[STAGE 2] Training finished. Running evaluation (loss only)...")
 
     raw_eval = trainer.evaluate()
-    print("\n[STAGE 2] Raw eval output:", raw_eval)
+    logger.info(f"[STAGE 2] Raw eval output: {raw_eval}")
 
     model_stage1.eval()
     model_stage2.eval()
 
     def _gen_text(model, prompt: str, max_new_tokens: int, no_repeat_ngram_size: int = 3) -> str:
+        # NOTE: use the *model's* device (avoid stage1/stage2 mismatch traps)
         prompt = _ensure_paper_format(prompt)
-        inputs = tokenizer(prompt, return_tensors="pt", max_length=192, truncation=True).to(model_stage2.device)
+        inputs = tokenizer(prompt, return_tensors="pt", max_length=384, truncation=True).to(model.device)
         pred_ids = model.generate(
             **inputs,
             max_new_tokens=max_new_tokens,
@@ -538,8 +528,8 @@ def train_stage2(model_stage1, tokenizer, qa_path: str):
         bleu_sum = 0.0
         rouge_sum = 0.0
 
-        fmt_sum = 0.0          # 5-line template compliance on FIXED output
-        parse_ok_sum = 0.0     # whether we could parse all fields from RAW output
+        fmt_sum = 0.0
+        parse_ok_sum = 0.0
 
         accel_mae_sum = 0.0
         brake_mae_sum = 0.0
@@ -549,25 +539,36 @@ def train_stage2(model_stage1, tokenizer, qa_path: str):
         n = 0
         outputs: List[Dict] = []
 
-        for sample in eval_ds:
+        for si, sample in enumerate(eval_ds):
             raw_input_text = sample["input"]
             gt_text = sample["target"]
 
-            if mode == "oracle_caption":
-                stage2_prompt = _ensure_paper_format(raw_input_text)
+            try:
+                if mode == "oracle_caption":
+                    stage2_prompt = _ensure_paper_format(raw_input_text)
+                    caption_used = None
+                    risk_level = sample.get("risk_level", None)
+                else:
+                    vec_str = sample.get("vec_str", "")
+                    risk_text = sample.get("risk_text", "")
+                    risk_level = sample.get("risk_level", None)
+
+                    s1_prompt = _build_stage1_prompt(vec_str)
+                    caption_pred = _gen_text(model_stage1, s1_prompt, max_new_tokens=260, no_repeat_ngram_size=4)
+                    caption_used = caption_pred
+
+                    stage2_prompt = _build_stage2_prompt_from_caption(caption_pred, risk_text=risk_text)
+
+                pred_raw = _gen_text(model_stage2, stage2_prompt, max_new_tokens=90, no_repeat_ngram_size=3)
+                pred_fixed, parse_ok = enforce_5_lines(pred_raw)
+            except Exception:
+                logger.exception(f"[STAGE 2][EVAL] Failed on eval sample idx={si} (mode={mode}).")
+                pred_raw = ""
+                pred_fixed, parse_ok = enforce_5_lines("")
                 caption_used = None
-            else:
-                vec_str = sample.get("vec_str", "")
-                s1_prompt = _build_stage1_prompt(vec_str)
-                caption_pred = _gen_text(model_stage1, s1_prompt, max_new_tokens=160, no_repeat_ngram_size=4)
-                caption_used = caption_pred
+                risk_level = sample.get("risk_level", None)
+                stage2_prompt = raw_input_text if mode == "oracle_caption" else ""
 
-                stage2_prompt = _build_stage2_prompt_from_caption(caption_pred)
-
-            pred_raw = _gen_text(model_stage2, stage2_prompt, max_new_tokens=90, no_repeat_ngram_size=3)
-            pred_fixed, parse_ok = enforce_5_lines(pred_raw)
-
-            # bucket metric (use FIXED so extraction always consistent)
             gt_action = _map_text_to_action_label(gt_text)
             pred_action = _map_text_to_action_label(pred_fixed)
 
@@ -576,14 +577,12 @@ def train_stage2(model_stage1, tokenizer, qa_path: str):
                 if gt_action == pred_action:
                     correct += 1
 
-            # text overlap: compare fixed output to gt (stable)
             bleu_sum += bleu1(pred_fixed, gt_text)
             rouge_sum += rouge_l_f1(pred_fixed, gt_text)
 
             fmt_sum += float(_format_compliance_5line(pred_fixed))
             parse_ok_sum += float(parse_ok)
 
-            # control metrics
             gt_acc = _extract_accel_percent(gt_text)
             gt_brk = _extract_brake_percent(gt_text)
             gt_str = _extract_steer(gt_text)
@@ -615,6 +614,7 @@ def train_stage2(model_stage1, tokenizer, qa_path: str):
                 "format_ok": int(_format_compliance_5line(pred_fixed)),
                 "parse_ok": int(parse_ok),
                 "caption_used": caption_used,
+                "risk_level": risk_level,
             })
 
         metrics = {
@@ -631,14 +631,24 @@ def train_stage2(model_stage1, tokenizer, qa_path: str):
         }
         return metrics, outputs
 
-    print("[STAGE 2] Computing metrics: oracle_caption...")
+    logger.info("[STAGE 2] Computing metrics: oracle_caption...")
     oracle_metrics, oracle_outputs = run_eval("oracle_caption")
-    print("[STAGE 2] oracle_caption metrics:", oracle_metrics)
+    logger.info(
+        "[STAGE 2] oracle_caption top-line: "
+        f"acc={oracle_metrics['action_accuracy']:.3f}, "
+        f"bleu1={oracle_metrics['bleu1']:.3f}, rougeL={oracle_metrics['rougeL_f1']:.3f}, "
+        f"fmt={oracle_metrics['format_compliance']:.3f}, parse_ok={oracle_metrics['parse_ok_rate']:.3f}"
+    )
     _print_eval_risk_summary(oracle_outputs, "oracle_caption")
 
-    print("[STAGE 2] Computing metrics: stage1_caption...")
+    logger.info("[STAGE 2] Computing metrics: stage1_caption...")
     stage1_metrics, stage1_outputs = run_eval("stage1_caption")
-    print("[STAGE 2] stage1_caption metrics:", stage1_metrics)
+    logger.info(
+        "[STAGE 2] stage1_caption top-line: "
+        f"acc={stage1_metrics['action_accuracy']:.3f}, "
+        f"bleu1={stage1_metrics['bleu1']:.3f}, rougeL={stage1_metrics['rougeL_f1']:.3f}, "
+        f"fmt={stage1_metrics['format_compliance']:.3f}, parse_ok={stage1_metrics['parse_ok_rate']:.3f}"
+    )
     _print_eval_risk_summary(stage1_outputs, "stage1_caption")
 
     eval_metrics: Dict = {}
@@ -655,17 +665,17 @@ def train_stage2(model_stage1, tokenizer, qa_path: str):
     metrics_path = os.path.join(STAGE2_OUTPUT_DIR, "eval_metrics.json")
     with open(metrics_path, "w") as f:
         json.dump(eval_metrics, f, indent=2)
-    print(f"[STAGE 2] Saved eval metrics to {metrics_path}")
+    logger.info(f"[STAGE 2] Saved eval metrics to {metrics_path}")
 
     preds_path1 = os.path.join(STAGE2_OUTPUT_DIR, "val_predictions_oracle_caption.json")
     with open(preds_path1, "w") as f:
         json.dump(oracle_outputs, f, indent=2)
-    print(f"[STAGE 2] Saved oracle-caption predictions to {preds_path1}")
+    logger.info(f"[STAGE 2] Saved oracle-caption predictions to {preds_path1}")
 
     preds_path2 = os.path.join(STAGE2_OUTPUT_DIR, "val_predictions_stage1_caption.json")
     with open(preds_path2, "w") as f:
         json.dump(stage1_outputs, f, indent=2)
-    print(f"[STAGE 2] Saved stage1-caption predictions to {preds_path2}")
+    logger.info(f"[STAGE 2] Saved stage1-caption predictions to {preds_path2}")
 
-    print("[STAGE 2] Done.\n" + "=" * 80)
+    logger.info("[STAGE 2] Done.\n" + "=" * 80)
     return model_stage2

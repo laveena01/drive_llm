@@ -14,9 +14,12 @@ Key Features:
 """
 
 import numpy as np
+import logging
 from dataclasses import dataclass
 from typing import List, Dict, Tuple, Optional
 from enum import Enum
+
+logger = logging.getLogger("llm_driving")
 
 # =============================================================================
 # PART 1: DATA STRUCTURES
@@ -39,15 +42,15 @@ class ObjectVector:
     size: np.ndarray        # [width, length]
     velocity: np.ndarray    # [vx, vy] in m/s
     heading: float          # in radians
-    
+
     @property
     def distance(self) -> float:
         return np.linalg.norm(self.position)
-    
+
     @property
     def speed(self) -> float:
         return np.linalg.norm(self.velocity)
-    
+
     @property
     def angle_degrees(self) -> float:
         return np.degrees(np.arctan2(self.position[1], self.position[0]))
@@ -58,12 +61,12 @@ class EgoState:
     velocity: np.ndarray    # [vx, vy] in m/s
     position: np.ndarray    # [x, y] - usually [0, 0]
     heading: float          # in radians
-    
+
     @property
     def speed(self) -> float:
         return np.linalg.norm(self.velocity)
 
-@dataclass 
+@dataclass
 class RiskVector:
     """Multi-dimensional risk representation"""
     collision_risk: float       # Risk of physical collision
@@ -71,7 +74,7 @@ class RiskVector:
     regulatory_risk: float      # Risk of violating traffic rules
     comfort_risk: float         # Risk of uncomfortable maneuvers needed
     uncertainty_risk: float     # Risk from perception uncertainty
-    
+
     @property
     def total_risk(self) -> float:
         """Weighted combination of all risk dimensions"""
@@ -89,7 +92,7 @@ class RiskVector:
             self.comfort_risk * weights['comfort'] +
             self.uncertainty_risk * weights['uncertainty']
         )
-    
+
     @property
     def risk_level(self) -> RiskLevel:
         """Convert total risk to categorical level"""
@@ -104,7 +107,7 @@ class RiskVector:
             return RiskLevel.LOW
         else:
             return RiskLevel.MINIMAL
-    
+
     def to_dict(self) -> Dict:
         return {
             'collision_risk': round(self.collision_risk, 3),
@@ -134,7 +137,7 @@ class RiskCalculator:
     """
     Advanced risk calculation engine with multiple risk dimensions
     """
-    
+
     # Object type weights (vulnerability/danger factor)
     TYPE_WEIGHTS = {
         'human.pedestrian': 2.5,        # Highest priority - vulnerable
@@ -149,57 +152,46 @@ class RiskCalculator:
         'movable_object.trafficcone': 0.5,
         'static_object.bicycle_rack': 0.3,
     }
-    
-    # Safe following distances by speed (m/s -> meters)
+
     SAFE_DISTANCE_FACTOR = 2.0  # seconds of following distance
-    
+
     def __init__(self, ego_state: EgoState):
         self.ego = ego_state
-    
+
     def get_type_weight(self, obj_type: str) -> float:
         """Get risk weight multiplier based on object type"""
-        # Check exact match first
         if obj_type in self.TYPE_WEIGHTS:
             return self.TYPE_WEIGHTS[obj_type]
-        
-        # Check partial match (e.g., 'human.pedestrian.adult' matches 'human.pedestrian')
+
         for key, weight in self.TYPE_WEIGHTS.items():
             if key in obj_type or obj_type in key:
                 return weight
-        
-        return 1.0  # Default weight
-    
+
+        return 1.0
+
     def calculate_ttc(self, obj: ObjectVector) -> float:
         """
         Calculate Time-to-Collision (TTC)
-        
+
         TTC = distance / closing_speed
         Lower TTC = Higher risk
         """
-        # Relative velocity (how fast we're approaching each other)
         relative_velocity = obj.velocity - self.ego.velocity
-        
-        # Closing speed (positive = getting closer)
-        # Project relative velocity onto the line connecting ego to object
         direction_to_obj = obj.position / (obj.distance + 1e-6)
         closing_speed = -np.dot(relative_velocity, direction_to_obj)
-        
+
         if closing_speed <= 0:
-            # Objects moving apart - no collision risk from TTC perspective
             return float('inf')
-        
+
         ttc = obj.distance / closing_speed
-        return max(ttc, 0.01)  # Avoid division issues
-    
+        return max(ttc, 0.01)
+
     def calculate_collision_risk(self, obj: ObjectVector, ttc: float) -> float:
-        """
-        Calculate collision risk based on TTC and distance
-        """
-        # TTC-based risk (exponential decay)
+        """Calculate collision risk based on TTC and distance"""
         if ttc == float('inf'):
             ttc_risk = 0.0
         elif ttc < 1.0:
-            ttc_risk = 1.0  # Critical - less than 1 second
+            ttc_risk = 1.0
         elif ttc < 2.0:
             ttc_risk = 0.9
         elif ttc < 3.0:
@@ -208,8 +200,7 @@ class RiskCalculator:
             ttc_risk = 0.5
         else:
             ttc_risk = max(0, 1.0 - (ttc / 10.0))
-        
-        # Distance-based risk
+
         safe_distance = max(5.0, self.ego.speed * self.SAFE_DISTANCE_FACTOR)
         if obj.distance < safe_distance * 0.3:
             distance_risk = 1.0
@@ -219,60 +210,40 @@ class RiskCalculator:
             distance_risk = 0.4
         else:
             distance_risk = max(0, 1.0 - (obj.distance / (safe_distance * 2)))
-        
-        # Combine with type weight
+
         type_weight = self.get_type_weight(obj.obj_type)
-        
-        # Combined collision risk
         raw_risk = max(ttc_risk, distance_risk)
         weighted_risk = min(1.0, raw_risk * (type_weight / 2.0 + 0.5))
-        
         return weighted_risk
-    
+
     def calculate_pedestrian_risk(self, obj: ObjectVector) -> float:
-        """
-        Special risk calculation for pedestrians and vulnerable road users
-        """
+        """Special risk calculation for pedestrians and vulnerable road users"""
         if 'pedestrian' not in obj.obj_type.lower() and 'bicycle' not in obj.obj_type.lower():
             return 0.0
-        
-        # Pedestrians within 15m are always a concern
+
         if obj.distance > 15:
             return 0.1
-        
-        # Check if pedestrian is moving towards our path
-        # Simplified: check if pedestrian velocity has component towards ego
-        if obj.speed > 0.5:  # Moving pedestrian
+
+        if obj.speed > 0.5:
             velocity_towards_ego = -np.dot(obj.velocity, obj.position) / (obj.distance + 1e-6)
             if velocity_towards_ego > 0:
-                # Moving towards us
                 crossing_risk = min(1.0, velocity_towards_ego / 2.0)
             else:
                 crossing_risk = 0.2
         else:
-            # Stationary pedestrian - could start moving
             crossing_risk = 0.3
-        
-        # Distance factor
+
         distance_factor = max(0, 1.0 - (obj.distance / 15.0))
-        
-        # Child multiplier
         child_multiplier = 1.5 if 'child' in obj.obj_type.lower() else 1.0
-        
         return min(1.0, (crossing_risk + distance_factor) * 0.5 * child_multiplier)
-    
+
     def calculate_comfort_risk(self, obj: ObjectVector, ttc: float) -> float:
-        """
-        Risk of needing uncomfortable/harsh maneuvers
-        """
+        """Risk of needing uncomfortable/harsh maneuvers"""
         if ttc == float('inf') or ttc > 5:
             return 0.0
-        
-        # Required deceleration to stop before object
+
         required_decel = (self.ego.speed ** 2) / (2 * obj.distance + 1e-6)
-        
-        # Comfortable deceleration is ~2-3 m/s²
-        # Emergency braking is ~8-10 m/s²
+
         if required_decel < 2.0:
             return 0.1
         elif required_decel < 4.0:
@@ -282,42 +253,24 @@ class RiskCalculator:
         elif required_decel < 8.0:
             return 0.8
         else:
-            return 1.0  # Emergency braking needed
-    
+            return 1.0
+
     def calculate_uncertainty_risk(self, obj: ObjectVector) -> float:
-        """
-        Risk from perception uncertainty
-        
-        In real systems, this would come from perception confidence scores.
-        Here we simulate based on distance and object type.
-        """
-        # Further objects have more uncertainty
+        """Risk from perception uncertainty"""
         distance_uncertainty = min(1.0, obj.distance / 50.0) * 0.5
-        
-        # Small objects are harder to track
         obj_area = obj.size[0] * obj.size[1]
         size_uncertainty = max(0, 0.5 - obj_area / 10.0)
-        
-        # Fast moving objects are harder to predict
         speed_uncertainty = min(0.3, obj.speed / 30.0)
-        
         return min(1.0, distance_uncertainty + size_uncertainty + speed_uncertainty)
-    
+
     def calculate_risk_trajectory(self, obj: ObjectVector, ttc: float) -> List[float]:
-        """
-        Predict how risk will evolve over next 3 seconds
-        Assumes constant velocity model
-        """
+        """Predict how risk will evolve over next 3 seconds"""
         trajectory = []
-        
         for dt in [1.0, 2.0, 3.0]:
-            # Predicted position
             future_pos = obj.position + obj.velocity * dt
             ego_future_pos = self.ego.position + self.ego.velocity * dt
-            
             future_distance = np.linalg.norm(future_pos - ego_future_pos)
-            
-            # Simple risk based on future distance
+
             if future_distance < 2:
                 future_risk = 1.0
             elif future_distance < 5:
@@ -326,17 +279,13 @@ class RiskCalculator:
                 future_risk = 0.5
             else:
                 future_risk = max(0, 1.0 - future_distance / 30.0)
-            
+
             trajectory.append(round(future_risk, 2))
-        
         return trajectory
-    
+
     def get_recommended_action(self, risk_vector: RiskVector, ttc: float) -> str:
-        """
-        Get recommended action based on risk profile
-        """
+        """Get recommended action based on risk profile"""
         total = risk_vector.total_risk
-        
         if total >= 0.8 or ttc < 1.5:
             return "EMERGENCY_BRAKE"
         elif total >= 0.6 or ttc < 3.0:
@@ -347,55 +296,41 @@ class RiskCalculator:
             return "CAUTION"
         else:
             return "PROCEED"
-    
-    def calculate_object_risk(self, obj: ObjectVector, 
-                               traffic_light: Optional[str] = None) -> ObjectRiskProfile:
-        """
-        Calculate complete risk profile for a single object
-        """
+
+    def calculate_object_risk(self, obj: ObjectVector,
+                             traffic_light: Optional[str] = None) -> ObjectRiskProfile:
+        """Calculate complete risk profile for a single object"""
         ttc = self.calculate_ttc(obj)
-        
+
         risk_vector = RiskVector(
             collision_risk=self.calculate_collision_risk(obj, ttc),
             pedestrian_risk=self.calculate_pedestrian_risk(obj),
-            regulatory_risk=0.0,  # Set at scene level
+            regulatory_risk=0.0,
             comfort_risk=self.calculate_comfort_risk(obj, ttc),
             uncertainty_risk=self.calculate_uncertainty_risk(obj)
         )
-        
+
         trajectory = self.calculate_risk_trajectory(obj, ttc)
         action = self.get_recommended_action(risk_vector, ttc)
-        
+
         return ObjectRiskProfile(
             obj=obj,
             risk_vector=risk_vector,
             ttc=ttc if ttc != float('inf') else 999.9,
-            risk_contribution=0.0,  # Calculated at scene level
+            risk_contribution=0.0,
             recommended_action=action,
             risk_trajectory=trajectory
         )
-    
+
     def calculate_scene_risk(self, objects: List[ObjectVector],
-                              traffic_light: Optional[str] = None,
-                              speed_limit: Optional[float] = None) -> Dict:
-        """
-        Calculate comprehensive risk for entire scene
-        
-        Returns:
-            Dict containing:
-            - scene_risk_vector: Overall risk vector for scene
-            - object_risks: List of risk profiles per object
-            - risk_attribution: Which objects contribute what %
-            - top_risk_factors: Top 3 risk contributors
-            - recommended_action: Overall recommended action
-        """
-        # Calculate individual object risks
+                            traffic_light: Optional[str] = None,
+                            speed_limit: Optional[float] = None) -> Dict:
+        """Calculate comprehensive risk for entire scene"""
         object_risks = []
         for obj in objects:
             risk_profile = self.calculate_object_risk(obj, traffic_light)
             object_risks.append(risk_profile)
-        
-        # Aggregate scene-level risks
+
         if object_risks:
             total_collision = max(r.risk_vector.collision_risk for r in object_risks)
             total_pedestrian = max(r.risk_vector.pedestrian_risk for r in object_risks)
@@ -406,18 +341,17 @@ class RiskCalculator:
             total_pedestrian = 0.0
             total_comfort = 0.0
             total_uncertainty = 0.0
-        
-        # Regulatory risk (traffic light, speed limit)
+
         regulatory_risk = 0.0
         if traffic_light == 'red':
             regulatory_risk = 0.9
         elif traffic_light == 'yellow':
             regulatory_risk = 0.5
-        
+
         if speed_limit and self.ego.speed > speed_limit:
             speed_violation = (self.ego.speed - speed_limit) / speed_limit
             regulatory_risk = max(regulatory_risk, min(1.0, speed_violation))
-        
+
         scene_risk_vector = RiskVector(
             collision_risk=total_collision,
             pedestrian_risk=total_pedestrian,
@@ -425,18 +359,15 @@ class RiskCalculator:
             comfort_risk=total_comfort,
             uncertainty_risk=total_uncertainty
         )
-        
-        # Calculate risk attribution (% contribution per object)
+
         total_raw_risk = sum(r.risk_vector.total_risk for r in object_risks) + 0.001
         for risk_profile in object_risks:
             risk_profile.risk_contribution = round(
                 (risk_profile.risk_vector.total_risk / total_raw_risk) * 100, 1
             )
-        
-        # Sort by risk contribution
+
         object_risks.sort(key=lambda x: x.risk_contribution, reverse=True)
-        
-        # Top risk factors
+
         top_factors = []
         if scene_risk_vector.collision_risk > 0.3:
             top_factors.append(f"Collision risk: {scene_risk_vector.collision_risk:.0%}")
@@ -446,11 +377,10 @@ class RiskCalculator:
             top_factors.append(f"Regulatory risk: {scene_risk_vector.regulatory_risk:.0%}")
         if scene_risk_vector.comfort_risk > 0.3:
             top_factors.append(f"Comfort risk: {scene_risk_vector.comfort_risk:.0%}")
-        
-        # Overall recommended action
+
         min_ttc = min((r.ttc for r in object_risks), default=999)
         overall_action = self.get_recommended_action(scene_risk_vector, min_ttc)
-        
+
         return {
             'scene_risk_vector': scene_risk_vector,
             'object_risks': object_risks,
@@ -465,15 +395,12 @@ class RiskCalculator:
 # =============================================================================
 
 class RiskAwarePromptGenerator:
-    """
-    Generates rich, risk-aware prompts for LLM
-    """
-    
+    """Generates rich, risk-aware prompts for LLM"""
+
     def __init__(self):
         pass
-    
+
     def format_risk_level_emoji(self, level: RiskLevel) -> str:
-        """Add visual indicator for risk level"""
         mapping = {
             RiskLevel.CRITICAL: "🔴",
             RiskLevel.HIGH: "🟠",
@@ -482,12 +409,11 @@ class RiskAwarePromptGenerator:
             RiskLevel.MINIMAL: "⚪"
         }
         return mapping.get(level, "⚪")
-    
+
     def format_trajectory(self, trajectory: List[float]) -> str:
-        """Format risk trajectory as trend indicator"""
         if len(trajectory) < 2:
             return "STABLE"
-        
+
         trend = trajectory[-1] - trajectory[0]
         if trend > 0.2:
             return "↗️ ESCALATING"
@@ -495,15 +421,10 @@ class RiskAwarePromptGenerator:
             return "↘️ DECREASING"
         else:
             return "→ STABLE"
-    
+
     def generate_basic_prompt(self, scene_risk: Dict, ego_speed: float) -> str:
-        """
-        Generate a basic prompt with risk information
-        
-        This is the MINIMAL version - just adds risk scores to the prompt
-        """
         risk_vec = scene_risk['scene_risk_vector']
-        
+
         prompt = f"""You are an autonomous driving AI assistant.
 
 Current Speed: {ego_speed:.1f} m/s
@@ -511,27 +432,22 @@ Overall Risk Level: {risk_vec.risk_level.value} ({risk_vec.total_risk:.0%})
 
 Scene Objects:
 """
-        for obj_risk in scene_risk['object_risks'][:5]:  # Top 5 objects
+        for obj_risk in scene_risk['object_risks'][:5]:
             obj = obj_risk.obj
             prompt += f"- {obj.obj_type}: {obj.distance:.1f}m away, risk={obj_risk.risk_vector.total_risk:.0%}\n"
-        
+
         prompt += f"""
 Recommended Action: {scene_risk['recommended_action']}
 
 What action should the vehicle take and why?"""
-        
+
         return prompt
-    
+
     def generate_detailed_prompt(self, scene_risk: Dict, ego_speed: float,
-                                  traffic_light: Optional[str] = None) -> str:
-        """
-        Generate a DETAILED prompt with full risk breakdown
-        
-        This version gives the LLM maximum context for reasoning
-        """
+                                 traffic_light: Optional[str] = None) -> str:
         risk_vec = scene_risk['scene_risk_vector']
         emoji = self.format_risk_level_emoji(risk_vec.risk_level)
-        
+
         prompt = f"""You are an advanced autonomous driving AI with risk-aware reasoning capabilities.
 
 ═══════════════════════════════════════════════════════════════
@@ -558,13 +474,13 @@ Risk Breakdown:
 """
         if scene_risk['min_ttc']:
             prompt += f"⏱️  Minimum Time-to-Collision: {scene_risk['min_ttc']:.1f} seconds\n\n"
-        
+
         if scene_risk['top_risk_factors']:
             prompt += "⚠️  Top Risk Factors:\n"
             for factor in scene_risk['top_risk_factors']:
                 prompt += f"  • {factor}\n"
             prompt += "\n"
-        
+
         prompt += """───────────────────────────────────────────────────────────────
                     DETECTED OBJECTS (by risk)
 ───────────────────────────────────────────────────────────────
@@ -573,7 +489,7 @@ Risk Breakdown:
         for i, obj_risk in enumerate(scene_risk['object_risks'][:5], 1):
             obj = obj_risk.obj
             trajectory_str = self.format_trajectory(obj_risk.risk_trajectory)
-            
+
             prompt += f"""Object {i}: {obj.obj_type.split('.')[-1].upper()}
   • Position: {obj.distance:.1f}m at {obj.angle_degrees:.0f}°
   • Speed: {obj.speed:.1f} m/s
@@ -583,7 +499,7 @@ Risk Breakdown:
   • Action: {obj_risk.recommended_action}
 
 """
-        
+
         prompt += f"""───────────────────────────────────────────────────────────────
                     SYSTEM RECOMMENDATION
 ───────────────────────────────────────────────────────────────
@@ -598,30 +514,21 @@ Based on the above risk assessment, provide:
 3. Any ADDITIONAL PRECAUTIONS the vehicle should take
 
 Response:"""
-        
+
         return prompt
-    
+
     def generate_counterfactual_prompt(self, scene_risk: Dict, ego_speed: float,
-                                        risk_calculator: RiskCalculator,
-                                        objects: List[ObjectVector]) -> str:
-        """
-        Generate prompt with COUNTERFACTUAL reasoning
-        
-        Shows how risk would change with different actions
-        """
+                                       risk_calculator: "RiskCalculator",
+                                       objects: List[ObjectVector]) -> str:
         risk_vec = scene_risk['scene_risk_vector']
-        
-        # Simulate different actions
+
         actions_analysis = []
-        
-        # Action 1: Continue at current speed
         actions_analysis.append({
             'action': 'CONTINUE',
             'risk_change': 0,
             'description': 'Maintain current speed'
         })
-        
-        # Action 2: Brake (reduce speed by 50%)
+
         braking_ego = EgoState(
             velocity=risk_calculator.ego.velocity * 0.5,
             position=risk_calculator.ego.position,
@@ -636,8 +543,7 @@ Response:"""
             'risk_change': brake_change,
             'description': 'Reduce speed by 50%'
         })
-        
-        # Action 3: Hard brake (reduce speed by 80%)
+
         hard_brake_ego = EgoState(
             velocity=risk_calculator.ego.velocity * 0.2,
             position=risk_calculator.ego.position,
@@ -652,7 +558,7 @@ Response:"""
             'risk_change': hard_brake_change,
             'description': 'Reduce speed by 80%'
         })
-        
+
         prompt = f"""You are an autonomous driving AI with predictive risk reasoning.
 
 CURRENT SITUATION:
@@ -671,34 +577,29 @@ COUNTERFACTUAL ANALYSIS - "What if I...?"
                 change_str = f"↑ Risk increases by {abs(change):.0%}"
             else:
                 change_str = "→ Risk unchanged"
-            
+
             prompt += f"""If I {analysis['action']} ({analysis['description']}):
   {change_str}
-  
+
 """
-        
+
         prompt += f"""
 DETECTED OBJECTS:
 """
         for obj_risk in scene_risk['object_risks'][:3]:
             obj = obj_risk.obj
             prompt += f"  • {obj.obj_type}: {obj.distance:.1f}m, risk={obj_risk.risk_vector.total_risk:.0%}\n"
-        
+
         prompt += """
 Based on this counterfactual analysis, what action should be taken and why?
 
 Response:"""
-        
+
         return prompt
-    
+
     def generate_structured_output_prompt(self, scene_risk: Dict, ego_speed: float) -> str:
-        """
-        Generate prompt that requests STRUCTURED output from LLM
-        
-        Easier to parse for downstream systems
-        """
         risk_vec = scene_risk['scene_risk_vector']
-        
+
         prompt = f"""You are an autonomous driving AI. Analyze the situation and provide a structured response.
 
 INPUT:
@@ -722,7 +623,7 @@ INPUT:
       "ttc_s": {obj_risk.ttc:.1f}
     }},
 """
-        
+
         prompt += """  ]
 }
 
@@ -737,7 +638,7 @@ Respond with a JSON object containing:
 }
 
 Response:"""
-        
+
         return prompt
 
 
@@ -746,22 +647,20 @@ Response:"""
 # =============================================================================
 
 def extract_objects_from_nuscenes(nusc, sample) -> List[ObjectVector]:
-    """
-    Extract ObjectVector list from NuScenes sample
-    """
+    """Extract ObjectVector list from NuScenes sample"""
     objects = []
-    
+
     for i, ann_token in enumerate(sample['anns']):
         ann = nusc.get('sample_annotation', ann_token)
-        
-        # Get velocity (might not exist for all annotations)
+
         try:
             velocity = nusc.box_velocity(ann_token)[:2]
             if np.isnan(velocity).any():
                 velocity = np.array([0.0, 0.0])
-        except:
+        except Exception:
+            logger.exception("[risk_system] box_velocity failed for ann_token=%s", ann_token)
             velocity = np.array([0.0, 0.0])
-        
+
         obj = ObjectVector(
             obj_id=i,
             obj_type=ann['category_name'],
@@ -771,41 +670,32 @@ def extract_objects_from_nuscenes(nusc, sample) -> List[ObjectVector]:
             heading=ann['rotation'][2] if len(ann['rotation']) > 2 else 0.0
         )
         objects.append(obj)
-    
+
     return objects
 
 
-def process_nuscenes_scene(nusc, scene_idx: int = 0, 
-                            ego_speed: float = 10.0) -> Tuple[Dict, str, str, str]:
+def process_nuscenes_scene(nusc, scene_idx: int = 0,
+                          ego_speed: float = 10.0) -> Tuple[Dict, str, str, str, str]:
     """
     Process a NuScenes scene and generate risk-aware prompts
-    
-    Returns:
-        scene_risk: Complete risk analysis
-        basic_prompt: Simple prompt with risk
-        detailed_prompt: Full detailed prompt
-        counterfactual_prompt: Prompt with what-if analysis
     """
-    # Get scene and sample
+    logger.info("[risk_system] Processing scene_idx=%s ego_speed=%.2f", scene_idx, float(ego_speed))
+
     scene = nusc.scene[scene_idx]
     sample_token = scene['first_sample_token']
     sample = nusc.get('sample', sample_token)
-    
-    # Extract objects
+
     objects = extract_objects_from_nuscenes(nusc, sample)
-    
-    # Create ego state (assume driving forward at given speed)
+
     ego = EgoState(
         velocity=np.array([ego_speed, 0.0]),
         position=np.array([0.0, 0.0]),
         heading=0.0
     )
-    
-    # Calculate risks
+
     calculator = RiskCalculator(ego)
     scene_risk = calculator.calculate_scene_risk(objects)
-    
-    # Generate prompts
+
     prompt_gen = RiskAwarePromptGenerator()
     basic_prompt = prompt_gen.generate_basic_prompt(scene_risk, ego_speed)
     detailed_prompt = prompt_gen.generate_detailed_prompt(scene_risk, ego_speed)
@@ -813,7 +703,16 @@ def process_nuscenes_scene(nusc, scene_idx: int = 0,
         scene_risk, ego_speed, calculator, objects
     )
     structured_prompt = prompt_gen.generate_structured_output_prompt(scene_risk, ego_speed)
-    
+
+    logger.info(
+        "[risk_system] scene_idx=%s recommended_action=%s risk_level=%s total_risk=%.3f min_ttc=%s",
+        scene_idx,
+        scene_risk.get("recommended_action"),
+        scene_risk["scene_risk_vector"].risk_level.value,
+        float(scene_risk["scene_risk_vector"].total_risk),
+        scene_risk.get("min_ttc"),
+    )
+
     return scene_risk, basic_prompt, detailed_prompt, counterfactual_prompt, structured_prompt
 
 
@@ -822,21 +721,18 @@ def process_nuscenes_scene(nusc, scene_idx: int = 0,
 # =============================================================================
 
 def demo_with_synthetic_data():
-    """
-    Demonstrate the system with synthetic data (no NuScenes needed)
-    """
-    print("=" * 70)
-    print("RISK-AWARE DRIVING LLM DEMO")
-    print("=" * 70)
-    
-    # Create synthetic objects
+    """Demonstrate the system with synthetic data (no NuScenes needed)"""
+    logger.info("=" * 70)
+    logger.info("RISK-AWARE DRIVING LLM DEMO")
+    logger.info("=" * 70)
+
     objects = [
         ObjectVector(
             obj_id=0,
             obj_type='human.pedestrian.adult',
             position=np.array([8.0, 2.0]),
             size=np.array([0.5, 0.5]),
-            velocity=np.array([-1.0, 0.0]),  # Walking towards road
+            velocity=np.array([-1.0, 0.0]),
             heading=0.0
         ),
         ObjectVector(
@@ -844,7 +740,7 @@ def demo_with_synthetic_data():
             obj_type='vehicle.car',
             position=np.array([15.0, 0.0]),
             size=np.array([2.0, 4.5]),
-            velocity=np.array([-5.0, 0.0]),  # Oncoming car
+            velocity=np.array([-5.0, 0.0]),
             heading=np.pi
         ),
         ObjectVector(
@@ -852,62 +748,60 @@ def demo_with_synthetic_data():
             obj_type='vehicle.bicycle',
             position=np.array([12.0, 3.0]),
             size=np.array([0.5, 1.8]),
-            velocity=np.array([2.0, 0.0]),  # Cyclist same direction
+            velocity=np.array([2.0, 0.0]),
             heading=0.0
         ),
     ]
-    
-    # Create ego state
+
     ego = EgoState(
-        velocity=np.array([8.0, 0.0]),  # 8 m/s ≈ 29 km/h
+        velocity=np.array([8.0, 0.0]),
         position=np.array([0.0, 0.0]),
         heading=0.0
     )
-    
-    # Calculate risks
+
     calculator = RiskCalculator(ego)
     scene_risk = calculator.calculate_scene_risk(objects, traffic_light='green')
-    
-    # Generate prompts
+
     prompt_gen = RiskAwarePromptGenerator()
-    
-    print("\n" + "=" * 70)
-    print("1. BASIC PROMPT")
-    print("=" * 70)
+
+    logger.info("\n" + "=" * 70)
+    logger.info("1. BASIC PROMPT")
+    logger.info("=" * 70)
     basic = prompt_gen.generate_basic_prompt(scene_risk, ego.speed)
-    print(basic)
-    
-    print("\n" + "=" * 70)
-    print("2. DETAILED PROMPT")
-    print("=" * 70)
+    logger.info(basic)
+
+    logger.info("\n" + "=" * 70)
+    logger.info("2. DETAILED PROMPT")
+    logger.info("=" * 70)
     detailed = prompt_gen.generate_detailed_prompt(scene_risk, ego.speed, 'green')
-    print(detailed)
-    
-    print("\n" + "=" * 70)
-    print("3. COUNTERFACTUAL PROMPT")
-    print("=" * 70)
+    logger.info(detailed)
+
+    logger.info("\n" + "=" * 70)
+    logger.info("3. COUNTERFACTUAL PROMPT")
+    logger.info("=" * 70)
     counterfactual = prompt_gen.generate_counterfactual_prompt(
         scene_risk, ego.speed, calculator, objects
     )
-    print(counterfactual)
-    
-    print("\n" + "=" * 70)
-    print("4. STRUCTURED OUTPUT PROMPT")
-    print("=" * 70)
+    logger.info(counterfactual)
+
+    logger.info("\n" + "=" * 70)
+    logger.info("4. STRUCTURED OUTPUT PROMPT")
+    logger.info("=" * 70)
     structured = prompt_gen.generate_structured_output_prompt(scene_risk, ego.speed)
-    print(structured)
-    
-    print("\n" + "=" * 70)
-    print("RISK ANALYSIS SUMMARY")
-    print("=" * 70)
+    logger.info(structured)
+
+    logger.info("\n" + "=" * 70)
+    logger.info("RISK ANALYSIS SUMMARY")
+    logger.info("=" * 70)
     rv = scene_risk['scene_risk_vector']
-    print(f"Total Risk: {rv.total_risk:.2%}")
-    print(f"Risk Level: {rv.risk_level.value}")
-    print(f"Recommended Action: {scene_risk['recommended_action']}")
-    print(f"Min TTC: {scene_risk['min_ttc']}s")
-    print("\nPer-Object Risk Attribution:")
+    logger.info("Total Risk: %.2f%%", rv.total_risk * 100.0)
+    logger.info("Risk Level: %s", rv.risk_level.value)
+    logger.info("Recommended Action: %s", scene_risk['recommended_action'])
+    logger.info("Min TTC: %ss", str(scene_risk['min_ttc']))
+
+    logger.info("Per-Object Risk Attribution:")
     for obj_risk in scene_risk['object_risks']:
-        print(f"  - {obj_risk.obj.obj_type}: {obj_risk.risk_contribution:.1f}%")
+        logger.info("  - %s: %.1f%%", obj_risk.obj.obj_type, float(obj_risk.risk_contribution))
 
 
 if __name__ == "__main__":
