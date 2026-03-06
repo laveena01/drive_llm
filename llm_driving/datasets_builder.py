@@ -117,27 +117,6 @@ def _make_samples_from_frames(
         use_n = min(num_objects, MAX_OBJECTS)
 
         # Phase-1: compute TTC-based risk + summary text
-        # risk_data = calculate_risk_from_vectors(
-        #     vectors=frame["vectors"],
-        #     use_n=use_n,
-        #     ego_speed=None,
-        #     traffic_light=None,
-        # )
-        # risk_text = get_risk_summary_text(risk_data)
-
-        # # Make risk visible to lanGen (it checks frame.get("risk_data"))
-        # frame["risk_data"] = {
-        #     "risk_level": risk_data.risk_level,
-        #     "max_collision_risk": risk_data.max_collision_risk,
-        #     "max_pedestrian_risk": risk_data.max_pedestrian_risk,
-        #     "min_ttc": risk_data.min_ttc,
-        #     "avg_total_risk": risk_data.avg_total_risk,
-        #     "regulatory_risk":0.0,
-        #     "uncertainty_risk": 0.0,
-        #     # "regulatory_risk": risk_data.regulatory_risk,
-        #     # "uncertainty_risk": risk_data.uncertainty_risk,
-        # }
-
         risk_data = calculate_risk_from_vectors(
             vectors=frame["vectors"],
             use_n=use_n,
@@ -146,28 +125,29 @@ def _make_samples_from_frames(
         )
         risk_text = get_risk_summary_text(risk_data)
 
-        # --- Stage-1 caption should NOT see risk_data ---
-        frame_for_caption = dict(frame)          # shallow copy is enough here
-        frame_for_caption.pop("risk_data", None) # ensure no risk_data leaks
-        caption = lanGen(frame_for_caption)
-
-        # --- After caption is created, attach risk_data for Stage-2 + storage ---
+        # Make risk visible to lanGen (it checks frame.get("risk_data"))
         frame["risk_data"] = {
             "risk_level": risk_data.risk_level,
             "max_collision_risk": risk_data.max_collision_risk,
             "max_pedestrian_risk": risk_data.max_pedestrian_risk,
             "min_ttc": risk_data.min_ttc,
             "avg_total_risk": risk_data.avg_total_risk,
-            "regulatory_risk": 0.0,
+            "regulatory_risk":0.0,
             "uncertainty_risk": 0.0,
+            # "regulatory_risk": risk_data.regulatory_risk,
+            # "uncertainty_risk": risk_data.uncertainty_risk,
         }
-        # caption = lanGen(frame)
+
+        caption = lanGen(frame)
         vec_str = vector_to_string(frame["vectors"], num_objects)
 
         # --- Stage 1: vector -> caption ---
         captioning_samples.append({
             "input": f"Describe the driving scene from object vectors:\n{vec_str}",
-            "target": caption ,
+            "target": caption + "\n" + risk_text,
+            "risk_text": risk_text,
+            "risk_data": frame["risk_data"],
+            "risk_level": risk_data.risk_level,
         })
 
         # --- Stage 2: paper-style actions ---

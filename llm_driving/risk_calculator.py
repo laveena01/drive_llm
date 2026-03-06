@@ -1,13 +1,24 @@
 # llm_driving/risk_calculator.py
 
 """
-Risk-aware driving calculations integrated from the risk module.
+Phase-2 Risk Module (thesis-friendly + driving-realistic)
 
-Option-A update:
-- Uses ego-frame velocity components (rel_vx, rel_vy) from vectors.
-- Removes the incorrect "heading -> velocity direction" assumption.
-- Adds simple path gating (front cone + lateral band) to avoid side objects
-  dominating TTC/collision risk.
+This file keeps the SAME public API used by your pipeline:
+  - calculate_risk_from_vectors(...)
+  - get_risk_summary_text(...)
+  - policy_from_risk(...)
+
+But upgrades the internals to be more realistic and more explainable:
+
+1) Soft front/path weighting (front gating, not hard discard)
+2) Correct closing-speed TTC (TTC only if approaching)
+3) Distance baseline risk (static close objects still risky)
+4) Lateral conflict risk (near-path / cut-in style)
+5) Lightweight uncertainty proxy risk (distance + small size + speed)
+6) Stable scene aggregation using log-sum-exp ("softmax" over objects)
+
+Outputs remain compatible with Phase-1:
+FrameRiskData has: risk_level, max_collision_risk, max_pedestrian_risk, min_ttc, avg_total_risk, num_risk_objects, object_risks
 """
 
 from typing import Dict, Tuple, List, Optional
@@ -16,8 +27,6 @@ import logging
 import math
 
 import numpy as np
-
-from .nuscenes_risk_integration import SimpleRiskCalculator
 
 from .config import (
     DEFAULT_EGO_SPEED,
@@ -40,14 +49,28 @@ TYPE_ID_TO_CATEGORY = {
     3: "object.other",
 }
 
+# More vulnerable road users get higher weight.
+TYPE_WEIGHT = {
+    "human.pedestrian.adult": 2.5,
+    "human.pedestrian.child": 3.0,
+    "vehicle.bicycle": 2.0,
+    "vehicle.motorcycle": 1.8,
+    "vehicle.car": 1.0,
+    "vehicle.truck": 1.3,
+    "vehicle.bus": 1.3,
+    "vehicle.emergency": 1.5,
+    "traffic_light": 0.2,
+    "object.other": 0.8,
+}
+
 
 # =============================================================================
-# RISK CALCULATION FOR FRAME VECTORS
+# DATA STRUCTURE
 # =============================================================================
 
 @dataclass
 class FrameRiskData:
-    """Risk data for an entire frame"""
+    """Risk data for an entire frame."""
     risk_level: str
     max_collision_risk: float
     max_pedestrian_risk: float
@@ -60,23 +83,145 @@ class FrameRiskData:
         return asdict(self)
 
 
-def _in_path_gate(rel_x: float, rel_y: float) -> bool:
+# =============================================================================
+# HELPERS
+# =============================================================================
+
+def _sigmoid(x: float) -> float:
+    # safe sigmoid
+    if x >= 50:
+        return 1.0
+    if x <= -50:
+        return 0.0
+    return 1.0 / (1.0 + math.exp(-x))
+
+
+def _logsumexp(xs: List[float], lam: float) -> float:
     """
-    Simple geometric gating to decide whether an object is likely in the ego path.
+    Stable log-sum-exp aggregator. Returns:
+        (1/lam) * log(sum(exp(lam * x_i)))
+    When lam is large, approaches max(x_i) but smoother.
     """
+    if not xs:
+        return 0.0
+    m = max(xs)
+    # if all -inf, return 0
+    if not math.isfinite(m):
+        return 0.0
+    s = 0.0
+    for x in xs:
+        s += math.exp(lam * (x - m))
+    return (m + (math.log(max(s, 1e-12)) / lam))
+
+
+def _type_weight(obj_type: str) -> float:
+    if obj_type in TYPE_WEIGHT:
+        return float(TYPE_WEIGHT[obj_type])
+    # fuzzy match
+    lo = (obj_type or "").lower()
+    if "pedestrian" in lo:
+        return 2.5
+    if "bicycle" in lo:
+        return 2.0
+    if "motorcycle" in lo:
+        return 1.8
+    if "truck" in lo or "bus" in lo:
+        return 1.3
+    return 1.0
+
+
+def _front_weight(rel_x: float, rel_y: float, dist: float) -> float:
+    """
+    Soft front/path weight in [0,1].
+
+    - Uses angle vs RISK_FRONT_CONE_DEG as a soft gate (not hard).
+    - Optionally suppresses behind objects when RISK_REQUIRE_IN_FRONT is True.
+    """
+    if dist <= 1e-6:
+        return 1.0
+
+    # cos(theta) = rel_x / dist  (1.0 is directly ahead)
+    cos_th = max(-1.0, min(1.0, rel_x / dist))
+
+    # convert "front cone degrees" to a cosine threshold
+    # if cone=60°, cos=0.5. If cone=30°, cos=0.866.
+    cone = float(RISK_FRONT_CONE_DEG)
+    cone = max(5.0, min(85.0, cone))
+    cos_thr = math.cos(math.radians(cone))
+
+    # soft transition around cos_thr
+    # scale decides softness; 0.08~0.15 is reasonable
+    w = _sigmoid((cos_th - cos_thr) / 0.10)
+
     if RISK_REQUIRE_IN_FRONT and rel_x <= 0.0:
-        return False
+        w *= 0.1  # still keep tiny weight (rear object rarely relevant)
 
-    # angle wrt ego forward (+x)
-    angle_deg = abs(math.degrees(math.atan2(rel_y, rel_x + 1e-6)))
-    if angle_deg > float(RISK_FRONT_CONE_DEG):
-        return False
+    return float(max(0.0, min(1.0, w)))
 
-    if abs(rel_y) > float(RISK_LATERAL_BAND_M):
-        return False
 
-    return True
+def _lateral_conflict(rel_x: float, rel_y: float) -> float:
+    """
+    Lateral conflict: higher when |y| is near the lane/path band and x is ahead.
+    Produces a smooth risk in [0,1].
+    """
+    y = abs(float(rel_y))
+    # if within band -> high; beyond band -> decays
+    band = float(RISK_LATERAL_BAND_M)
+    band = max(0.5, band)
 
+    # exp decay outside the band
+    lat = math.exp(-max(0.0, (y - band)) / (band + 1e-6))
+
+    # suppress if far behind
+    if rel_x < -2.0:
+        lat *= 0.2
+    return float(max(0.0, min(1.0, lat)))
+
+
+def _uncertainty_proxy(dist: float, size: float, speed: float) -> float:
+    """
+    Lightweight uncertainty proxy (no sensor covariance available):
+    - farther objects -> more uncertain
+    - very small size -> more uncertain
+    - higher speed magnitude -> more uncertain
+    """
+    d_term = min(1.0, (dist / 50.0)) * 0.5
+    # size proxy: small objects are harder (size is coarse in your vectors)
+    s_term = 0.0
+    if size <= 0.6:
+        s_term = 0.35
+    elif size <= 1.0:
+        s_term = 0.20
+    elif size <= 1.5:
+        s_term = 0.10
+
+    v_term = min(0.3, speed / 30.0)
+    return float(max(0.0, min(1.0, d_term + s_term + v_term)))
+
+
+def _closing_speed_and_ttc(rel_x: float, rel_y: float, dist: float, rel_vx: float, rel_vy: float) -> Tuple[float, Optional[float]]:
+    """
+    Compute closing speed along line-of-sight and TTC.
+
+    In ego frame, rel_v is object's velocity relative to ego.
+    closing_speed = - dot(rel_v, unit_pos)
+      >0  -> approaching
+      <=0 -> not approaching (TTC = inf)
+    """
+    if dist <= 1e-6:
+        return 0.0, 0.01
+    ux = rel_x / dist
+    uy = rel_y / dist
+    closing = - (rel_vx * ux + rel_vy * uy)
+    if closing <= 1e-3:
+        return float(closing), None
+    ttc = dist / (closing + 1e-6)
+    return float(closing), float(max(0.01, ttc))
+
+
+# =============================================================================
+# CORE: RISK CALCULATION FOR FRAME VECTORS
+# =============================================================================
 
 def calculate_risk_from_vectors(
     vectors: np.ndarray,
@@ -85,19 +230,8 @@ def calculate_risk_from_vectors(
     traffic_light: Optional[str] = None,
 ) -> FrameRiskData:
     """
-    Calculate comprehensive risk data from object vectors.
-
     Vector format (Option A, VECTOR_DIM=8):
       [rel_x, rel_y, dist, rel_vx, rel_vy, heading, size, type_id]
-
-    Args:
-        vectors: (MAX_OBJECTS, VECTOR_DIM) array
-        use_n: number of objects to use (None -> infer)
-        ego_speed: ego vehicle speed in m/s (None -> DEFAULT_EGO_SPEED)
-        traffic_light: optional ('red','yellow','green')
-
-    Returns:
-        FrameRiskData
     """
     try:
         arr = np.asarray(vectors)
@@ -106,7 +240,6 @@ def calculate_risk_from_vectors(
         arr = vectors
 
     if arr is None or len(arr) == 0:
-        logger.warning("[risk_calculator] Empty vectors array; returning MINIMAL risk.")
         return FrameRiskData(
             risk_level="MINIMAL",
             max_collision_risk=0.0,
@@ -135,132 +268,146 @@ def calculate_risk_from_vectors(
             object_risks=[],
         )
 
-    calculator = SimpleRiskCalculator(ego_speed=float(ego_speed))
+    # Hyperparameters (tunable, but keep fixed for Phase-2 baseline)
+    TTC_T = 3.0      # seconds (risk decays with TTC)
+    DIST_D = 18.0    # meters (risk decays with distance)
+    LAM = 10.0       # logsumexp sharpness (10 ~ fairly max-like)
 
     object_risks: List[Dict] = []
-    total_risk_sum = 0.0
+    per_obj_total: List[float] = []
+
     max_collision = 0.0
     max_pedestrian = 0.0
     min_ttc = float("inf")
 
     for i in range(use_n):
         vec = arr[i]
-
-        # Option-A unpack (8D)
         try:
             rel_x, rel_y, dist, rel_vx, rel_vy, heading, size, type_id = vec
         except Exception:
-            logger.exception("[risk_calculator] Bad vector at index=%d; skipping.", i)
             continue
 
         rel_x = float(rel_x)
         rel_y = float(rel_y)
 
-        position = np.array([rel_x, rel_y], dtype=np.float32)
-
-        # Option-A: use ego-frame velocity components directly
+        # dist in vectors can be slightly inconsistent; recompute for safety
         try:
-            vx = float(rel_vx)
-            vy = float(rel_vy)
+            dist_f = float(dist)
+            if not math.isfinite(dist_f):
+                dist_f = math.sqrt(rel_x * rel_x + rel_y * rel_y)
         except Exception:
-            logger.exception("[risk_calculator] rel_vx/rel_vy invalid at index=%d; using zero velocity.", i)
-            vx, vy = 0.0, 0.0
-        velocity = np.array([vx, vy], dtype=np.float32)
+            dist_f = math.sqrt(rel_x * rel_x + rel_y * rel_y)
 
-        # Size as [width, length] proxy duplicated
+        # velocity magnitude
         try:
-            s = float(size)
+            rvx = float(rel_vx)
+            rvy = float(rel_vy)
         except Exception:
-            logger.exception("[risk_calculator] size invalid at index=%d; using 1.0.", i)
-            s = 1.0
-        size_arr = np.array([s, s], dtype=np.float32)
+            rvx, rvy = 0.0, 0.0
+        speed = math.sqrt(rvx * rvx + rvy * rvy)
+
+        try:
+            size_f = float(size)
+            if not math.isfinite(size_f):
+                size_f = 1.0
+        except Exception:
+            size_f = 1.0
 
         try:
             obj_type = TYPE_ID_TO_CATEGORY.get(int(type_id), "object.other")
         except Exception:
-            logger.exception("[risk_calculator] type_id invalid at index=%d; using object.other.", i)
             obj_type = "object.other"
 
-        # Compute raw risk from calculator
-        try:
-            risk_components, metadata = calculator.calculate_risk(
-                position=position,
-                velocity=velocity,
-                size=size_arr,
-                obj_type=obj_type,
-                traffic_light=traffic_light,
-            )
-        except Exception:
-            logger.exception("[risk_calculator] calculate_risk failed at index=%d; skipping.", i)
-            continue
+        tw = _type_weight(obj_type)
+        fw = _front_weight(rel_x, rel_y, dist_f)
+        lat = _lateral_conflict(rel_x, rel_y)
 
-        # ---------- Path gating (mandatory) ----------
-        # If object is NOT in-path, down-weight collision/TTC contributions
-        in_path = _in_path_gate(rel_x, rel_y)
+        closing_speed, ttc = _closing_speed_and_ttc(rel_x, rel_y, dist_f, rvx, rvy)
 
-        # risk_components has: collision_risk, pedestrian_risk, ttc_risk, regulatory_risk, total_risk, risk_level
-        col = float(risk_components.collision_risk)
-        ped = float(risk_components.pedestrian_risk)
-        ttc_r = float(risk_components.ttc_risk)
-        reg = float(risk_components.regulatory_risk)
-
-        if not in_path:
-            # Keep ped risk (vulnerable users can matter even if slightly off path),
-            # but suppress collision/ttc so far-side objects don't force CRITICAL.
-            col *= 0.2
-            ttc_r *= 0.2
-
-        # Recompute total risk using the same weights as your SimpleRiskCalculator
-        total = col * 0.40 + ped * 0.30 + ttc_r * 0.20 + reg * 0.10
-
-        # Recompute a derived risk_level (consistent with calculator thresholds)
-        if total >= 0.8:
-            derived_level = "CRITICAL"
-        elif total >= 0.6:
-            derived_level = "HIGH"
-        elif total >= 0.4:
-            derived_level = "MODERATE"
-        elif total >= 0.2:
-            derived_level = "LOW"
+        # TTC risk: only if approaching
+        if ttc is None:
+            ttc_risk = 0.0
         else:
-            derived_level = "MINIMAL"
+            ttc_risk = math.exp(-ttc / TTC_T)
+            ttc_risk = float(max(0.0, min(1.0, ttc_risk)))
 
-        # TTC tracking
-        # TTC tracking (IMPORTANT: only consider in-path objects)
-        ttc_val = metadata.get("ttc", None)
-        if in_path and ttc_val is not None:
-            try:
-                ttc_f = float(ttc_val)
-                if ttc_f < min_ttc:
-                    min_ttc = ttc_f
-            except Exception:
-                pass
+        # Distance baseline risk (always applicable)
+        dist_risk = math.exp(-dist_f / DIST_D)
+        dist_risk = float(max(0.0, min(1.0, dist_risk)))
 
-        # Aggregate stats (use gated collision/ped values!)
-        total_risk_sum += float(total)
-        max_collision = max(max_collision, float(col))
+        # Uncertainty proxy
+        unc_risk = _uncertainty_proxy(dist_f, size_f, speed)
+
+        # Collision risk combines TTC + distance + lateral, and is weighted by front/path
+        # weights sum to 1.0 inside parentheses
+        collision_raw = (0.55 * ttc_risk) + (0.25 * dist_risk) + (0.20 * lat)
+        collision = fw * collision_raw
+
+        # Pedestrian risk: emphasize vulnerable road users; still front weighted,
+        # but keep some risk even when slightly off-path (use sqrt(fw)).
+        ped = 0.0
+        if "pedestrian" in obj_type or "bicycle" in obj_type or "motorcycle" in obj_type:
+            ped = (math.sqrt(max(fw, 0.0)) * (0.60 * collision_raw + 0.40 * dist_risk))
+            ped = min(1.0, ped * min(1.5, tw / 1.5))
+
+        # Type-weighted collision (cap to 1.0)
+        collision = min(1.0, collision * min(1.6, (tw / 1.2)))
+        ped = float(max(0.0, min(1.0, ped)))
+
+        # Regulatory risk (kept minimal; you can expand later)
+        reg = 0.0
+        if traffic_light == "red":
+            # only meaningful if we are moving forward and object is ahead (rough proxy)
+            reg = 0.6 if float(ego_speed) > 1.0 else 0.3
+        elif traffic_light == "yellow":
+            reg = 0.25
+
+        # Total per-object risk (keep weights similar to Phase-1 expectations)
+        total = (0.40 * collision) + (0.30 * ped) + (0.20 * unc_risk) + (0.10 * reg)
+        total = float(max(0.0, min(1.0, total)))
+
+        # Risk level per object (for debugging/analysis)
+        if total >= 0.8:
+            obj_level = "CRITICAL"
+        elif total >= 0.6:
+            obj_level = "HIGH"
+        elif total >= 0.4:
+            obj_level = "MODERATE"
+        elif total >= 0.2:
+            obj_level = "LOW"
+        else:
+            obj_level = "MINIMAL"
+
+        # Track global stats
+        max_collision = max(max_collision, float(collision))
         max_pedestrian = max(max_pedestrian, float(ped))
+        per_obj_total.append(total)
+
+        if ttc is not None and fw >= 0.3:
+            min_ttc = min(min_ttc, float(ttc))
 
         object_risks.append({
             "idx": i,
             "type": obj_type,
-            "distance": metadata.get("distance"),
-            "ttc": metadata.get("ttc"),
-            "closing_speed": metadata.get("closing_speed"),
-            "in_path": bool(in_path),
+            "distance": round(dist_f, 3),
+            "closing_speed": round(float(closing_speed), 3),
+            "ttc": round(float(ttc), 3) if ttc is not None else None,
+            "front_weight": round(float(fw), 3),
+            "lateral_conflict": round(float(lat), 3),
             "risk": {
-                "collision_risk": round(col, 3),
-                "pedestrian_risk": round(ped, 3),
-                "ttc_risk": round(ttc_r, 3),
-                "regulatory_risk": round(reg, 3),
-                "total_risk": round(total, 3),
-                "risk_level": derived_level,
+                "collision_risk": round(float(collision), 3),
+                "pedestrian_risk": round(float(ped), 3),
+                "dist_risk": round(float(dist_risk), 3),
+                "ttc_risk": round(float(ttc_risk), 3),
+                "uncertainty_risk": round(float(unc_risk), 3),
+                "regulatory_risk": round(float(reg), 3),
+                "total_risk": round(float(total), 3),
+                "risk_level": obj_level,
             }
         })
 
     effective_n = len(object_risks)
     if effective_n == 0:
-        logger.warning("[risk_calculator] All objects skipped; returning MINIMAL risk.")
         return FrameRiskData(
             risk_level="MINIMAL",
             max_collision_risk=0.0,
@@ -271,18 +418,18 @@ def calculate_risk_from_vectors(
             object_risks=[],
         )
 
-    avg_risk = total_risk_sum / effective_n
+    # Scene aggregation (soft max): lets the most dangerous object dominate but remains stable.
+    scene_total = float(_logsumexp(per_obj_total, lam=LAM))
+    avg_risk = float(sum(per_obj_total) / max(1, len(per_obj_total)))
 
-    # Frame-level risk: based on max collision OR small TTC (same style as before, but now collision is gated)
-    score = 0.7 * max_collision + 0.3 * avg_risk
-
-    if (min_ttc < float("inf") and min_ttc < 2.0) or score >= 0.75:
+    # Frame-level risk level from aggregated score, with TTC override
+    if (min_ttc < float("inf") and min_ttc < 2.0) or scene_total >= 0.80:
         risk_level = "CRITICAL"
-    elif (min_ttc < float("inf") and min_ttc < 3.0) or score >= 0.55:
+    elif (min_ttc < float("inf") and min_ttc < 3.0) or scene_total >= 0.60:
         risk_level = "HIGH"
-    elif (min_ttc < float("inf") and min_ttc < 5.0) or score >= 0.35:
+    elif (min_ttc < float("inf") and min_ttc < 5.0) or scene_total >= 0.40:
         risk_level = "MODERATE"
-    elif score >= 0.18:
+    elif scene_total >= 0.20:
         risk_level = "LOW"
     else:
         risk_level = "MINIMAL"
@@ -291,7 +438,7 @@ def calculate_risk_from_vectors(
         risk_level=risk_level,
         max_collision_risk=round(float(max_collision), 3),
         max_pedestrian_risk=round(float(max_pedestrian), 3),
-        min_ttc=round(min_ttc, 2) if min_ttc < float("inf") else None,
+        min_ttc=round(float(min_ttc), 2) if min_ttc < float("inf") else None,
         avg_total_risk=round(float(avg_risk), 3),
         num_risk_objects=int(effective_n),
         object_risks=object_risks,
@@ -304,42 +451,43 @@ def calculate_risk_from_vectors(
 
 def policy_from_risk(risk_data: FrameRiskData) -> Tuple[int, int, str, str, str]:
     """
-    Determine driving policy based on multi-dimensional risk assessment.
+    Determine driving policy based on risk assessment.
     Returns: (accel, brake, steer, reason, policy_label)
     """
     steer = "straight"
-    risk_level = risk_data.risk_level
+    rl = risk_data.risk_level
     min_ttc = risk_data.min_ttc
-    max_collision = risk_data.max_collision_risk
-    max_pedestrian = risk_data.max_pedestrian_risk
+    max_collision = float(risk_data.max_collision_risk)
+    max_ped = float(risk_data.max_pedestrian_risk)
 
     if risk_data.num_risk_objects == 0:
         return 20, 0, steer, "No nearby obstacles detected.", "CONTINUE"
 
-    if risk_level == "CRITICAL":
-        if min_ttc is not None and min_ttc < 2:
+    if rl == "CRITICAL":
+        if min_ttc is not None and min_ttc < 2.0:
             return 0, 90, steer, f"Critical risk: TTC={min_ttc:.1f}s, emergency braking required.", "BRAKE"
-        return 0, 80, steer, f"Critical risk level (collision={max_collision:.0%}), braking hard.", "BRAKE"
+        return 0, 80, steer, f"Critical risk (collision={max_collision:.0%}), braking hard.", "BRAKE"
 
-    if risk_level == "HIGH":
-        if max_pedestrian >= 0.5:
-            return 0, 60, steer, f"High pedestrian risk ({max_pedestrian:.0%}), reducing speed.", "BRAKE"
+    if rl == "HIGH":
+        if max_ped >= 0.5:
+            return 0, 60, steer, f"High pedestrian risk ({max_ped:.0%}), reducing speed.", "BRAKE"
         return 0, 50, steer, f"High risk (collision={max_collision:.0%}), slowing down.", "BRAKE"
 
-    if risk_level == "MODERATE":
-        if max_pedestrian >= 0.3:
+    if rl == "MODERATE":
+        if max_ped >= 0.3:
             return 5, 30, steer, "Moderate pedestrian risk, proceeding with caution.", "CAUTION"
         return 10, 20, steer, f"Moderate risk (collision={max_collision:.0%}), proceed carefully.", "CAUTION"
 
-    if risk_level == "LOW":
-        # IMPORTANT: brake=0 to keep labels consistent with your bucket metric
+    if rl == "LOW":
         return 15, 0, steer, "Low risk detected, maintaining awareness.", "CONTINUE"
 
     return 20, 0, steer, "Minimal risk, safe to continue.", "CONTINUE"
 
 
 def get_risk_summary_text(risk_data: FrameRiskData) -> str:
-    """Generate a human-readable risk summary."""
+    """
+    Compact, Stage-2 friendly summary (keep short to avoid token bloat).
+    """
     if risk_data.num_risk_objects == 0:
         return "The driving situation is clear with no significant risks."
 
