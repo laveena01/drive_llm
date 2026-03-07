@@ -137,14 +137,16 @@ def _make_samples_from_frames(
             # "regulatory_risk": risk_data.regulatory_risk,
             # "uncertainty_risk": risk_data.uncertainty_risk,
         }
-
-        caption = lanGen(frame)
+        frame_for_caption = dict(frame)
+        frame_for_caption.pop("risk_data", None)
+        caption = lanGen(frame_for_caption)
+        # caption = lanGen(frame)
         vec_str = vector_to_string(frame["vectors"], num_objects)
 
         # --- Stage 1: vector -> caption ---
         captioning_samples.append({
             "input": f"Describe the driving scene from object vectors:\n{vec_str}",
-            "target": caption + "\n" + risk_text,
+            "target": caption,
             "risk_text": risk_text,
             "risk_data": frame["risk_data"],
             "risk_level": risk_data.risk_level,
