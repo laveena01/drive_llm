@@ -2,31 +2,31 @@
 
 """
 Builds datasets for:
-1) Vector Captioning: (input: vector string) -> (target: lanGen caption)
-2) Driving QA (paper-style): (input: caption + question + format) -> (target: actions + reason)
+1) Vector Captioning: (input: vector string) -> (target: lanGen caption) [NO risk in Stage-1]
+2) Driving QA (paper-style): (input: caption + risk + question + format) -> target depends on question type
 
-PART-1 updates:
-- Remove min_dist leakage from Stage-2 input (still stored as metadata)
-- Keep vec_str for stage1_caption eval
-- Keep oracle caption only as debug field
+Phase-3 update:
+- Adds multiple questions per frame, split into:
+  A) ACTION questions -> 5-line output (accelerator/brake/steer/reason)
+  B) RISK questions   -> 1-2 line output: "Risk level: ... Reason: ..."
+- Keeps Phase-2 cleanup: DO NOT leak risk into lanGen captions (Option-B)
 """
 
 from typing import List, Dict
 from collections import Counter
 import json
 import logging
+import re
 
 from .nuscenes_data import get_scene_frames_vectors, init_nuscenes
 from .langen import lanGen, vector_to_string
 from .config import CAPTIONING_DATA_PATH, QA_DATA_PATH, MAX_OBJECTS
-# from llm_driving.risk_calculator import calculate_risk_from_vectors, get_risk_summary_text
 from llm_driving.risk_calculator import calculate_risk_from_vectors, get_risk_summary_text, policy_from_risk
 
 logger = logging.getLogger("llm_driving")
 
-# Track policy decisions for logging
+# Track policy decisions for logging (per-frame, not per-question)
 _policy_log: List[Dict] = []
-
 
 PAPER_FORMAT_INSTRUCTION = (
     "You are an AI Driver.\n"
@@ -38,6 +38,30 @@ PAPER_FORMAT_INSTRUCTION = (
     "Reason: <one short sentence>\n"
     "Do NOT ask questions. Do NOT add extra text.\n"
 )
+
+RISK_FORMAT_INSTRUCTION = (
+    "Answer in 1-2 short lines using this template ONLY:\n"
+    "Risk level: <CRITICAL|HIGH|MODERATE|LOW|MINIMAL>.\n"
+    "Reason: <brief; mention TTC/collision/pedestrian if relevant>.\n"
+    "Do NOT include driving controls.\n"
+)
+
+# -----------------------------
+# Phase-3 question sets
+# -----------------------------
+ACTION_QUESTIONS: List[str] = [
+    "How should the car drive in this situation and why?",
+    "Should the car brake now or continue?",
+    "What brake percentage should be applied and why?",
+    "Should the ego slow down, maintain speed, or speed up?",
+    "What caution should the vehicle take in the next 2 seconds?",
+]
+
+RISK_QUESTIONS: List[str] = [
+    "What is the risk level and the main reason?",
+    "Is there an imminent collision risk (low TTC)? Explain briefly.",
+    "Are pedestrians a significant risk here? Explain briefly.",
+]
 
 
 def _paper_target(accel: int, brake: int, steer: str, reason: str) -> str:
@@ -54,55 +78,45 @@ def _paper_target(accel: int, brake: int, steer: str, reason: str) -> str:
     )
 
 
-def _policy_from_min_dist(num_objects: int, min_dist: float, frame_idx: int = -1) -> tuple[int, int, str, str, str]:
+def _strip_any_risk_lines_from_caption(caption: str) -> str:
+    """Extra safety guard: strip risk lines if they ever appear in caption."""
+    if not caption:
+        return caption
+    kept = []
+    for ln in caption.splitlines():
+        low = ln.lower().strip()
+        if low.startswith("risk assessment:") or low.startswith("risk level:") or low.startswith("time-to-collision"):
+            continue
+        kept.append(ln)
+    return "\n".join(kept).strip()
+
+
+def _risk_target_from_risk_data(risk_data) -> str:
     """
-    Rule-based policy to determine driving action based on minimum distance to objects.
-
-    Risk levels:
-    - BRAKE (HIGH RISK):    min_dist < 10m  -> brake hard (70%) or slow down (40%)
-    - CAUTION (MED RISK):   10m <= min_dist < 15m -> light brake + accel
-    - CONTINUE (LOW RISK):  min_dist >= 15m or no objects -> normal driving
+    Create a stable short answer for risk questions.
+    Keep it simple so evaluation is easy and thesis-friendly.
     """
-    steer = "straight"
+    rl = getattr(risk_data, "risk_level", "UNKNOWN")
+    min_ttc = getattr(risk_data, "min_ttc", None)
+    max_col = float(getattr(risk_data, "max_collision_risk", 0.0))
+    max_ped = float(getattr(risk_data, "max_pedestrian_risk", 0.0))
 
-    if num_objects == 0:
-        risk_level = "LOW"
-        decision = "CONTINUE"
-        accel, brake = 20, 0
-        reason = "No nearby obstacles detected."
-    elif min_dist < 6.0:
-        risk_level = "CRITICAL"
-        decision = "BRAKE"
-        accel, brake = 0, 70
-        reason = f"An object is very close ({min_dist:.1f} m), so brake hard."
-    elif min_dist < 10.0:
-        risk_level = "HIGH"
-        decision = "BRAKE"
-        accel, brake = 0, 40
-        reason = f"An object is close ({min_dist:.1f} m), so slow down."
-    elif min_dist < 15.0:
-        risk_level = "MEDIUM"
-        decision = "CAUTION"
-        accel, brake = 10, 10
-        reason = f"Objects are within caution range (min {min_dist:.1f} m), proceed carefully."
-    else:
-        risk_level = "LOW"
-        decision = "CONTINUE"
-        accel, brake = 20, 0
-        reason = f"All objects are far enough (min {min_dist:.1f} m), continue."
+    reasons = []
+    if min_ttc is not None:
+        try:
+            if float(min_ttc) <= 3.0:
+                reasons.append(f"TTC={float(min_ttc):.1f}s")
+        except Exception:
+            pass
+    if max_col >= 0.30:
+        reasons.append(f"collision={max_col:.0%}")
+    if max_ped >= 0.30:
+        reasons.append(f"ped={max_ped:.0%}")
+    if not reasons:
+        reasons.append("no strong risk factors")
 
-    # Log the policy decision
-    _policy_log.append({
-        "frame_idx": frame_idx,
-        "num_objects": num_objects,
-        "min_dist": min_dist,
-        "risk_level": risk_level,
-        "decision": decision,
-        "accel": accel,
-        "brake": brake,
-    })
-
-    return accel, brake, steer, reason, decision
+    # 1-2 lines max
+    return f"Risk level: {rl}.\nReason: " + ", ".join(reasons) + ".\n"
 
 
 def _make_samples_from_frames(
@@ -116,7 +130,7 @@ def _make_samples_from_frames(
         num_objects = int(frame["num_objects"])
         use_n = min(num_objects, MAX_OBJECTS)
 
-        # Phase-1: compute TTC-based risk + summary text
+        # Risk (Stage-2 only)
         risk_data = calculate_risk_from_vectors(
             vectors=frame["vectors"],
             use_n=use_n,
@@ -125,111 +139,136 @@ def _make_samples_from_frames(
         )
         risk_text = get_risk_summary_text(risk_data)
 
-        # Make risk visible to lanGen (it checks frame.get("risk_data"))
-        frame["risk_data"] = {
-            "risk_level": risk_data.risk_level,
-            "max_collision_risk": risk_data.max_collision_risk,
-            "max_pedestrian_risk": risk_data.max_pedestrian_risk,
-            "min_ttc": risk_data.min_ttc,
-            "avg_total_risk": risk_data.avg_total_risk,
-            "regulatory_risk":0.0,
-            "uncertainty_risk": 0.0,
-            # "regulatory_risk": risk_data.regulatory_risk,
-            # "uncertainty_risk": risk_data.uncertainty_risk,
-        }
+        # IMPORTANT: caption must NOT see risk_data (Option-B)
         frame_for_caption = dict(frame)
         frame_for_caption.pop("risk_data", None)
         caption = lanGen(frame_for_caption)
-        # caption = lanGen(frame)
+        caption = _strip_any_risk_lines_from_caption(caption)
+
         vec_str = vector_to_string(frame["vectors"], num_objects)
 
-        # --- Stage 1: vector -> caption ---
+        # --- Stage 1: vector -> caption (caption-only target) ---
         captioning_samples.append({
             "input": f"Describe the driving scene from object vectors:\n{vec_str}",
             "target": caption,
-            "risk_text": risk_text,
-            "risk_data": frame["risk_data"],
-            "risk_level": risk_data.risk_level,
         })
 
-        # --- Stage 2: paper-style actions ---
+        # --- metadata: min_dist ---
         if use_n == 0:
             min_dist = 999.0
         else:
             dists = [float(frame["vectors"][i][2]) for i in range(use_n)]
-            min_dist = min(dists)
+            min_dist = float(min(dists))
 
-        qa_question = "How should the car drive in this situation and why?"
-
-        global_frame_idx = len(qa_samples)  # unique frame index across all scenes
-        # accel, brake, steer, reason, policy_label = _policy_from_min_dist(
-        #     use_n, min_dist, frame_idx=global_frame_idx
-        # )
+        # --- action policy from risk ---
         accel, brake, steer, reason, policy_label = policy_from_risk(risk_data)
-        _policy_log.append({
-        "frame_idx": global_frame_idx,
-        "num_objects": use_n,
-        "min_dist": float(min_dist),
-        "risk_level": risk_data.risk_level,
-        "decision": policy_label,
-        "accel": accel,
-        "brake": brake,
-    })
-        qa_target = _paper_target(accel, brake, steer, reason)
+        qa_target_action = _paper_target(accel, brake, steer, reason)
 
-        # Log individual decisions (every 10th frame to avoid spam)
+        # frame-level index (stable across multiple questions)
+        frame_idx_global = len(_policy_log)
+
+        # log per-frame once
+        _policy_log.append({
+            "frame_idx": frame_idx_global,
+            "num_objects": int(use_n),
+            "min_dist": float(min_dist),
+            "risk_level": str(getattr(risk_data, "risk_level", "UNKNOWN")),
+            "decision": str(policy_label),
+            "accel": int(accel),
+            "brake": int(brake),
+            "scene_idx": int(scene_idx),
+            "frame_in_scene": int(idx),
+        })
+
         if idx % 10 == 0:
-            last_risk = _policy_log[-1]["risk_level"] if _policy_log else "?"
             logger.info(
-                f"    [RISK] Scene {scene_idx} Frame {idx}: "
-                f"objects={use_n}, min_dist={min_dist:.1f}m -> {last_risk} risk -> {policy_label}"
+                f"    [RISK] Scene {scene_idx} Frame {idx}: objects={use_n}, "
+                f"min_dist={min_dist:.1f}m -> {getattr(risk_data,'risk_level','?')} -> {policy_label}"
             )
 
-        # Stage-2 input includes RISK block
-        qa_input = (
-            "### OBSERVATION\n"
-            f"{caption}\n\n"
-            "### RISK\n"
-            f"{risk_text}\n\n"
-            "### QUESTION\n"
-            f"{qa_question}\n\n"
-            "### OUTPUT FORMAT\n"
-            f"{PAPER_FORMAT_INSTRUCTION}"
-        )
+        # --- Stage 2 samples: ACTION questions ---
+        for qid, qa_question in enumerate(ACTION_QUESTIONS):
+            qa_input = (
+                "### OBSERVATION\n"
+                f"{caption}\n\n"
+                "### RISK\n"
+                f"{risk_text}\n\n"
+                "### QUESTION\n"
+                f"{qa_question}\n\n"
+                "### OUTPUT FORMAT\n"
+                f"{PAPER_FORMAT_INSTRUCTION}"
+            )
 
-        qa_samples.append({
-            "input": qa_input,
-            "target": qa_target,
+            qa_samples.append({
+                "input": qa_input,
+                "target": qa_target_action,
 
-            # Needed for stage1_caption eval: Stage1(vec_str)->caption_pred->Stage2
-            "vec_str": vec_str,
+                "question_type": "action",
+                "question_id": int(qid),
+                "question": qa_question,
 
-            # Debug only
-            "oracle_caption_debug": caption,
+                "vec_str": vec_str,
+                "oracle_caption_debug": caption,
+                "risk_text": risk_text,
+                "risk_level": str(getattr(risk_data, "risk_level", "UNKNOWN")),
 
-            # Phase-1 additions
-            "risk_text": risk_text,
-            "risk_data": frame["risk_data"],
-            "risk_level": risk_data.risk_level,
+                "min_dist": float(min_dist),
+                "policy_label": str(policy_label),
+                "use_n": int(use_n),
 
-            # Metadata (not leaked into prompt)
-            "min_dist": float(min_dist),
-            "policy_label": policy_label,
-            "use_n": int(use_n),
-        })
+                "frame_idx": int(frame_idx_global),
+                "scene_idx": int(scene_idx),
+                "frame_in_scene": int(idx),
+            })
+
+        # --- Stage 2 samples: RISK questions ---
+        risk_target = _risk_target_from_risk_data(risk_data)
+        for rqid, qa_question in enumerate(RISK_QUESTIONS):
+            qa_input = (
+                "### OBSERVATION\n"
+                f"{caption}\n\n"
+                "### RISK\n"
+                f"{risk_text}\n\n"
+                "### QUESTION\n"
+                f"{qa_question}\n\n"
+                "### OUTPUT FORMAT\n"
+                f"{RISK_FORMAT_INSTRUCTION}"
+            )
+
+            qa_samples.append({
+                "input": qa_input,
+                "target": risk_target,
+
+                "question_type": "risk",
+                "question_id": int(len(ACTION_QUESTIONS) + rqid),
+                "question": qa_question,
+
+                "vec_str": vec_str,
+                "oracle_caption_debug": caption,
+                "risk_text": risk_text,
+                "risk_level": str(getattr(risk_data, "risk_level", "UNKNOWN")),
+
+                "min_dist": float(min_dist),
+                "policy_label": str(policy_label),
+                "use_n": int(use_n),
+
+                "frame_idx": int(frame_idx_global),
+                "scene_idx": int(scene_idx),
+                "frame_in_scene": int(idx),
+            })
 
         if (idx + 1) % 50 == 0:
             logger.info(f"[datasets_builder]     Processed {idx + 1}/{len(frames)} frames in this scene...")
 
 
 def _print_policy_summary():
-    """Print a summary of all policy decisions made during dataset building."""
+    """Print a summary of all frame-level decisions (not per-question)."""
     if not _policy_log:
         logger.info("[POLICY SUMMARY] No policy decisions logged.")
         return
 
     logger.info("\n" + "=" * 80)
-    logger.info("[POLICY SUMMARY] Risk Assessment Outcomes")
+    logger.info("[POLICY SUMMARY] Risk Assessment Outcomes (per-frame)")
     logger.info("=" * 80)
 
     risk_counts = Counter(p["risk_level"] for p in _policy_log)
@@ -252,25 +291,6 @@ def _print_policy_summary():
         bar = "█" * int(pct / 2)
         logger.info(f"  {decision:10s}: {count:4d} ({pct:5.1f}%) {bar}")
 
-    # Distance statistics
-    dists = [p["min_dist"] for p in _policy_log if p["min_dist"] < 900]
-    if dists:
-        import numpy as np
-        logger.info("\n--- Distance Statistics (objects present) ---")
-        logger.info(f"  Min distance:  {min(dists):.2f} m")
-        logger.info(f"  Max distance:  {max(dists):.2f} m")
-        logger.info(f"  Mean distance: {np.mean(dists):.2f} m")
-        logger.info(f"  Median distance: {np.median(dists):.2f} m")
-
-    critical_frames = [p for p in _policy_log if p["risk_level"] in ["CRITICAL", "HIGH"]]
-    if critical_frames:
-        logger.info(f"\n--- Sample High-Risk Frames (showing up to 5) ---")
-        for p in critical_frames[:5]:
-            logger.info(
-                f"  Frame {p['frame_idx']}: {p['num_objects']} objects, min_dist={p['min_dist']:.1f}m "
-                f"-> {p['risk_level']} -> Brake={p['brake']}%"
-            )
-
     logger.info("=" * 80 + "\n")
 
 
@@ -291,6 +311,7 @@ def build_datasets_full_mini(
     num_scenes = len(nusc.scene)
     logger.info(f"[datasets_builder] Building data from all {num_scenes} scenes in nuScenes-mini.")
     logger.info(f"[datasets_builder]   max_frames_per_scene = {max_frames_per_scene}")
+    logger.info(f"[datasets_builder]   action_questions={len(ACTION_QUESTIONS)} risk_questions={len(RISK_QUESTIONS)}")
 
     for scene_idx in range(num_scenes):
         logger.info(f"\n[datasets_builder] Processing scene {scene_idx}/{num_scenes - 1}...")
@@ -316,5 +337,10 @@ def build_datasets_full_mini(
     with open(qa_path, "w") as f:
         json.dump(qa_samples, f, indent=2)
 
-    logger.info(f"[datasets_builder] DONE. Captioning samples: {len(captioning_samples)} | QA samples: {len(qa_samples)}")
+    frames_n = len(_policy_log)
+    qpf = len(ACTION_QUESTIONS) + len(RISK_QUESTIONS)
+    logger.info(
+        f"[datasets_builder] DONE. Captioning samples: {len(captioning_samples)} | "
+        f"QA samples: {len(qa_samples)} (= {frames_n} frames × {qpf} questions)"
+    )
     return captioning_samples, qa_samples

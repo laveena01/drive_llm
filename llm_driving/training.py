@@ -44,6 +44,13 @@ PAPER_FORMAT_INSTRUCTION = (
     "Do NOT ask questions. Do NOT add extra text.\n"
 )
 
+RISK_FORMAT_INSTRUCTION = (
+    "\n\nAnswer in 1-2 short lines using this template ONLY:\n"
+    "Risk level: <CRITICAL|HIGH|MODERATE|LOW|MINIMAL>.\n"
+    "Reason: <brief; mention TTC/collision/pedestrian if relevant>.\n"
+    "Do NOT include driving controls.\n"
+)
+
 def _ensure_paper_format(prompt: str) -> str:
     p = prompt or ""
     if "Here are my actions:" in p and "Brake pedal" in p and "Steering" in p:
@@ -53,20 +60,36 @@ def _ensure_paper_format(prompt: str) -> str:
 def _build_stage1_prompt(vec_str: str) -> str:
     return f"Describe the driving scene from object vectors:\n{vec_str}"
 
-def _build_stage2_prompt_from_caption(caption: str, risk_text: str = "") -> str:
-    qa_question = "How should the car drive in this situation and why?"
-    risk_block = ""
-    if risk_text:
-        risk_block = f"\n\n### RISK\n{risk_text}\n"
+def _build_stage2_prompt_from_caption(
+    caption: str,
+    risk_text: str,
+    qa_question: str,
+    question_type: str,
+) -> str:
+    """
+    Rebuilds Stage-2 prompt for stage1_caption evaluation.
+    Must match the dataset_builder templates.
+    """
+    caption = caption or ""
+    risk_text = risk_text or ""
+    qa_question = qa_question or "How should the car drive in this situation and why?"
+    question_type = (question_type or "action").strip().lower()
+
+    if question_type == "risk":
+        out_fmt = "### OUTPUT FORMAT\n" + RISK_FORMAT_INSTRUCTION.strip()
+    else:
+        out_fmt = "### OUTPUT FORMAT\n" + _ensure_paper_format("").strip()
 
     prompt = (
         "### OBSERVATION\n"
-        f"{caption}"
-        f"{risk_block}\n\n"
+        f"{caption}\n\n"
+        "### RISK\n"
+        f"{risk_text}\n\n"
         "### QUESTION\n"
         f"{qa_question}\n\n"
+        f"{out_fmt}\n"
     )
-    return _ensure_paper_format(prompt)
+    return prompt
 
 
 # ---------------------------
@@ -210,11 +233,6 @@ def _format_compliance_5line(text: str) -> int:
         return 0
     return 1
 
-
-# ---------------------------
-# Stage 2 proxy action metric
-# ---------------------------
-
 def _map_text_to_action_label(text: str) -> str:
     b = _extract_brake_percent(text)
     if b is None:
@@ -225,46 +243,58 @@ def _map_text_to_action_label(text: str) -> str:
         return "CAUTION"
     return "CONTINUE"
 
+def _extract_risk_level(text: str) -> Optional[str]:
+    """
+    Extracts Risk level: <...> from risk answers.
+    """
+    m = re.search(r"risk level:\s*(CRITICAL|HIGH|MODERATE|LOW|MINIMAL)", text or "", flags=re.IGNORECASE)
+    return m.group(1).upper() if m else None
+
 
 def _print_eval_risk_summary(outputs: List[Dict], mode: str):
+    """
+    Keeps your old summary but only for ACTION questions.
+    """
+    action_outputs = [o for o in outputs if o.get("question_type", "action") == "action"]
+
     logger.info(f"\n{'=' * 60}")
-    logger.info(f"[RISK OUTCOMES] Evaluation Mode: {mode}")
+    logger.info(f"[RISK OUTCOMES] Evaluation Mode: {mode} (ACTION ONLY)")
     logger.info(f"{'=' * 60}")
 
-    gt_actions = [o["gt_action"] for o in outputs]
-    pred_actions = [o["pred_action"] for o in outputs]
+    gt_actions = [o["gt_action"] for o in action_outputs]
+    pred_actions = [o["pred_action"] for o in action_outputs]
 
     gt_counts = Counter(gt_actions)
     pred_counts = Counter(pred_actions)
 
-    logger.info(f"\nTotal samples: {len(outputs)}")
+    logger.info(f"\nTotal action samples: {len(action_outputs)}")
 
     logger.info("\n--- Ground Truth Action Distribution ---")
     for action in ["BRAKE", "CAUTION", "CONTINUE", "OTHER"]:
         count = gt_counts.get(action, 0)
-        pct = (count / len(outputs)) * 100 if outputs else 0
+        pct = (count / len(action_outputs)) * 100 if action_outputs else 0
         bar = "█" * int(pct / 2)
         logger.info(f"  {action:10s}: {count:4d} ({pct:5.1f}%) {bar}")
 
     logger.info("\n--- Predicted Action Distribution ---")
     for action in ["BRAKE", "CAUTION", "CONTINUE", "OTHER"]:
         count = pred_counts.get(action, 0)
-        pct = (count / len(outputs)) * 100 if outputs else 0
+        pct = (count / len(action_outputs)) * 100 if action_outputs else 0
         bar = "█" * int(pct / 2)
         logger.info(f"  {action:10s}: {count:4d} ({pct:5.1f}%) {bar}")
 
     logger.info("\n--- Action Prediction Confusion ---")
-    correct = sum(1 for o in outputs if o["gt_action"] == o["pred_action"] and o["gt_action"] != "OTHER")
-    total_valid = sum(1 for o in outputs if o["gt_action"] != "OTHER")
+    correct = sum(1 for o in action_outputs if o["gt_action"] == o["pred_action"] and o["gt_action"] != "OTHER")
+    total_valid = sum(1 for o in action_outputs if o["gt_action"] != "OTHER")
     logger.info(f"  Correct: {correct}/{total_valid} = {correct/max(1,total_valid)*100:.1f}%")
 
     for action in ["BRAKE", "CAUTION", "CONTINUE"]:
-        gt_this = [o for o in outputs if o["gt_action"] == action]
+        gt_this = [o for o in action_outputs if o["gt_action"] == action]
         if gt_this:
             correct_this = sum(1 for o in gt_this if o["pred_action"] == action)
             logger.info(f"  {action}: {correct_this}/{len(gt_this)} = {correct_this/len(gt_this)*100:.1f}% recall")
 
-    missed_brakes = [o for o in outputs if o["gt_action"] == "BRAKE" and o["pred_action"] != "BRAKE"]
+    missed_brakes = [o for o in action_outputs if o["gt_action"] == "BRAKE" and o["pred_action"] != "BRAKE"]
     if missed_brakes:
         logger.info(f"\n--- Missed BRAKE Decisions (showing up to 3) ---")
         for o in missed_brakes[:3]:
@@ -338,13 +368,6 @@ def train_stage1(captioning_path: str):
     train_ds = split_ds["train"]
     eval_ds = split_ds["test"]
     logger.info(f"[STAGE 1] Train samples: {len(train_ds)}  |  Val samples: {len(eval_ds)}")
-
-    # quick sanity: risk coverage in stage-1 targets (non-empty risk_text field)
-    try:
-        has_risk = sum(1 for x in data if (x.get("risk_text") or "").strip())
-        logger.info(f"[STAGE 1] Samples with risk_text: {has_risk}/{len(data)} ({has_risk/max(1,len(data))*100:.1f}%)")
-    except Exception:
-        logger.debug("[STAGE 1] Could not compute risk_text coverage.", exc_info=True)
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 
@@ -448,24 +471,13 @@ def train_stage2(model_stage1, tokenizer, qa_path: str):
     full_ds = Dataset.from_list(data)
     logger.info(f"[STAGE 2] Total samples: {len(full_ds)}")
 
-    # sanity: risk coverage in stage-2 dataset
-    try:
-        has_risk_text = sum(1 for x in data if (x.get("risk_text") or "").strip())
-        has_risk_level = sum(1 for x in data if (x.get("risk_level") or "").strip())
-        logger.info(f"[STAGE 2] Samples with risk_text : {has_risk_text}/{len(data)} ({has_risk_text/max(1,len(data))*100:.1f}%)")
-        logger.info(f"[STAGE 2] Samples with risk_level: {has_risk_level}/{len(data)} ({has_risk_level/max(1,len(data))*100:.1f}%)")
-    except Exception:
-        logger.debug("[STAGE 2] Could not compute risk coverage.", exc_info=True)
-
     split_ds = full_ds.train_test_split(test_size=0.2, seed=42)
     train_ds = split_ds["train"]
     eval_ds = split_ds["test"]
     logger.info(f"[STAGE 2] Train samples: {len(train_ds)}  |  Val samples: {len(eval_ds)}")
 
     def tokenize_fn(batch):
-        batch_inp = batch["input"]
-        batch = dict(batch)
-        batch["input"] = [_ensure_paper_format(x) for x in batch_inp]
+        # Do NOT force paper format globally; dataset inputs already include format blocks.
         return _tokenize_qa(batch, tokenizer)
 
     logger.info("[STAGE 2] Tokenizing datasets...")
@@ -507,148 +519,178 @@ def train_stage2(model_stage1, tokenizer, qa_path: str):
     model_stage1.eval()
     model_stage2.eval()
 
-    def _gen_text(model, prompt: str, max_new_tokens: int, no_repeat_ngram_size: int = 3) -> str:
-        # NOTE: use the *model's* device (avoid stage1/stage2 mismatch traps)
-        prompt = _ensure_paper_format(prompt)
+    def _gen_text(model, prompt: str, max_new_tokens: int, ensure_paper: bool) -> str:
+        if ensure_paper:
+            prompt = _ensure_paper_format(prompt)
         inputs = tokenizer(prompt, return_tensors="pt", max_length=384, truncation=True).to(model.device)
         pred_ids = model.generate(
             **inputs,
             max_new_tokens=max_new_tokens,
             num_beams=4,
             early_stopping=True,
-            no_repeat_ngram_size=no_repeat_ngram_size,
+            no_repeat_ngram_size=3,
             repetition_penalty=1.2,
         )
         return tokenizer.decode(pred_ids[0], skip_special_tokens=True)
 
     def run_eval(mode: str) -> Tuple[Dict, List[Dict]]:
+        # ACTION metrics
         correct = 0
         total = 0
 
+        missed_brake = 0
+        brake_total = 0
+        unsafe_continue_high = 0
+        highcrit_total = 0
+
+        # NEW: brake regression metric (only when GT is BRAKE and percents parse)
+        brake_mae_sum_on_brake_gt = 0.0
+        brake_mae_count_on_brake_gt = 0
+
+        # RISK metrics
+        risk_correct = 0
+        risk_total = 0
+
+        # Optional text metrics for ACTION only
         bleu_sum = 0.0
         rouge_sum = 0.0
-
         fmt_sum = 0.0
         parse_ok_sum = 0.0
 
-        accel_mae_sum = 0.0
-        brake_mae_sum = 0.0
-        steer_correct = 0
-        steer_total = 0
-
-        n = 0
         outputs: List[Dict] = []
 
         for si, sample in enumerate(eval_ds):
             raw_input_text = sample["input"]
             gt_text = sample["target"]
 
+            qtype = (sample.get("question_type") or "action").strip().lower()
+            question = sample.get("question", "How should the car drive in this situation and why?")
+            risk_text = sample.get("risk_text", "")
+            risk_level = sample.get("risk_level", None)
+
             try:
                 if mode == "oracle_caption":
-                    stage2_prompt = _ensure_paper_format(raw_input_text)
+                    stage2_prompt = raw_input_text
                     caption_used = None
-                    risk_level = sample.get("risk_level", None)
                 else:
                     vec_str = sample.get("vec_str", "")
-                    risk_text = sample.get("risk_text", "")
-                    risk_level = sample.get("risk_level", None)
-
                     s1_prompt = _build_stage1_prompt(vec_str)
-                    caption_pred = _gen_text(model_stage1, s1_prompt, max_new_tokens=260, no_repeat_ngram_size=4)
+                    caption_pred = _gen_text(model_stage1, s1_prompt, max_new_tokens=260, ensure_paper=False)
                     caption_used = caption_pred
+                    stage2_prompt = _build_stage2_prompt_from_caption(
+                        caption_pred, risk_text=risk_text, qa_question=question, question_type=qtype
+                    )
 
-                    stage2_prompt = _build_stage2_prompt_from_caption(caption_pred, risk_text=risk_text)
+                pred_raw = _gen_text(
+                    model_stage2,
+                    stage2_prompt,
+                    max_new_tokens=90,
+                    ensure_paper=(qtype == "action"),
+                )
 
-                pred_raw = _gen_text(model_stage2, stage2_prompt, max_new_tokens=90, no_repeat_ngram_size=3)
-                pred_fixed, parse_ok = enforce_5_lines(pred_raw)
+                if qtype == "action":
+                    pred_fixed, parse_ok = enforce_5_lines(pred_raw)
+                    gt_action = _map_text_to_action_label(gt_text)
+                    pred_action = _map_text_to_action_label(pred_fixed)
+
+                    rl = (sample.get("risk_level") or "").strip().upper()
+                    if rl in ("HIGH", "CRITICAL"):
+                        highcrit_total += 1
+                        if pred_action == "CONTINUE":
+                            unsafe_continue_high += 1
+
+                    # NEW: brake% MAE on GT BRAKE frames (captures borderline 20 vs 30 cases)
+                    if gt_action == "BRAKE":
+                        gt_brk = _extract_brake_percent(gt_text)
+                        pr_brk = _extract_brake_percent(pred_fixed)
+                        if gt_brk is not None and pr_brk is not None:
+                            brake_mae_sum_on_brake_gt += abs(float(pr_brk) - float(gt_brk))
+                            brake_mae_count_on_brake_gt += 1
+
+                    if gt_action != "OTHER":
+                        total += 1
+                        if gt_action == pred_action:
+                            correct += 1
+
+                        if gt_action == "BRAKE":
+                            brake_total += 1
+                            if pred_action != "BRAKE":
+                                missed_brake += 1
+
+                    bleu_sum += bleu1(pred_fixed, gt_text)
+                    rouge_sum += rouge_l_f1(pred_fixed, gt_text)
+                    fmt_sum += float(_format_compliance_5line(pred_fixed))
+                    parse_ok_sum += float(parse_ok)
+
+                else:
+                    # risk question
+                    gt_rl = (risk_level or _extract_risk_level(gt_text) or "")
+                    pr_rl = (_extract_risk_level(pred_raw) or "")
+                    if gt_rl:
+                        risk_total += 1
+                        if pr_rl == gt_rl.upper():
+                            risk_correct += 1
+
+                    pred_fixed = pred_raw
+                    gt_action = "OTHER"
+                    pred_action = "OTHER"
+                    parse_ok = 0
+
             except Exception:
                 logger.exception(f"[STAGE 2][EVAL] Failed on eval sample idx={si} (mode={mode}).")
                 pred_raw = ""
-                pred_fixed, parse_ok = enforce_5_lines("")
+                pred_fixed = ""
                 caption_used = None
-                risk_level = sample.get("risk_level", None)
-                stage2_prompt = raw_input_text if mode == "oracle_caption" else ""
-
-            gt_action = _map_text_to_action_label(gt_text)
-            pred_action = _map_text_to_action_label(pred_fixed)
-
-            if gt_action != "OTHER":
-                total += 1
-                if gt_action == pred_action:
-                    correct += 1
-
-            bleu_sum += bleu1(pred_fixed, gt_text)
-            rouge_sum += rouge_l_f1(pred_fixed, gt_text)
-
-            fmt_sum += float(_format_compliance_5line(pred_fixed))
-            parse_ok_sum += float(parse_ok)
-
-            gt_acc = _extract_accel_percent(gt_text)
-            gt_brk = _extract_brake_percent(gt_text)
-            gt_str = _extract_steer(gt_text)
-
-            pr_acc = _extract_accel_percent(pred_fixed)
-            pr_brk = _extract_brake_percent(pred_fixed)
-            pr_str = _extract_steer(pred_fixed)
-
-            if gt_acc is not None and pr_acc is not None:
-                accel_mae_sum += abs(pr_acc - gt_acc)
-            if gt_brk is not None and pr_brk is not None:
-                brake_mae_sum += abs(pr_brk - gt_brk)
-
-            if gt_str is not None and pr_str is not None:
-                steer_total += 1
-                if gt_str == pr_str:
-                    steer_correct += 1
-
-            n += 1
+                gt_action = "OTHER"
+                pred_action = "OTHER"
+                parse_ok = 0
 
             outputs.append({
                 "mode": mode,
+                "question_type": qtype,
+                "question": question,
                 "input": stage2_prompt if mode != "oracle_caption" else raw_input_text,
                 "ground_truth": gt_text,
                 "prediction_raw": pred_raw,
                 "prediction_fixed": pred_fixed,
                 "gt_action": gt_action,
                 "pred_action": pred_action,
-                "format_ok": int(_format_compliance_5line(pred_fixed)),
                 "parse_ok": int(parse_ok),
                 "caption_used": caption_used,
                 "risk_level": risk_level,
             })
 
         metrics = {
+            # ACTION
             "action_accuracy": float(correct / total) if total > 0 else 0.0,
-            "bleu1": float(bleu_sum / max(1, n)),
-            "rougeL_f1": float(rouge_sum / max(1, n)),
-            "format_compliance": float(fmt_sum / max(1, n)),
-            "parse_ok_rate": float(parse_ok_sum / max(1, n)),
-            "accel_mae": float(accel_mae_sum / max(1, n)),
-            "brake_mae": float(brake_mae_sum / max(1, n)),
-            "steering_accuracy": float(steer_correct / max(1, steer_total)) if steer_total > 0 else 0.0,
-            "n_samples": int(n),
             "n_action_samples": int(total),
+            "missed_brake_rate": float(missed_brake / brake_total) if brake_total > 0 else 0.0,
+            "n_brake_gt": int(brake_total),
+            "unsafe_continue_high_rate": float(unsafe_continue_high / highcrit_total) if highcrit_total > 0 else 0.0,
+            "n_highcrit_action_samples": int(highcrit_total),
+            "brake_mae_on_brake_gt": float(brake_mae_sum_on_brake_gt / brake_mae_count_on_brake_gt) if brake_mae_count_on_brake_gt > 0 else 0.0,
+            "n_brake_mae_samples": int(brake_mae_count_on_brake_gt),
+
+            # RISK
+            "risk_level_accuracy": float(risk_correct / risk_total) if risk_total > 0 else 0.0,
+            "n_risk_samples": int(risk_total),
+
+            # ACTION text/format
+            "bleu1_action": float(bleu_sum / max(1, total)) if total > 0 else 0.0,
+            "rougeL_f1_action": float(rouge_sum / max(1, total)) if total > 0 else 0.0,
+            "format_compliance_action": float(fmt_sum / max(1, total)) if total > 0 else 0.0,
+            "parse_ok_rate_action": float(parse_ok_sum / max(1, total)) if total > 0 else 0.0,
         }
         return metrics, outputs
 
     logger.info("[STAGE 2] Computing metrics: oracle_caption...")
     oracle_metrics, oracle_outputs = run_eval("oracle_caption")
-    logger.info(
-        "[STAGE 2] oracle_caption top-line: "
-        f"acc={oracle_metrics['action_accuracy']:.3f}, "
-        f"bleu1={oracle_metrics['bleu1']:.3f}, rougeL={oracle_metrics['rougeL_f1']:.3f}, "
-        f"fmt={oracle_metrics['format_compliance']:.3f}, parse_ok={oracle_metrics['parse_ok_rate']:.3f}"
-    )
+    logger.info(f"[STAGE 2] oracle_caption metrics: {oracle_metrics}")
     _print_eval_risk_summary(oracle_outputs, "oracle_caption")
 
     logger.info("[STAGE 2] Computing metrics: stage1_caption...")
     stage1_metrics, stage1_outputs = run_eval("stage1_caption")
-    logger.info(
-        "[STAGE 2] stage1_caption top-line: "
-        f"acc={stage1_metrics['action_accuracy']:.3f}, "
-        f"bleu1={stage1_metrics['bleu1']:.3f}, rougeL={stage1_metrics['rougeL_f1']:.3f}, "
-        f"fmt={stage1_metrics['format_compliance']:.3f}, parse_ok={stage1_metrics['parse_ok_rate']:.3f}"
-    )
+    logger.info(f"[STAGE 2] stage1_caption metrics: {stage1_metrics}")
     _print_eval_risk_summary(stage1_outputs, "stage1_caption")
 
     eval_metrics: Dict = {}

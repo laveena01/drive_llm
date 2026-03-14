@@ -474,9 +474,17 @@ def policy_from_risk(risk_data: FrameRiskData) -> Tuple[int, int, str, str, str]
         return 0, 50, steer, f"High risk (collision={max_collision:.0%}), slowing down.", "BRAKE"
 
     if rl == "MODERATE":
+        if min_ttc is not None and min_ttc < 4.0:
+            return 0, 40, steer, f"Moderate risk with low TTC={min_ttc:.1f}s, braking to increase safety margin.", "BRAKE"
+
+        # Otherwise keep it clearly CAUTION (not near the BRAKE threshold)
         if max_ped >= 0.3:
-            return 5, 30, steer, "Moderate pedestrian risk, proceeding with caution.", "CAUTION"
+            return 5, 20, steer, "Moderate pedestrian risk, proceed with caution.", "CAUTION"
         return 10, 20, steer, f"Moderate risk (collision={max_collision:.0%}), proceed carefully.", "CAUTION"
+
+        # if max_ped >= 0.3:
+        #     return 5, 30, steer, "Moderate pedestrian risk, proceeding with caution.", "CAUTION"
+        # return 10, 20, steer, f"Moderate risk (collision={max_collision:.0%}), proceed carefully.", "CAUTION"
 
     if rl == "LOW":
         return 15, 0, steer, "Low risk detected, maintaining awareness.", "CONTINUE"
