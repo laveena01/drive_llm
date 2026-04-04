@@ -35,6 +35,7 @@ RISK_WEIGHTS = {
 # model
 # -----------------------------
 MODEL_NAME = "google/flan-t5-base"
+T5_D_MODEL = 768                     # flan-t5-base hidden size
 
 # Run switches
 RUN_STAGE1 = True
@@ -45,11 +46,26 @@ SEED = 42
 # Vector-prefix (PART-2)
 # -----------------------------
 USE_VECTOR_PREFIX = True          # <-- key switch
-PREFIX_LEN = 16                   # number of prefix tokens injected to encoder
+PREFIX_LEN = 64                   # number of prefix tokens injected to encoder (paper: 64)
 VEC_ENCODER_HIDDEN = 256
 VEC_ENCODER_LAYERS = 2
 VEC_ENCODER_HEADS = 4
 VEC_ENCODER_DROPOUT = 0.1
+NUM_OBJECT_TYPES = 4              # car=0, pedestrian=1, traffic_light=2, object=3
+TYPE_EMBED_DIM = 16               # learned embedding dim for type_id
+
+VECTOR_ENCODER_CONFIG = dict(
+    max_objects=MAX_OBJECTS,        # 10
+    vector_dim=VECTOR_DIM,         # 8
+    hidden_dim=VEC_ENCODER_HIDDEN, # 256
+    prefix_len=PREFIX_LEN,         # 64
+    t5_d_model=T5_D_MODEL,        # 768
+    n_layers=VEC_ENCODER_LAYERS,   # 2
+    n_heads=VEC_ENCODER_HEADS,     # 4
+    dropout=VEC_ENCODER_DROPOUT,   # 0.1
+    num_types=NUM_OBJECT_TYPES,    # 4
+    type_embed_dim=TYPE_EMBED_DIM, # 16
+)
 
 # Whether to freeze base FLAN-T5 weights and train only (LoRA + vector encoder)
 FREEZE_BASE_MODEL = True

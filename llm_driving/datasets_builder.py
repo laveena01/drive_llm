@@ -148,10 +148,16 @@ def _make_samples_from_frames(
         vec_str = vector_to_string(frame["vectors"], num_objects)
 
         # --- Stage 1: vector -> caption (caption-only target) ---
-        captioning_samples.append({
+        # Include raw vectors for vector prefix pipeline
+        cap_sample = {
             "input": f"Describe the driving scene from object vectors:\n{vec_str}",
             "target": caption,
-        })
+        }
+        # Raw vectors for vector prefix mode (USE_VECTOR_PREFIX=True)
+        cap_sample["vectors"] = [v.tolist() if hasattr(v, 'tolist') else list(v)
+                                  for v in frame["vectors"][:MAX_OBJECTS]]
+        cap_sample["num_objects"] = int(use_n)
+        captioning_samples.append(cap_sample)
 
         # --- metadata: min_dist ---
         if use_n == 0:
@@ -199,7 +205,7 @@ def _make_samples_from_frames(
                 f"{PAPER_FORMAT_INSTRUCTION}"
             )
 
-            qa_samples.append({
+            qa_sample = {
                 "input": qa_input,
                 "target": qa_target_action,
 
@@ -219,7 +225,12 @@ def _make_samples_from_frames(
                 "frame_idx": int(frame_idx_global),
                 "scene_idx": int(scene_idx),
                 "frame_in_scene": int(idx),
-            })
+            }
+            # Raw vectors for vector prefix mode
+            qa_sample["vectors"] = [v.tolist() if hasattr(v, 'tolist') else list(v)
+                                    for v in frame["vectors"][:MAX_OBJECTS]]
+            qa_sample["num_objects"] = int(use_n)
+            qa_samples.append(qa_sample)
 
         # --- Stage 2 samples: RISK questions ---
         risk_target = _risk_target_from_risk_data(risk_data)
@@ -235,7 +246,7 @@ def _make_samples_from_frames(
                 f"{RISK_FORMAT_INSTRUCTION}"
             )
 
-            qa_samples.append({
+            qa_sample = {
                 "input": qa_input,
                 "target": risk_target,
 
@@ -255,7 +266,12 @@ def _make_samples_from_frames(
                 "frame_idx": int(frame_idx_global),
                 "scene_idx": int(scene_idx),
                 "frame_in_scene": int(idx),
-            })
+            }
+            # Raw vectors for vector prefix mode
+            qa_sample["vectors"] = [v.tolist() if hasattr(v, 'tolist') else list(v)
+                                    for v in frame["vectors"][:MAX_OBJECTS]]
+            qa_sample["num_objects"] = int(use_n)
+            qa_samples.append(qa_sample)
 
         if (idx + 1) % 50 == 0:
             logger.info(f"[datasets_builder]     Processed {idx + 1}/{len(frames)} frames in this scene...")
