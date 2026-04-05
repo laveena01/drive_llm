@@ -141,28 +141,39 @@ class VectorPrefixEncoder(nn.Module):
 
         # --- Create padding mask (True = padded, should be ignored) ---
         idxs = torch.arange(M, device=device).unsqueeze(0).expand(B, M)
-        key_padding_mask = idxs >= num_objects.clamp(min=0).unsqueeze(1)
+        num_obj_clamped = num_objects.clamp(min=0)
+        key_padding_mask = idxs >= num_obj_clamped.unsqueeze(1)
 
-        # --- Transformer encoder (self-attention over objects) ---
-        x = self.encoder(x, src_key_padding_mask=key_padding_mask)  # (B, M, hidden_dim)
+        # --- Check if any sample has zero objects (all-masked causes NaN in Transformer) ---
+        has_objects = num_obj_clamped > 0  # (B,)
+
+        if has_objects.all():
+            # Normal path: all samples have at least 1 object
+            x = self.encoder(x, src_key_padding_mask=key_padding_mask)
+        elif not has_objects.any():
+            # All samples have zero objects — skip encoder entirely, use zeros
+            x = torch.zeros_like(x)
+        else:
+            # Mixed batch: run encoder only on samples with objects
+            mask_with = has_objects.unsqueeze(1).unsqueeze(2).float()  # (B, 1, 1)
+            # Run encoder with at least 1 unmasked position per sample
+            safe_mask = key_padding_mask.clone()
+            safe_mask[~has_objects, 0] = False  # unmask first position to avoid NaN
+            x_enc = self.encoder(x, src_key_padding_mask=safe_mask)
+            x = x_enc * mask_with  # zero out encoder output for zero-object samples
 
         # --- Expand each object into tokens_per_object prefix tokens ---
         expanded = self.token_expansion(x)  # (B, M, tokens_per_object * hidden_dim)
         expanded = expanded.view(B, M, self.tokens_per_object, self.cfg.hidden_dim)
-        # (B, M, tokens_per_object, hidden_dim)
 
         # Reshape to (B, M * tokens_per_object, hidden_dim)
         object_prefix = expanded.reshape(B, self.object_prefix_len, self.cfg.hidden_dim)
         object_prefix = self.expansion_norm(object_prefix)
 
         # --- Zero out prefix tokens for padded objects ---
-        # Create per-token mask: (B, object_prefix_len)
-        obj_token_mask = idxs.unsqueeze(2).expand(B, M, self.tokens_per_object)
-        obj_token_mask = obj_token_mask.reshape(B, self.object_prefix_len)
-        n_expanded = num_objects.clamp(min=0).unsqueeze(1)  # (B, 1)
-        # Each token at position i belongs to object i // tokens_per_object
         obj_indices = torch.arange(self.object_prefix_len, device=device).unsqueeze(0)
         obj_owner = obj_indices // self.tokens_per_object  # (1, object_prefix_len)
+        n_expanded = num_obj_clamped.unsqueeze(1)  # (B, 1)
         token_mask = (obj_owner < n_expanded).unsqueeze(-1).float()  # (B, object_prefix_len, 1)
         object_prefix = object_prefix * token_mask
 
