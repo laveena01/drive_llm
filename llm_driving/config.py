@@ -53,6 +53,7 @@ VEC_ENCODER_HEADS = 4
 VEC_ENCODER_DROPOUT = 0.1
 NUM_OBJECT_TYPES = 4              # car=0, pedestrian=1, traffic_light=2, object=3
 TYPE_EMBED_DIM = 16               # learned embedding dim for type_id
+TOKENS_PER_OBJECT = 6             # prefix tokens per object (10 * 6 = 60, + 4 global = 64)
 
 VECTOR_ENCODER_CONFIG = dict(
     max_objects=MAX_OBJECTS,        # 10
@@ -65,6 +66,7 @@ VECTOR_ENCODER_CONFIG = dict(
     dropout=VEC_ENCODER_DROPOUT,   # 0.1
     num_types=NUM_OBJECT_TYPES,    # 4
     type_embed_dim=TYPE_EMBED_DIM, # 16
+    tokens_per_object=TOKENS_PER_OBJECT,  # 6
 )
 
 # Whether to freeze base FLAN-T5 weights and train only (LoRA + vector encoder)
