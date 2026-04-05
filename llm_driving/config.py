@@ -85,15 +85,15 @@ LORA_TARGET_MODULES = ["q", "v"]
 # -----------------------------
 # Stage 1: vector -> caption
 # -----------------------------
-STAGE1_EPOCHS = 10
-STAGE1_BATCH_SIZE = 2
+STAGE1_EPOCHS = 25
+STAGE1_BATCH_SIZE = 4
 STAGE1_LR = 2e-5
 STAGE1_WEIGHT_DECAY = 0.0
 STAGE1_MAX_INPUT_LEN = 128
-STAGE1_MAX_TARGET_LEN = 192
+STAGE1_MAX_TARGET_LEN = 256
 
 # Stage1 text prompt (vectors go via prefix)
-STAGE1_TEXT_PROMPT = "Describe the driving scene from object vectors."
+STAGE1_TEXT_PROMPT = "List each nearby object with its type, size, distance, direction, and speed."
 
 # -----------------------------
 # Stage 2: caption+question -> action
@@ -112,8 +112,8 @@ STAGE2_QUESTION = "How should the car drive in this situation and why?"
 # -----------------------------
 GEN_NUM_BEAMS = 4
 GEN_EARLY_STOPPING = True
-GEN_NO_REPEAT_NGRAM_SIZE = 4
-GEN_REPETITION_PENALTY = 1.2
+GEN_NO_REPEAT_NGRAM_SIZE = 8
+GEN_REPETITION_PENALTY = 1.5
 GEN_LENGTH_PENALTY = 1.0
 GEN_MAX_NEW_TOKENS_STAGE1 = 160
 GEN_MAX_NEW_TOKENS_STAGE2 = 80
