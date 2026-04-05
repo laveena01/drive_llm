@@ -7,7 +7,7 @@ from datetime import datetime
 # -----------------------------
 # nuScenes
 # -----------------------------
-NUSC_ROOT = "/u/student/2021/cs21resch15003/nuscenes"
+NUSC_ROOT = "/root/drive_llm/data"
 NUSC_VERSION = "v1.0-mini"          # later: "v1.0-trainval"
 
 # -----------------------------

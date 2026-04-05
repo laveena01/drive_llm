@@ -1,0 +1,17 @@
+torch>=2.0.0
+torchaudio>=2.0.0
+torchvision>=0.15.0
+transformers>=4.40.0
+datasets>=2.14.0
+accelerate>=0.25.0
+peft>=0.7.0
+sentencepiece>=0.1.99
+nuscenes-devkit>=1.1.0
+pyquaternion>=0.9.5
+numpy<2.0.0,>=1.22.0
+scipy>=1.10.0
+scikit-learn>=1.2.0
+matplotlib>=3.6.0
+Pillow>6.2.1
+tqdm>=4.60.0
+PyYAML>=6.0

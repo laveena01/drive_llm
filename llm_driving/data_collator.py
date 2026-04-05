@@ -62,14 +62,13 @@ class VectorPrefixDataCollator:
             return_tensors="pt",
         )
 
-        with self.tokenizer.as_target_tokenizer():
-            labels = self.tokenizer(
-                targets_text,
-                max_length=self.max_target_length,
-                padding=self.padding,
-                truncation=True,
-                return_tensors="pt",
-            )
+        labels = self.tokenizer(
+            text_target=targets_text,
+            max_length=self.max_target_length,
+            padding=self.padding,
+            truncation=True,
+            return_tensors="pt",
+        )
 
         # Replace padding token id with -100 so loss ignores padding
         label_ids = labels["input_ids"]
