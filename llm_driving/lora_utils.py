@@ -13,7 +13,10 @@ import os
 from typing import Optional
 
 import torch
-from peft import LoraConfig, get_peft_model, TaskType
+try:
+    from peft import LoraConfig, get_peft_model, TaskType
+except ImportError:
+    LoraConfig = get_peft_model = TaskType = None  # LoRA disabled
 
 from llm_driving.vector_prefix_t5 import VectorPrefixT5
 from llm_driving.vector_encoder import VectorEncoderConfig
@@ -99,13 +102,17 @@ def save_checkpoint(
     torch.save(vars(model.encoder_config), config_path)
     logger.info(f"[save_checkpoint] Saved encoder config to {config_path}")
 
-    # Save LoRA adapter (peft's save method)
+    # Save LoRA adapter OR full T5 weights
     lora_dir = os.path.join(output_dir, "lora_adapter")
-    if hasattr(model.t5, "save_pretrained"):
+    if hasattr(model.t5, "save_pretrained") and hasattr(model.t5, "peft_config"):
+        # LoRA mode: save just the adapter
         model.t5.save_pretrained(lora_dir)
         logger.info(f"[save_checkpoint] Saved LoRA adapter to {lora_dir}")
     else:
-        logger.warning("[save_checkpoint] T5 model has no save_pretrained — LoRA not saved")
+        # Full fine-tune mode: save entire T5 state dict
+        t5_path = os.path.join(output_dir, "t5_model.pt")
+        torch.save(model.t5.state_dict(), t5_path)
+        logger.info(f"[save_checkpoint] Saved full T5 model to {t5_path}")
 
     # Save epoch info
     if epoch is not None:
@@ -143,8 +150,6 @@ def load_checkpoint(
     Returns:
         Fully loaded VectorPrefixT5 ready for inference or continued training
     """
-    from peft import PeftModel
-
     # Load encoder config
     config_path = os.path.join(checkpoint_dir, "encoder_config.pt")
     config_dict = torch.load(config_path, map_location=device, weights_only=True)
@@ -153,14 +158,22 @@ def load_checkpoint(
     # Create model
     model = VectorPrefixT5(model_name, encoder_config)
 
-    # Load LoRA adapter if exists
+    # Load LoRA adapter OR full T5 weights
     lora_dir = os.path.join(checkpoint_dir, "lora_adapter")
+    t5_path = os.path.join(checkpoint_dir, "t5_model.pt")
+
     if os.path.isdir(lora_dir) and apply_lora_config:
+        from peft import PeftModel
         model.t5 = PeftModel.from_pretrained(model.t5, lora_dir)
         logger.info(f"[load_checkpoint] Loaded LoRA adapter from {lora_dir}")
+    elif os.path.isfile(t5_path):
+        # Full fine-tune mode: load entire T5 state dict
+        state_dict = torch.load(t5_path, map_location=device, weights_only=True)
+        model.t5.load_state_dict(state_dict)
+        logger.info(f"[load_checkpoint] Loaded full T5 model from {t5_path}")
     elif apply_lora_config:
         # No saved adapter — apply fresh LoRA config
-        logger.info("[load_checkpoint] No saved LoRA adapter found, applying fresh LoRA config")
+        logger.info("[load_checkpoint] No saved weights found, applying fresh LoRA config")
         apply_lora(model, r=lora_r, alpha=lora_alpha, dropout=lora_dropout,
                    target_modules=lora_target_modules)
 

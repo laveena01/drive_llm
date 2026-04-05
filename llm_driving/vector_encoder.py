@@ -168,14 +168,18 @@ class VectorPrefixEncoder(nn.Module):
 
         # Reshape to (B, M * tokens_per_object, hidden_dim)
         object_prefix = expanded.reshape(B, self.object_prefix_len, self.cfg.hidden_dim)
-        object_prefix = self.expansion_norm(object_prefix)
 
         # --- Zero out prefix tokens for padded objects ---
         obj_indices = torch.arange(self.object_prefix_len, device=device).unsqueeze(0)
         obj_owner = obj_indices // self.tokens_per_object  # (1, object_prefix_len)
         n_expanded = num_obj_clamped.unsqueeze(1)  # (B, 1)
         token_mask = (obj_owner < n_expanded).unsqueeze(-1).float()  # (B, object_prefix_len, 1)
-        object_prefix = object_prefix * token_mask
+
+        # Apply LayerNorm only to valid tokens (avoids NaN from all-zero inputs)
+        # Then zero out padded slots
+        normed = self.expansion_norm(object_prefix)
+        normed = torch.nan_to_num(normed, nan=0.0)  # zero-object slots: LN(0)=NaN → 0
+        object_prefix = normed * token_mask
 
         # --- Append global context tokens ---
         if self.extra_tokens > 0:

@@ -69,13 +69,13 @@ VECTOR_ENCODER_CONFIG = dict(
     tokens_per_object=TOKENS_PER_OBJECT,  # 6
 )
 
-# Whether to freeze base FLAN-T5 weights and train only (LoRA + vector encoder)
-FREEZE_BASE_MODEL = True
+# Whether to freeze base FLAN-T5 weights (False = full fine-tuning, like the paper)
+FREEZE_BASE_MODEL = False
 
 # -----------------------------
 # LoRA (optional, PART-2)
 # -----------------------------
-USE_LORA = True
+USE_LORA = False
 LORA_R = 8
 LORA_ALPHA = 16
 LORA_DROPOUT = 0.05
@@ -88,14 +88,14 @@ LORA_TARGET_MODULES = ["q", "v"]
 # Stage 1: vector -> caption
 # -----------------------------
 STAGE1_EPOCHS = 25
-STAGE1_BATCH_SIZE = 4
+STAGE1_BATCH_SIZE = 2
 STAGE1_LR = 2e-5
 STAGE1_WEIGHT_DECAY = 0.0
 STAGE1_MAX_INPUT_LEN = 128
 STAGE1_MAX_TARGET_LEN = 256
 
-# Stage1 text prompt (vectors go via prefix)
-STAGE1_TEXT_PROMPT = "List each nearby object with its type, size, distance, direction, and speed."
+# Stage1 text prompt — minimal, forces decoder to rely on prefix embeddings
+STAGE1_TEXT_PROMPT = "Describe:"
 
 # -----------------------------
 # Stage 2: caption+question -> action
