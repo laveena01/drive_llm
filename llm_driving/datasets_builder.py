@@ -151,6 +151,8 @@ def _make_samples_from_frames(
         captioning_samples.append({
             "input": f"Describe the driving scene from object vectors:\n{vec_str}",
             "target": caption,
+            "vectors": frame["vectors"].tolist(),
+            "num_objects": int(use_n),
         })
 
         # --- metadata: min_dist ---
@@ -208,6 +210,8 @@ def _make_samples_from_frames(
                 "question": qa_question,
 
                 "vec_str": vec_str,
+                "vectors": frame["vectors"].tolist(),
+                "num_objects": int(use_n),
                 "oracle_caption_debug": caption,
                 "risk_text": risk_text,
                 "risk_level": str(getattr(risk_data, "risk_level", "UNKNOWN")),
@@ -244,6 +248,8 @@ def _make_samples_from_frames(
                 "question": qa_question,
 
                 "vec_str": vec_str,
+                "vectors": frame["vectors"].tolist(),
+                "num_objects": int(use_n),
                 "oracle_caption_debug": caption,
                 "risk_text": risk_text,
                 "risk_level": str(getattr(risk_data, "risk_level", "UNKNOWN")),

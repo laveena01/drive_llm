@@ -82,9 +82,22 @@ def main():
     logger.info(f"[MAIN] RUN_ID : {RUN_ID}")
     logger.info(f"[MAIN] RUN_DIR: {RUN_DIR}")
     logger.info("-" * 90)
+    logger.info(f"[MAIN] USE_VECTOR_PREFIX : {cfg.USE_VECTOR_PREFIX}")
+    logger.info(f"[MAIN] USE_LORA          : {cfg.USE_LORA}")
+    logger.info(f"[MAIN] FREEZE_BASE_MODEL : {cfg.FREEZE_BASE_MODEL}")
+    logger.info(f"[MAIN] PREFIX_LEN        : {cfg.PREFIX_LEN}")
     logger.info(f"[MAIN] Captioning dataset path : {CAPTIONING_DATA_PATH}")
     logger.info(f"[MAIN] QA dataset path         : {QA_DATA_PATH}")
     logger.info("=" * 90)
+
+    # Check peft is available if LoRA is enabled
+    if cfg.USE_LORA and cfg.USE_VECTOR_PREFIX:
+        try:
+            import peft
+            logger.info(f"[MAIN] peft version: {peft.__version__}")
+        except ImportError:
+            logger.error("[MAIN] peft is required for LoRA but not installed! Run: pip install peft")
+            raise
 
     _save_config_snapshot()
 

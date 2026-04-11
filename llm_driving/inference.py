@@ -5,8 +5,11 @@ import json
 import re
 from typing import Dict, List, Optional, Tuple
 
+import torch
 from datasets import Dataset
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+
+from . import config as cfg
 
 
 PAPER_FORMAT_INSTRUCTION = (
@@ -146,7 +149,6 @@ def _resolve_stage2_model_dir(run_dir_stage2: str) -> str:
             if name.startswith("checkpoint-"):
                 ckpt_dir = os.path.join(run_dir_stage2, name)
                 if os.path.exists(os.path.join(ckpt_dir, "config.json")):
-                    # parse global step
                     try:
                         step = int(name.split("-", 1)[1])
                     except Exception:
@@ -156,32 +158,92 @@ def _resolve_stage2_model_dir(run_dir_stage2: str) -> str:
             ckpts.sort(key=lambda x: x[0])
             return ckpts[-1][1]
 
-    # if we get here, path either doesn't exist or isn't a HF model folder
     raise FileNotFoundError(
         f"[INF] Could not find a loadable HF model at: {run_dir_stage2}\n"
         f"Expected config.json in stage2/ or stage2/checkpoint-*/"
     )
+
+
+# -------------------------------------------------------------------
+# Vector Prefix model loading
+# -------------------------------------------------------------------
+
+def _load_vector_prefix_model(stage1_dir: str, device: str = "cpu"):
+    """Load Stage-1 VectorPrefixT5 model for caption generation."""
+    from .vector_prefix_t5 import VectorPrefixT5
+
+    model = VectorPrefixT5.from_pretrained(stage1_dir, device=device)
+    model.eval()
+    return model
+
+
+def _load_stage2_model(model_dir: str, device: str = "cpu"):
+    """
+    Load Stage-2 model. Handles both standard T5 and LoRA adapter.
+    """
+    adapter_config_path = os.path.join(model_dir, "adapter_config.json")
+
+    if os.path.exists(adapter_config_path):
+        # LoRA adapter: load base model, then apply adapter
+        from peft import PeftModel
+
+        print(f"[INF] Loading LoRA adapter from: {model_dir}")
+        base_model = AutoModelForSeq2SeqLM.from_pretrained(model_dir, local_files_only=True)
+        model = PeftModel.from_pretrained(base_model, model_dir)
+        model = model.to(device)
+    else:
+        # Standard model
+        print(f"[INF] Loading standard model from: {model_dir}")
+        model = AutoModelForSeq2SeqLM.from_pretrained(model_dir, local_files_only=True)
+        model = model.to(device)
+
+    model.eval()
+    return model
+
+
+# -------------------------------------------------------------------
+# Main inference entry point
+# -------------------------------------------------------------------
 
 def run_inference_two_stage(
     run_dir_stage2: str,
     qa_path: str,
     out_path: Optional[str] = None,
     limit: Optional[int] = None,
+    run_dir_stage1: Optional[str] = None,
 ) -> Dict:
+    """
+    Two-stage inference.
+
+    If USE_VECTOR_PREFIX and run_dir_stage1 is provided, loads VectorPrefixT5
+    for caption generation. Otherwise uses text-only Stage 2 evaluation.
+    """
     # 1) resolve model dir robustly (root or latest checkpoint)
     model_dir = _resolve_stage2_model_dir(run_dir_stage2)
 
     print("[INF] Loading Stage-2 model from:", model_dir)
     tok2 = AutoTokenizer.from_pretrained(model_dir, local_files_only=True)
-    m2 = AutoModelForSeq2SeqLM.from_pretrained(model_dir, local_files_only=True)
 
-    if hasattr(m2, "cuda"):
-        try:
-            m2 = m2.cuda()
-        except Exception:
-            pass
+    device = "cpu"
+    try:
+        if torch.cuda.is_available():
+            device = "cuda"
+    except Exception:
+        pass
 
-    # 2) load QA data from the SAME run_dir you passed (no config mismatch)
+    m2 = _load_stage2_model(model_dir, device=device)
+
+    # Optionally load Stage-1 VectorPrefixT5 for caption generation
+    caption_model = None
+    use_vector_prefix = False
+
+    if run_dir_stage1 and os.path.exists(os.path.join(run_dir_stage1, "vector_encoder.pt")):
+        print("[INF] Loading VectorPrefixT5 from Stage-1 for caption generation...")
+        caption_model = _load_vector_prefix_model(run_dir_stage1, device=device)
+        use_vector_prefix = True
+        print("[INF] Vector prefix caption generation enabled.")
+
+    # 2) load QA data
     if not os.path.exists(qa_path):
         raise FileNotFoundError(f"[INF] QA file not found: {qa_path}")
 
@@ -237,6 +299,7 @@ def run_inference_two_stage(
         "predictions": preds,
         "model_dir_used": model_dir,
         "qa_path_used": qa_path,
+        "vector_prefix_enabled": use_vector_prefix,
     }
 
     if out_path is None:
