@@ -86,12 +86,17 @@ def main():
     logger.info(f"[MAIN] USE_LORA          : {cfg.USE_LORA}")
     logger.info(f"[MAIN] FREEZE_BASE_MODEL : {cfg.FREEZE_BASE_MODEL}")
     logger.info(f"[MAIN] PREFIX_LEN        : {cfg.PREFIX_LEN}")
+    if cfg.USE_VECTOR_PREFIX:
+        logger.info(f"[MAIN] TOKENS_PER_OBJECT : {cfg.TOKENS_PER_OBJECT}")
+        logger.info(f"[MAIN] NUM_OBJECT_TYPES  : {cfg.NUM_OBJECT_TYPES}")
+        logger.info(f"[MAIN] STAGE1_EPOCHS     : {cfg.STAGE1_EPOCHS}")
+        logger.info(f"[MAIN] STAGE1_TEXT_PROMPT : {cfg.STAGE1_TEXT_PROMPT!r}")
     logger.info(f"[MAIN] Captioning dataset path : {CAPTIONING_DATA_PATH}")
     logger.info(f"[MAIN] QA dataset path         : {QA_DATA_PATH}")
     logger.info("=" * 90)
 
     # Check peft is available if LoRA is enabled
-    if cfg.USE_LORA and cfg.USE_VECTOR_PREFIX:
+    if cfg.USE_LORA:
         try:
             import peft
             logger.info(f"[MAIN] peft version: {peft.__version__}")

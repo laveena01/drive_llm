@@ -10,6 +10,8 @@ Modules:
 - datasets_builder: builds captioning + driving QA datasets
 - training: training loops for Stage 1 (captioning) & Stage 2 (QA)
 - risk_calculator: multi-dimensional risk scoring with TTC and type weighting
-- vector_encoder: learned vector-to-prefix encoder
+- vector_encoder: learned vector-to-prefix encoder (per-object slot design)
 - vector_prefix_t5: VectorPrefixT5 wrapper model (vector prefix + T5)
+- data_collator: custom data collator for vector prefix training
+- lora_utils: LoRA integration and checkpoint save/load utilities
 """

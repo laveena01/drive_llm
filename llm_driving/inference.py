@@ -169,10 +169,32 @@ def _resolve_stage2_model_dir(run_dir_stage2: str) -> str:
 # -------------------------------------------------------------------
 
 def _load_vector_prefix_model(stage1_dir: str, device: str = "cpu"):
-    """Load Stage-1 VectorPrefixT5 model for caption generation."""
-    from .vector_prefix_t5 import VectorPrefixT5
+    """Load Stage-1 VectorPrefixT5 model from checkpoint."""
+    from .lora_utils import load_checkpoint
 
-    model = VectorPrefixT5.from_pretrained(stage1_dir, device=device)
+    # Prefer best_checkpoint, fallback to final_checkpoint
+    best_ckpt = os.path.join(stage1_dir, "best_checkpoint")
+    final_ckpt = os.path.join(stage1_dir, "final_checkpoint")
+
+    if os.path.isdir(best_ckpt) and os.path.exists(os.path.join(best_ckpt, "encoder_config.pt")):
+        ckpt_dir = best_ckpt
+    elif os.path.isdir(final_ckpt) and os.path.exists(os.path.join(final_ckpt, "encoder_config.pt")):
+        ckpt_dir = final_ckpt
+    elif os.path.exists(os.path.join(stage1_dir, "encoder_config.pt")):
+        ckpt_dir = stage1_dir
+    else:
+        raise FileNotFoundError(
+            f"[INF] Could not find vector prefix checkpoint in: {stage1_dir}\n"
+            f"Expected encoder_config.pt in stage1/, stage1/best_checkpoint/, or stage1/final_checkpoint/"
+        )
+
+    print(f"[INF] Loading VectorPrefixT5 from: {ckpt_dir}")
+    model = load_checkpoint(
+        model_name=cfg.MODEL_NAME,
+        checkpoint_dir=ckpt_dir,
+        device=device,
+        apply_lora_config=cfg.USE_LORA,
+    )
     model.eval()
     return model
 
@@ -215,8 +237,9 @@ def run_inference_two_stage(
     """
     Two-stage inference.
 
-    If USE_VECTOR_PREFIX and run_dir_stage1 is provided, loads VectorPrefixT5
-    for caption generation. Otherwise uses text-only Stage 2 evaluation.
+    If run_dir_stage1 is provided and contains vector prefix artifacts,
+    loads VectorPrefixT5 for caption generation. Otherwise uses text-only
+    Stage 2 evaluation.
     """
     # 1) resolve model dir robustly (root or latest checkpoint)
     model_dir = _resolve_stage2_model_dir(run_dir_stage2)
@@ -237,11 +260,14 @@ def run_inference_two_stage(
     caption_model = None
     use_vector_prefix = False
 
-    if run_dir_stage1 and os.path.exists(os.path.join(run_dir_stage1, "vector_encoder.pt")):
-        print("[INF] Loading VectorPrefixT5 from Stage-1 for caption generation...")
-        caption_model = _load_vector_prefix_model(run_dir_stage1, device=device)
-        use_vector_prefix = True
-        print("[INF] Vector prefix caption generation enabled.")
+    if run_dir_stage1:
+        try:
+            caption_model = _load_vector_prefix_model(run_dir_stage1, device=device)
+            use_vector_prefix = True
+            print("[INF] Vector prefix caption generation enabled.")
+        except FileNotFoundError as e:
+            print(f"[INF] No vector prefix checkpoint found: {e}")
+            print("[INF] Falling back to text-only inference.")
 
     # 2) load QA data
     if not os.path.exists(qa_path):

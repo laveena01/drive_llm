@@ -12,11 +12,13 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 from datasets import Dataset
+from torch.utils.data import DataLoader, Dataset as TorchDataset
 from transformers import (
     AutoModelForSeq2SeqLM,
     AutoTokenizer,
     Trainer,
     TrainingArguments,
+    get_linear_schedule_with_warmup,
 )
 
 from .config import (
@@ -308,7 +310,7 @@ def _print_eval_risk_summary(outputs: List[Dict], mode: str):
 
 
 # ---------------------------
-# Tokenization
+# Tokenization (text path)
 # ---------------------------
 
 def _tokenize_captioning(batch, tokenizer):
@@ -353,94 +355,20 @@ def _tokenize_qa(batch, tokenizer):
 
 
 # ===================================================================
-# Vector Prefix: tokenization, data collator, custom Trainer
+# Vector Prefix: Dataset wrapper for custom training loop
 # ===================================================================
 
-def _tokenize_captioning_prefix(batch, tokenizer):
-    """
-    For vector prefix Stage 1: text prompt is just the fixed instruction
-    (no vec_str). Vectors go through the learned encoder as prefix embeddings.
-    """
-    prompts = [cfg.STAGE1_TEXT_PROMPT] * len(batch["target"])
+class VectorPrefixDataset(TorchDataset):
+    """Wraps a list of sample dicts (from datasets_builder JSON) for DataLoader."""
 
-    model_inputs = tokenizer(
-        prompts,
-        truncation=True,
-        padding="max_length",
-        max_length=cfg.STAGE1_MAX_INPUT_LEN,
-    )
-    with tokenizer.as_target_tokenizer():
-        labels = tokenizer(
-            batch["target"],
-            truncation=True,
-            padding="max_length",
-            max_length=cfg.STAGE1_MAX_TARGET_LEN,
-        )["input_ids"]
+    def __init__(self, samples: List[Dict]):
+        self.samples = samples
 
-    pad_id = tokenizer.pad_token_id
-    labels = [[(tok if tok != pad_id else -100) for tok in seq] for seq in labels]
-    model_inputs["labels"] = labels
+    def __len__(self):
+        return len(self.samples)
 
-    # Pass through vector data (will be collated by VectorPrefixDataCollator)
-    model_inputs["vectors"] = batch["vectors"]
-    model_inputs["num_objects"] = batch["num_objects"]
-
-    return model_inputs
-
-
-@dataclass
-class VectorPrefixDataCollator:
-    """
-    Custom data collator that handles both standard text fields
-    and vector tensor fields for the VectorPrefixT5 model.
-    """
-    tokenizer: Any
-    pad_to_multiple_of: Optional[int] = None
-
-    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
-        # Separate vector fields from standard fields
-        vectors_list = [f.pop("vectors") for f in features]
-        num_objects_list = [f.pop("num_objects") for f in features]
-
-        # Standard collation for text fields (input_ids, attention_mask, labels)
-        batch: Dict[str, Any] = {}
-
-        # Manually stack tensor-like fields
-        first = features[0]
-        for key in first:
-            vals = [f[key] for f in features]
-            if isinstance(vals[0], list):
-                batch[key] = torch.tensor(vals, dtype=torch.long)
-            elif isinstance(vals[0], (int, float)):
-                batch[key] = torch.tensor(vals)
-            else:
-                batch[key] = vals
-
-        # Add vector tensors
-        batch["vectors"] = torch.tensor(vectors_list, dtype=torch.float32)
-        batch["num_objects"] = torch.tensor(num_objects_list, dtype=torch.long)
-
-        return batch
-
-
-class VectorPrefixTrainer(Trainer):
-    """
-    Custom Trainer that saves the vector encoder alongside the T5 model.
-    """
-
-    def save_model(self, output_dir: Optional[str] = None, _internal_call: bool = False):
-        output_dir = output_dir or self.args.output_dir
-        os.makedirs(output_dir, exist_ok=True)
-
-        # Use our custom save_pretrained which handles both T5 + vector encoder
-        if hasattr(self.model, "save_pretrained"):
-            self.model.save_pretrained(output_dir)
-        else:
-            super().save_model(output_dir, _internal_call=_internal_call)
-
-        # Also save tokenizer
-        if self.tokenizer is not None:
-            self.tokenizer.save_pretrained(output_dir)
+    def __getitem__(self, idx):
+        return self.samples[idx]
 
 
 # ---------------------------
@@ -548,16 +476,18 @@ def _train_stage1_text(captioning_path: str):
 
 
 # ---------------------------
-# Stage 1 training (vector prefix path)
+# Stage 1 training (vector prefix path — custom PyTorch loop)
 # ---------------------------
 
 def _train_stage1_prefix(captioning_path: str):
     """
     Vector Prefix Stage 1: vectors -> learned prefix embeddings -> T5 -> caption.
-    T5 is frozen; only the VectorPrefixEncoder is trained.
+    Uses custom PyTorch training loop with AdamW + linear warmup.
     """
-    from .vector_encoder import VectorEncoderConfig, VectorPrefixEncoder, parse_vec_str
+    from .vector_encoder import VectorEncoderConfig, parse_vec_str
     from .vector_prefix_t5 import VectorPrefixT5
+    from .data_collator import VectorPrefixDataCollator
+    from .lora_utils import apply_lora, save_checkpoint
 
     logger.info("\n" + "=" * 80)
     logger.info("[STAGE 1 - VECTOR PREFIX] Vector -> Caption training started.")
@@ -569,158 +499,269 @@ def _train_stage1_prefix(captioning_path: str):
     # Ensure vectors field exists (fallback: parse from input text)
     for sample in data:
         if "vectors" not in sample:
-            # Extract vec_str from input text (after the prompt line)
             input_text = sample["input"]
             vec_str = input_text.split("\n", 1)[1] if "\n" in input_text else ""
             vectors, n = parse_vec_str(vec_str, cfg.MAX_OBJECTS, cfg.VECTOR_DIM)
             sample["vectors"] = vectors.tolist()
             sample["num_objects"] = n
 
-    full_ds = Dataset.from_list(data)
-    logger.info(f"[STAGE 1] Total samples: {len(full_ds)}")
+    logger.info(f"[STAGE 1] Total samples: {len(data)}")
 
-    split_ds = full_ds.train_test_split(test_size=0.2, seed=42)
-    train_ds = split_ds["train"]
-    eval_ds = split_ds["test"]
-    logger.info(f"[STAGE 1] Train: {len(train_ds)} | Val: {len(eval_ds)}")
+    # Train/val split
+    torch.manual_seed(cfg.SEED)
+    n_val = max(1, int(len(data) * 0.2))
+    n_train = len(data) - n_val
+    indices = torch.randperm(len(data)).tolist()
+    train_samples = [data[i] for i in indices[:n_train]]
+    val_samples = [data[i] for i in indices[n_train:]]
+    logger.info(f"[STAGE 1] Train: {len(train_samples)} | Val: {len(val_samples)}")
 
-    # Load tokenizer
+    # Build model
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    encoder_config = VectorEncoderConfig(**cfg.VECTOR_ENCODER_CONFIG)
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 
-    # Load T5 model and freeze
-    logger.info(f"[STAGE 1] Loading base model: {MODEL_NAME}")
-    t5_model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME)
+    model = VectorPrefixT5(MODEL_NAME, encoder_config, tokenizer)
 
     if cfg.FREEZE_BASE_MODEL:
-        logger.info("[STAGE 1] Freezing base T5 model parameters.")
-        for param in t5_model.parameters():
-            param.requires_grad = False
+        model.freeze_t5_base()
 
-    # Create VectorPrefixEncoder
-    vec_cfg = VectorEncoderConfig(
-        max_objects=cfg.MAX_OBJECTS,
-        vector_dim=cfg.VECTOR_DIM,
-        hidden_dim=cfg.VEC_ENCODER_HIDDEN,
-        prefix_len=cfg.PREFIX_LEN,
-        t5_d_model=t5_model.config.d_model,
-        n_layers=cfg.VEC_ENCODER_LAYERS,
-        n_heads=cfg.VEC_ENCODER_HEADS,
-        dropout=cfg.VEC_ENCODER_DROPOUT,
-    )
-    vector_encoder = VectorPrefixEncoder(vec_cfg)
-    logger.info(f"[STAGE 1] VectorPrefixEncoder created: {sum(p.numel() for p in vector_encoder.parameters())} params")
+    if cfg.USE_LORA:
+        model = apply_lora(
+            model, r=cfg.LORA_R, alpha=cfg.LORA_ALPHA,
+            dropout=cfg.LORA_DROPOUT, target_modules=cfg.LORA_TARGET_MODULES,
+        )
 
-    # Wrap in VectorPrefixT5
-    model = VectorPrefixT5(t5_model, vector_encoder)
+    model.to(device)
 
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
     logger.info(f"[STAGE 1] Trainable params: {trainable:,} / {total:,} ({100*trainable/total:.2f}%)")
+    logger.info(f"[STAGE 1] use_lora: {cfg.USE_LORA}")
+    logger.info(f"[STAGE 1] freeze_base: {cfg.FREEZE_BASE_MODEL}")
+    logger.info(f"[STAGE 1] device: {device}")
 
-    # Tokenize datasets
-    def tokenize_fn(batch):
-        return _tokenize_captioning_prefix(batch, tokenizer)
+    # Override text input for Stage-1 (minimal prompt)
+    for s in train_samples:
+        s["input"] = cfg.STAGE1_TEXT_PROMPT
+    for s in val_samples:
+        s["input"] = cfg.STAGE1_TEXT_PROMPT
 
-    logger.info("[STAGE 1] Tokenizing datasets...")
-    # Keep vectors and num_objects columns (they are returned by the tokenizer fn)
-    tokenized_train = train_ds.map(tokenize_fn, batched=True, remove_columns=["input", "target"])
-    tokenized_eval = eval_ds.map(tokenize_fn, batched=True, remove_columns=["input", "target"])
+    # Data loaders
+    collator = VectorPrefixDataCollator(
+        tokenizer=tokenizer,
+        max_input_length=cfg.STAGE1_MAX_INPUT_LEN,
+        max_target_length=cfg.STAGE1_MAX_TARGET_LEN,
+        max_objects=cfg.MAX_OBJECTS,
+        vector_dim=cfg.VECTOR_DIM,
+    )
 
-    # Data collator
-    data_collator = VectorPrefixDataCollator(tokenizer=tokenizer)
+    train_loader = DataLoader(
+        VectorPrefixDataset(train_samples),
+        batch_size=cfg.STAGE1_BATCH_SIZE,
+        shuffle=True,
+        collate_fn=collator,
+    )
+    val_loader = DataLoader(
+        VectorPrefixDataset(val_samples),
+        batch_size=cfg.STAGE1_BATCH_SIZE,
+        shuffle=False,
+        collate_fn=collator,
+    )
+
+    # Optimizer + scheduler
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(trainable_params, lr=cfg.STAGE1_LR, weight_decay=0.0)
+    total_steps = len(train_loader) * cfg.STAGE1_EPOCHS
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=min(100, total_steps // 10),
+        num_training_steps=total_steps,
+    )
 
     _ensure_dir(STAGE1_OUTPUT_DIR)
     logger.info(f"[STAGE 1] Output directory: {STAGE1_OUTPUT_DIR}")
 
-    training_args = TrainingArguments(
-        output_dir=STAGE1_OUTPUT_DIR,
-        per_device_train_batch_size=cfg.STAGE1_BATCH_SIZE,
-        gradient_accumulation_steps=4,
-        num_train_epochs=cfg.STAGE1_EPOCHS,
-        fp16=False,
-        optim="adafactor",
-        learning_rate=cfg.STAGE1_LR,
-        max_grad_norm=1.0,
-        logging_steps=cfg.LOGGING_STEPS,
-        eval_strategy=cfg.EVAL_STRATEGY,
-        save_strategy=cfg.SAVE_STRATEGY,
-        save_total_limit=cfg.SAVE_TOTAL_LIMIT,
-        remove_unused_columns=False,  # CRITICAL: keep vectors/num_objects
-        disable_tqdm=cfg.DISABLE_TQDM,
-    )
+    # Training loop
+    best_val_loss = float("inf")
+    training_log = []
 
-    trainer = VectorPrefixTrainer(
-        model=model,
-        args=training_args,
-        train_dataset=tokenized_train,
-        eval_dataset=tokenized_eval,
-        tokenizer=tokenizer,
-        data_collator=data_collator,
-    )
+    for epoch in range(cfg.STAGE1_EPOCHS):
+        model.train()
+        epoch_loss = 0.0
+        n_batches = 0
 
-    logger.info("[STAGE 1] Starting training...")
-    trainer.train()
+        for step, batch in enumerate(train_loader):
+            vectors = batch["vectors"].to(device)
+            num_objects = batch["num_objects"].to(device)
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            labels = batch["labels"].to(device)
 
-    # Save final model
-    model.save_pretrained(STAGE1_OUTPUT_DIR)
-    tokenizer.save_pretrained(STAGE1_OUTPUT_DIR)
+            outputs = model(
+                vectors=vectors,
+                num_objects=num_objects,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                labels=labels,
+            )
+            loss = outputs.loss
 
-    logger.info("[STAGE 1] Training finished. Running evaluation...")
-    eval_metrics = trainer.evaluate()
-    logger.info(f"[STAGE 1] Eval metrics: {eval_metrics}")
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad()
 
+            epoch_loss += loss.item()
+            n_batches += 1
+
+            if (step + 1) % cfg.LOGGING_STEPS == 0 or step == 0:
+                logger.info(
+                    f"[Stage-1] Epoch {epoch+1}/{cfg.STAGE1_EPOCHS}, "
+                    f"Step {step+1}/{len(train_loader)}, "
+                    f"Loss: {loss.item():.4f}"
+                )
+
+        avg_train_loss = epoch_loss / max(n_batches, 1)
+
+        # Validation
+        val_loss, val_preds_text, val_refs_text = _validate_stage1_prefix(
+            model, val_loader, tokenizer, device
+        )
+
+        # Compute caption metrics
+        bleu1_val = _compute_bleu1_list(val_preds_text, val_refs_text)
+        rouge_l_val = _compute_rouge_l_list(val_preds_text, val_refs_text)
+
+        epoch_log = {
+            "epoch": epoch + 1,
+            "train_loss": avg_train_loss,
+            "val_loss": val_loss,
+            "bleu1": bleu1_val,
+            "rouge_l": rouge_l_val,
+        }
+        training_log.append(epoch_log)
+
+        logger.info(
+            f"[Stage-1] Epoch {epoch+1}/{cfg.STAGE1_EPOCHS} -- "
+            f"Train Loss: {avg_train_loss:.4f}, "
+            f"Val Loss: {val_loss:.4f}, "
+            f"BLEU-1: {bleu1_val:.4f}, "
+            f"ROUGE-L: {rouge_l_val:.4f}"
+        )
+
+        # Log sample predictions
+        if val_preds_text:
+            n_show = min(3, len(val_preds_text))
+            logger.info(f"[Stage-1] Sample predictions (epoch {epoch+1}):")
+            for i in range(n_show):
+                logger.info(f"  [pred] {val_preds_text[i][:200]}")
+                logger.info(f"  [ref]  {val_refs_text[i][:200]}")
+                logger.info("")
+
+        # Save best checkpoint
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            ckpt_dir = os.path.join(STAGE1_OUTPUT_DIR, "best_checkpoint")
+            save_checkpoint(model, ckpt_dir, epoch=epoch + 1)
+            logger.info(f"[Stage-1] Saved best checkpoint (val_loss={val_loss:.4f})")
+
+    # Save final checkpoint
+    final_dir = os.path.join(STAGE1_OUTPUT_DIR, "final_checkpoint")
+    save_checkpoint(model, final_dir, epoch=cfg.STAGE1_EPOCHS)
+
+    # Save training log
+    log_path = os.path.join(STAGE1_OUTPUT_DIR, "stage1_training_log.json")
+    with open(log_path, "w") as f:
+        json.dump(training_log, f, indent=2)
+    logger.info(f"[Stage-1] Training log saved to {log_path}")
+
+    # Save eval metrics
+    eval_metrics = {
+        "eval_loss": best_val_loss,
+        "bleu1": bleu1_val,
+        "rouge_l": rouge_l_val,
+    }
     metrics_path = os.path.join(STAGE1_OUTPUT_DIR, "eval_metrics.json")
     with open(metrics_path, "w") as f:
         json.dump(eval_metrics, f, indent=2)
 
-    # Generate validation predictions
-    logger.info("[STAGE 1] Generating predictions on validation set...")
-    model.eval()
-    device = model.device
-    val_preds = []
-
-    for i, sample in enumerate(eval_ds):
-        gt_text = sample["target"]
-        try:
-            vectors_t = torch.tensor([sample["vectors"]], dtype=torch.float32).to(device)
-            num_obj_t = torch.tensor([sample["num_objects"]], dtype=torch.long).to(device)
-
-            text_inputs = tokenizer(
-                cfg.STAGE1_TEXT_PROMPT,
-                return_tensors="pt",
-                max_length=cfg.STAGE1_MAX_INPUT_LEN,
-                truncation=True,
-            ).to(device)
-
-            pred_ids = model.generate(
-                input_ids=text_inputs["input_ids"],
-                attention_mask=text_inputs["attention_mask"],
-                vectors=vectors_t,
-                num_objects=num_obj_t,
-                max_new_tokens=cfg.GEN_MAX_NEW_TOKENS_STAGE1,
-                num_beams=cfg.GEN_NUM_BEAMS,
-                early_stopping=cfg.GEN_EARLY_STOPPING,
-                no_repeat_ngram_size=cfg.GEN_NO_REPEAT_NGRAM_SIZE,
-                repetition_penalty=cfg.GEN_REPETITION_PENALTY,
-            )
-            pred_text = tokenizer.decode(pred_ids[0], skip_special_tokens=True)
-        except Exception:
-            logger.exception(f"[STAGE 1] Generation failed on val sample idx={i}.")
-            pred_text = ""
-
-        val_preds.append({
-            "input": sample.get("input", cfg.STAGE1_TEXT_PROMPT),
-            "ground_truth": gt_text,
-            "prediction": pred_text,
-        })
-
-    preds_path = os.path.join(STAGE1_OUTPUT_DIR, "val_predictions.json")
-    with open(preds_path, "w") as f:
-        json.dump(val_preds, f, indent=2)
-    logger.info(f"[STAGE 1] Saved {len(val_preds)} validation predictions to {preds_path}")
+    # Save sample predictions
+    pred_path = os.path.join(STAGE1_OUTPUT_DIR, "val_predictions.json")
+    preds_data = [
+        {"prediction": p, "ground_truth": r}
+        for p, r in zip(val_preds_text, val_refs_text)
+    ]
+    with open(pred_path, "w") as f:
+        json.dump(preds_data, f, indent=2)
+    logger.info(f"[STAGE 1] Saved {len(preds_data)} validation predictions to {pred_path}")
 
     logger.info("[STAGE 1] Done.\n" + "=" * 80)
     return model, tokenizer
+
+
+def _validate_stage1_prefix(model, val_loader, tokenizer, device):
+    """Run validation: compute loss + generate captions."""
+    model.eval()
+    total_loss = 0.0
+    n_batches = 0
+    all_preds = []
+    all_refs = []
+
+    with torch.no_grad():
+        for batch in val_loader:
+            vectors = batch["vectors"].to(device)
+            num_objects = batch["num_objects"].to(device)
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            labels = batch["labels"].to(device)
+
+            # Loss
+            outputs = model(
+                vectors=vectors,
+                num_objects=num_objects,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                labels=labels,
+            )
+            total_loss += outputs.loss.item()
+            n_batches += 1
+
+            # Generate
+            gen_ids = model.generate(
+                vectors=vectors,
+                num_objects=num_objects,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=cfg.GEN_MAX_NEW_TOKENS_STAGE1,
+                num_beams=cfg.GEN_NUM_BEAMS,
+            )
+            preds = tokenizer.batch_decode(gen_ids, skip_special_tokens=True)
+            all_preds.extend(preds)
+
+            # Decode references (replace -100 with pad_token_id)
+            ref_ids = labels.clone()
+            ref_ids[ref_ids == -100] = tokenizer.pad_token_id
+            refs = tokenizer.batch_decode(ref_ids, skip_special_tokens=True)
+            all_refs.extend(refs)
+
+    avg_loss = total_loss / max(n_batches, 1)
+    return avg_loss, all_preds, all_refs
+
+
+def _compute_bleu1_list(predictions: List[str], references: List[str]) -> float:
+    if not predictions:
+        return 0.0
+    scores = [bleu1(p, r) for p, r in zip(predictions, references)]
+    return sum(scores) / len(scores)
+
+
+def _compute_rouge_l_list(predictions: List[str], references: List[str]) -> float:
+    if not predictions:
+        return 0.0
+    scores = [rouge_l_f1(p, r) for p, r in zip(predictions, references)]
+    return sum(scores) / len(scores)
 
 
 # ---------------------------
@@ -982,19 +1023,19 @@ def _train_stage2_text(model_stage1, tokenizer, qa_path: str):
 
 
 # ---------------------------
-# Stage 2 training (vector prefix + LoRA path)
+# Stage 2 training (vector prefix path)
 # ---------------------------
 
 def _train_stage2_with_lora(model_stage1, tokenizer, qa_path: str):
     """
-    Stage 2 with LoRA. Text-only Stage 2 (Option A).
+    Stage 2: text-only QA training (caption + risk + question -> answer).
     model_stage1 is VectorPrefixT5; extract T5 for Stage 2, keep full model for caption gen.
     """
     from .vector_prefix_t5 import VectorPrefixT5
     from .vector_encoder import parse_vec_str
 
     logger.info("\n" + "=" * 80)
-    logger.info("[STAGE 2 - LORA] Driving QA finetuning started.")
+    logger.info("[STAGE 2 - PREFIX] Driving QA finetuning started.")
     logger.info(f"[STAGE 2] Loading QA data from: {qa_path}")
 
     # Keep full VectorPrefixT5 for caption generation in eval
@@ -1007,11 +1048,11 @@ def _train_stage2_with_lora(model_stage1, tokenizer, qa_path: str):
     else:
         t5_base = copy.deepcopy(model_stage1)
 
-    # Unfreeze T5 for Stage 2 (LoRA will selectively control trainability)
+    # Unfreeze T5 for Stage 2
     for param in t5_base.parameters():
         param.requires_grad = False
 
-    # Apply LoRA
+    # Apply LoRA if enabled
     if cfg.USE_LORA:
         from peft import LoraConfig, get_peft_model, TaskType
 
@@ -1101,10 +1142,10 @@ def _train_stage2_with_lora(model_stage1, tokenizer, qa_path: str):
         pred_ids = model_stage2.generate(
             **inputs,
             max_new_tokens=max_new_tokens,
-            num_beams=4,
-            early_stopping=True,
-            no_repeat_ngram_size=3,
-            repetition_penalty=1.2,
+            num_beams=cfg.GEN_NUM_BEAMS,
+            early_stopping=cfg.GEN_EARLY_STOPPING,
+            no_repeat_ngram_size=cfg.GEN_NO_REPEAT_NGRAM_SIZE,
+            repetition_penalty=cfg.GEN_REPETITION_PENALTY,
         )
         return tokenizer.decode(pred_ids[0], skip_special_tokens=True)
 
@@ -1133,10 +1174,10 @@ def _train_stage2_with_lora(model_stage1, tokenizer, qa_path: str):
         ).to(cap_device)
 
         pred_ids = caption_model.generate(
-            input_ids=text_inputs["input_ids"],
-            attention_mask=text_inputs["attention_mask"],
             vectors=vectors_t,
             num_objects=num_obj_t,
+            input_ids=text_inputs["input_ids"],
+            attention_mask=text_inputs["attention_mask"],
             max_new_tokens=cfg.GEN_MAX_NEW_TOKENS_STAGE1,
             num_beams=cfg.GEN_NUM_BEAMS,
             early_stopping=cfg.GEN_EARLY_STOPPING,
@@ -1184,7 +1225,7 @@ def _train_stage2_with_lora(model_stage1, tokenizer, qa_path: str):
 
                 pred_raw = _gen_text_s2(
                     stage2_prompt,
-                    max_new_tokens=90,
+                    max_new_tokens=cfg.GEN_MAX_NEW_TOKENS_STAGE2,
                     ensure_paper=(qtype == "action"),
                 )
 
