@@ -483,15 +483,20 @@ def _train_stage1_prefix(captioning_path: str):
     """
     Vector Prefix Stage 1: vectors -> learned prefix embeddings -> T5 -> caption.
     Uses custom PyTorch training loop with AdamW + linear warmup.
+    Supports multi-GPU via HuggingFace Accelerate.
     """
+    from accelerate import Accelerator
     from .vector_encoder import VectorEncoderConfig, parse_vec_str
     from .vector_prefix_t5 import VectorPrefixT5
     from .data_collator import VectorPrefixDataCollator
     from .lora_utils import apply_lora, save_checkpoint
 
+    accelerator = Accelerator()
+
     logger.info("\n" + "=" * 80)
     logger.info("[STAGE 1 - VECTOR PREFIX] Vector -> Caption training started.")
     logger.info(f"[STAGE 1] Loading captioning data from: {captioning_path}")
+    logger.info(f"[STAGE 1] Accelerate: {accelerator.num_processes} process(es), device={accelerator.device}")
 
     with open(captioning_path, "r") as f:
         data = json.load(f)
@@ -507,7 +512,7 @@ def _train_stage1_prefix(captioning_path: str):
 
     logger.info(f"[STAGE 1] Total samples: {len(data)}")
 
-    # Train/val split
+    # Train/val split (deterministic across all processes)
     torch.manual_seed(cfg.SEED)
     n_val = max(1, int(len(data) * 0.2))
     n_train = len(data) - n_val
@@ -517,7 +522,6 @@ def _train_stage1_prefix(captioning_path: str):
     logger.info(f"[STAGE 1] Train: {len(train_samples)} | Val: {len(val_samples)}")
 
     # Build model
-    device = "cuda" if torch.cuda.is_available() else "cpu"
     encoder_config = VectorEncoderConfig(**cfg.VECTOR_ENCODER_CONFIG)
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 
@@ -532,14 +536,11 @@ def _train_stage1_prefix(captioning_path: str):
             dropout=cfg.LORA_DROPOUT, target_modules=cfg.LORA_TARGET_MODULES,
         )
 
-    model.to(device)
-
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
     logger.info(f"[STAGE 1] Trainable params: {trainable:,} / {total:,} ({100*trainable/total:.2f}%)")
     logger.info(f"[STAGE 1] use_lora: {cfg.USE_LORA}")
     logger.info(f"[STAGE 1] freeze_base: {cfg.FREEZE_BASE_MODEL}")
-    logger.info(f"[STAGE 1] device: {device}")
 
     # Override text input for Stage-1 (minimal prompt)
     for s in train_samples:
@@ -562,6 +563,7 @@ def _train_stage1_prefix(captioning_path: str):
         shuffle=True,
         collate_fn=collator,
     )
+    # val_loader is NOT prepared by Accelerate — runs on main process only
     val_loader = DataLoader(
         VectorPrefixDataset(val_samples),
         batch_size=cfg.STAGE1_BATCH_SIZE,
@@ -569,9 +571,14 @@ def _train_stage1_prefix(captioning_path: str):
         collate_fn=collator,
     )
 
-    # Optimizer + scheduler
+    # Optimizer (created before accelerator.prepare)
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable_params, lr=cfg.STAGE1_LR, weight_decay=0.0)
+
+    # Accelerate: wrap model, optimizer, train_loader (handles DDP + device placement)
+    model, optimizer, train_loader = accelerator.prepare(model, optimizer, train_loader)
+
+    # Scheduler (created after prepare — len(train_loader) is now per-process correct)
     total_steps = len(train_loader) * cfg.STAGE1_EPOCHS
     scheduler = get_linear_schedule_with_warmup(
         optimizer,
@@ -592,11 +599,12 @@ def _train_stage1_prefix(captioning_path: str):
         n_batches = 0
 
         for step, batch in enumerate(train_loader):
-            vectors = batch["vectors"].to(device)
-            num_objects = batch["num_objects"].to(device)
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            labels = batch["labels"].to(device)
+            # Accelerate's prepared loader places tensors on the correct device
+            vectors = batch["vectors"]
+            num_objects = batch["num_objects"]
+            input_ids = batch["input_ids"]
+            attention_mask = batch["attention_mask"]
+            labels = batch["labels"]
 
             outputs = model(
                 vectors=vectors,
@@ -607,8 +615,9 @@ def _train_stage1_prefix(captioning_path: str):
             )
             loss = outputs.loss
 
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
+            accelerator.backward(loss)
+            if accelerator.sync_gradients:
+                accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad()
@@ -616,7 +625,7 @@ def _train_stage1_prefix(captioning_path: str):
             epoch_loss += loss.item()
             n_batches += 1
 
-            if (step + 1) % cfg.LOGGING_STEPS == 0 or step == 0:
+            if accelerator.is_main_process and ((step + 1) % cfg.LOGGING_STEPS == 0 or step == 0):
                 logger.info(
                     f"[Stage-1] Epoch {epoch+1}/{cfg.STAGE1_EPOCHS}, "
                     f"Step {step+1}/{len(train_loader)}, "
@@ -625,80 +634,95 @@ def _train_stage1_prefix(captioning_path: str):
 
         avg_train_loss = epoch_loss / max(n_batches, 1)
 
-        # Validation
-        val_loss, val_preds_text, val_refs_text = _validate_stage1_prefix(
-            model, val_loader, tokenizer, device
-        )
+        # Validation — main process only, using unwrapped model
+        val_loss = 0.0
+        val_preds_text = []
+        val_refs_text = []
+        bleu1_val = 0.0
+        rouge_l_val = 0.0
 
-        # Compute caption metrics
-        bleu1_val = _compute_bleu1_list(val_preds_text, val_refs_text)
-        rouge_l_val = _compute_rouge_l_list(val_preds_text, val_refs_text)
+        if accelerator.is_main_process:
+            unwrapped = accelerator.unwrap_model(model)
+            val_loss, val_preds_text, val_refs_text = _validate_stage1_prefix(
+                unwrapped, val_loader, tokenizer, accelerator.device
+            )
 
-        epoch_log = {
-            "epoch": epoch + 1,
-            "train_loss": avg_train_loss,
-            "val_loss": val_loss,
+            # Compute caption metrics
+            bleu1_val = _compute_bleu1_list(val_preds_text, val_refs_text)
+            rouge_l_val = _compute_rouge_l_list(val_preds_text, val_refs_text)
+
+            epoch_log = {
+                "epoch": epoch + 1,
+                "train_loss": avg_train_loss,
+                "val_loss": val_loss,
+                "bleu1": bleu1_val,
+                "rouge_l": rouge_l_val,
+            }
+            training_log.append(epoch_log)
+
+            logger.info(
+                f"[Stage-1] Epoch {epoch+1}/{cfg.STAGE1_EPOCHS} -- "
+                f"Train Loss: {avg_train_loss:.4f}, "
+                f"Val Loss: {val_loss:.4f}, "
+                f"BLEU-1: {bleu1_val:.4f}, "
+                f"ROUGE-L: {rouge_l_val:.4f}"
+            )
+
+            # Log sample predictions
+            if val_preds_text:
+                n_show = min(3, len(val_preds_text))
+                logger.info(f"[Stage-1] Sample predictions (epoch {epoch+1}):")
+                for i in range(n_show):
+                    logger.info(f"  [pred] {val_preds_text[i][:200]}")
+                    logger.info(f"  [ref]  {val_refs_text[i][:200]}")
+                    logger.info("")
+
+            # Save best checkpoint
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                ckpt_dir = os.path.join(STAGE1_OUTPUT_DIR, "best_checkpoint")
+                save_checkpoint(unwrapped, ckpt_dir, epoch=epoch + 1)
+                logger.info(f"[Stage-1] Saved best checkpoint (val_loss={val_loss:.4f})")
+
+        # Sync all processes before next epoch
+        accelerator.wait_for_everyone()
+
+    # Save final checkpoint + logs (main process only)
+    if accelerator.is_main_process:
+        unwrapped = accelerator.unwrap_model(model)
+
+        final_dir = os.path.join(STAGE1_OUTPUT_DIR, "final_checkpoint")
+        save_checkpoint(unwrapped, final_dir, epoch=cfg.STAGE1_EPOCHS)
+
+        # Save training log
+        log_path = os.path.join(STAGE1_OUTPUT_DIR, "stage1_training_log.json")
+        with open(log_path, "w") as f:
+            json.dump(training_log, f, indent=2)
+        logger.info(f"[Stage-1] Training log saved to {log_path}")
+
+        # Save eval metrics
+        eval_metrics = {
+            "eval_loss": best_val_loss,
             "bleu1": bleu1_val,
             "rouge_l": rouge_l_val,
         }
-        training_log.append(epoch_log)
+        metrics_path = os.path.join(STAGE1_OUTPUT_DIR, "eval_metrics.json")
+        with open(metrics_path, "w") as f:
+            json.dump(eval_metrics, f, indent=2)
 
-        logger.info(
-            f"[Stage-1] Epoch {epoch+1}/{cfg.STAGE1_EPOCHS} -- "
-            f"Train Loss: {avg_train_loss:.4f}, "
-            f"Val Loss: {val_loss:.4f}, "
-            f"BLEU-1: {bleu1_val:.4f}, "
-            f"ROUGE-L: {rouge_l_val:.4f}"
-        )
+        # Save sample predictions
+        pred_path = os.path.join(STAGE1_OUTPUT_DIR, "val_predictions.json")
+        preds_data = [
+            {"prediction": p, "ground_truth": r}
+            for p, r in zip(val_preds_text, val_refs_text)
+        ]
+        with open(pred_path, "w") as f:
+            json.dump(preds_data, f, indent=2)
+        logger.info(f"[STAGE 1] Saved {len(preds_data)} validation predictions to {pred_path}")
 
-        # Log sample predictions
-        if val_preds_text:
-            n_show = min(3, len(val_preds_text))
-            logger.info(f"[Stage-1] Sample predictions (epoch {epoch+1}):")
-            for i in range(n_show):
-                logger.info(f"  [pred] {val_preds_text[i][:200]}")
-                logger.info(f"  [ref]  {val_refs_text[i][:200]}")
-                logger.info("")
-
-        # Save best checkpoint
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            ckpt_dir = os.path.join(STAGE1_OUTPUT_DIR, "best_checkpoint")
-            save_checkpoint(model, ckpt_dir, epoch=epoch + 1)
-            logger.info(f"[Stage-1] Saved best checkpoint (val_loss={val_loss:.4f})")
-
-    # Save final checkpoint
-    final_dir = os.path.join(STAGE1_OUTPUT_DIR, "final_checkpoint")
-    save_checkpoint(model, final_dir, epoch=cfg.STAGE1_EPOCHS)
-
-    # Save training log
-    log_path = os.path.join(STAGE1_OUTPUT_DIR, "stage1_training_log.json")
-    with open(log_path, "w") as f:
-        json.dump(training_log, f, indent=2)
-    logger.info(f"[Stage-1] Training log saved to {log_path}")
-
-    # Save eval metrics
-    eval_metrics = {
-        "eval_loss": best_val_loss,
-        "bleu1": bleu1_val,
-        "rouge_l": rouge_l_val,
-    }
-    metrics_path = os.path.join(STAGE1_OUTPUT_DIR, "eval_metrics.json")
-    with open(metrics_path, "w") as f:
-        json.dump(eval_metrics, f, indent=2)
-
-    # Save sample predictions
-    pred_path = os.path.join(STAGE1_OUTPUT_DIR, "val_predictions.json")
-    preds_data = [
-        {"prediction": p, "ground_truth": r}
-        for p, r in zip(val_preds_text, val_refs_text)
-    ]
-    with open(pred_path, "w") as f:
-        json.dump(preds_data, f, indent=2)
-    logger.info(f"[STAGE 1] Saved {len(preds_data)} validation predictions to {pred_path}")
-
+    accelerator.wait_for_everyone()
     logger.info("[STAGE 1] Done.\n" + "=" * 80)
-    return model, tokenizer
+    return accelerator.unwrap_model(model), tokenizer
 
 
 def _validate_stage1_prefix(model, val_loader, tokenizer, device):
@@ -1314,39 +1338,41 @@ def _train_stage2_with_lora(model_stage1, tokenizer, qa_path: str):
         }
         return metrics, outputs
 
-    logger.info("[STAGE 2] Computing metrics: oracle_caption...")
-    oracle_metrics, oracle_outputs = run_eval("oracle_caption")
-    logger.info(f"[STAGE 2] oracle_caption metrics: {oracle_metrics}")
-    _print_eval_risk_summary(oracle_outputs, "oracle_caption")
+    # Run evaluation only on main process (avoids duplicate work in multi-GPU)
+    if not hasattr(trainer, 'is_world_process_zero') or trainer.is_world_process_zero():
+        logger.info("[STAGE 2] Computing metrics: oracle_caption...")
+        oracle_metrics, oracle_outputs = run_eval("oracle_caption")
+        logger.info(f"[STAGE 2] oracle_caption metrics: {oracle_metrics}")
+        _print_eval_risk_summary(oracle_outputs, "oracle_caption")
 
-    logger.info("[STAGE 2] Computing metrics: stage1_caption...")
-    stage1_metrics, stage1_outputs = run_eval("stage1_caption")
-    logger.info(f"[STAGE 2] stage1_caption metrics: {stage1_metrics}")
-    _print_eval_risk_summary(stage1_outputs, "stage1_caption")
+        logger.info("[STAGE 2] Computing metrics: stage1_caption...")
+        stage1_metrics, stage1_outputs = run_eval("stage1_caption")
+        logger.info(f"[STAGE 2] stage1_caption metrics: {stage1_metrics}")
+        _print_eval_risk_summary(stage1_outputs, "stage1_caption")
 
-    eval_metrics: Dict = {}
-    if isinstance(raw_eval, dict):
-        for k, v in raw_eval.items():
-            try:
-                eval_metrics[k] = float(v)
-            except Exception:
-                eval_metrics[k] = v
+        eval_metrics: Dict = {}
+        if isinstance(raw_eval, dict):
+            for k, v in raw_eval.items():
+                try:
+                    eval_metrics[k] = float(v)
+                except Exception:
+                    eval_metrics[k] = v
 
-    eval_metrics["oracle_caption"] = oracle_metrics
-    eval_metrics["stage1_caption"] = stage1_metrics
+        eval_metrics["oracle_caption"] = oracle_metrics
+        eval_metrics["stage1_caption"] = stage1_metrics
 
-    metrics_path = os.path.join(STAGE2_OUTPUT_DIR, "eval_metrics.json")
-    with open(metrics_path, "w") as f:
-        json.dump(eval_metrics, f, indent=2)
-    logger.info(f"[STAGE 2] Saved eval metrics to {metrics_path}")
+        metrics_path = os.path.join(STAGE2_OUTPUT_DIR, "eval_metrics.json")
+        with open(metrics_path, "w") as f:
+            json.dump(eval_metrics, f, indent=2)
+        logger.info(f"[STAGE 2] Saved eval metrics to {metrics_path}")
 
-    preds_path1 = os.path.join(STAGE2_OUTPUT_DIR, "val_predictions_oracle_caption.json")
-    with open(preds_path1, "w") as f:
-        json.dump(oracle_outputs, f, indent=2)
+        preds_path1 = os.path.join(STAGE2_OUTPUT_DIR, "val_predictions_oracle_caption.json")
+        with open(preds_path1, "w") as f:
+            json.dump(oracle_outputs, f, indent=2)
 
-    preds_path2 = os.path.join(STAGE2_OUTPUT_DIR, "val_predictions_stage1_caption.json")
-    with open(preds_path2, "w") as f:
-        json.dump(stage1_outputs, f, indent=2)
+        preds_path2 = os.path.join(STAGE2_OUTPUT_DIR, "val_predictions_stage1_caption.json")
+        with open(preds_path2, "w") as f:
+            json.dump(stage1_outputs, f, indent=2)
 
     logger.info("[STAGE 2] Done.\n" + "=" * 80)
     return model_stage2

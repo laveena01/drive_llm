@@ -106,22 +106,30 @@ def main():
 
     _save_config_snapshot()
 
-    # 1) Build datasets using all scenes in nuScenes-mini
-    logger.info("\n[MAIN] Step 1/3: Building datasets from nuScenes-mini...")
+    # 1) Build datasets using all scenes in nuScenes
+    # Guard to main process only (avoids redundant nuScenes loading in multi-GPU)
+    from accelerate import PartialState
+    state = PartialState()
 
-    if os.path.exists(CAPTIONING_DATA_PATH) and os.path.exists(QA_DATA_PATH):
-        logger.info("[MAIN] Found existing dataset JSONs. Skipping dataset building.")
-    else:
-        captioning_samples, qa_samples = build_datasets_full_mini(
-            max_frames_per_scene=None,
-            captioning_path=CAPTIONING_DATA_PATH,
-            qa_path=QA_DATA_PATH,
-        )
-        logger.info(
-            f"[MAIN] Step 1/3 DONE: "
-            f"{len(captioning_samples)} captioning samples, "
-            f"{len(qa_samples)} QA samples."
-        )
+    logger.info("\n[MAIN] Step 1/3: Building datasets from nuScenes...")
+
+    if state.is_main_process:
+        if os.path.exists(CAPTIONING_DATA_PATH) and os.path.exists(QA_DATA_PATH):
+            logger.info("[MAIN] Found existing dataset JSONs. Skipping dataset building.")
+        else:
+            captioning_samples, qa_samples = build_datasets_full_mini(
+                max_frames_per_scene=None,
+                captioning_path=CAPTIONING_DATA_PATH,
+                qa_path=QA_DATA_PATH,
+            )
+            logger.info(
+                f"[MAIN] Step 1/3 DONE: "
+                f"{len(captioning_samples)} captioning samples, "
+                f"{len(qa_samples)} QA samples."
+            )
+
+    # Ensure dataset files exist before other processes continue
+    state.wait_for_everyone()
 
     # 2) Stage 1: Vector -> Caption pretraining
     logger.info("\n[MAIN] Step 2/3: Training Stage 1 (vector → caption)...")
