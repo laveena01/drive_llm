@@ -485,13 +485,17 @@ def _train_stage1_prefix(captioning_path: str):
     Uses custom PyTorch training loop with AdamW + linear warmup.
     Supports multi-GPU via HuggingFace Accelerate.
     """
-    from accelerate import Accelerator
+    import datetime
+    from accelerate import Accelerator, InitProcessGroupKwargs
     from .vector_encoder import VectorEncoderConfig, parse_vec_str
     from .vector_prefix_t5 import VectorPrefixT5
     from .data_collator import VectorPrefixDataCollator
     from .lora_utils import apply_lora, save_checkpoint
 
-    accelerator = Accelerator()
+    # accelerator = Accelerator()
+    accelerator = Accelerator(
+        kwargs_handlers=[InitProcessGroupKwargs(timeout=datetime.timedelta(hours=2))]
+    )
 
     logger.info("\n" + "=" * 80)
     logger.info("[STAGE 1 - VECTOR PREFIX] Vector -> Caption training started.")
@@ -641,7 +645,8 @@ def _train_stage1_prefix(captioning_path: str):
         bleu1_val = 0.0
         rouge_l_val = 0.0
 
-        if accelerator.is_main_process:
+        should_validate = (accelerator.num_processes == 1) or ((epoch + 1) == cfg.STAGE1_EPOCHS)
+        if accelerator.is_main_process and should_validate:
             unwrapped = accelerator.unwrap_model(model)
             val_loss, val_preds_text, val_refs_text = _validate_stage1_prefix(
                 unwrapped, val_loader, tokenizer, accelerator.device
@@ -683,6 +688,14 @@ def _train_stage1_prefix(captioning_path: str):
                 ckpt_dir = os.path.join(STAGE1_OUTPUT_DIR, "best_checkpoint")
                 save_checkpoint(unwrapped, ckpt_dir, epoch=epoch + 1)
                 logger.info(f"[Stage-1] Saved best checkpoint (val_loss={val_loss:.4f})")
+            elif accelerator.is_main_process:
+            # Multi-GPU mid-training: save by train loss as proxy
+                if avg_train_loss < best_val_loss:
+                    best_val_loss = avg_train_loss
+                    unwrapped = accelerator.unwrap_model(model)
+                    ckpt_dir = os.path.join(STAGE1_OUTPUT_DIR, "best_checkpoint")
+                    save_checkpoint(unwrapped, ckpt_dir, epoch=epoch + 1)
+                    logger.info(f"[Stage-1] Saved best checkpoint (train_loss={avg_train_loss:.4f})")
 
         # Sync all processes before next epoch
         accelerator.wait_for_everyone()

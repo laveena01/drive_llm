@@ -7,8 +7,11 @@ from datetime import datetime
 # -----------------------------
 # nuScenes
 # -----------------------------
-NUSC_ROOT = "/u/student/2021/cs21resch15003/nuscenes"
-NUSC_VERSION = "v1.0-mini"          # later: "v1.0-trainval"
+# NUSC_ROOT = "/u/student/2021/cs21resch15003/nuscenes"
+# NUSC_VERSION = "v1.0-mini"          # later: "v1.0-trainval"
+
+NUSC_ROOT = "/u/student/2021/cs21resch15003/data/nuscenes"
+NUSC_VERSION = "v1.0-trainval"
 
 # -----------------------------
 # vectors
@@ -87,8 +90,8 @@ LORA_TARGET_MODULES = ["q", "v"]
 # -----------------------------
 # Stage 1: vector -> caption
 # -----------------------------
-STAGE1_EPOCHS = 25
-STAGE1_BATCH_SIZE = 2
+STAGE1_EPOCHS = 10
+STAGE1_BATCH_SIZE = 4
 STAGE1_LR = 2e-5
 STAGE1_WEIGHT_DECAY = 0.0
 STAGE1_MAX_INPUT_LEN = 128
@@ -101,7 +104,7 @@ STAGE1_TEXT_PROMPT = "Describe:"
 # Stage 2: caption+question -> action
 # -----------------------------
 STAGE2_EPOCHS = 8
-STAGE2_BATCH_SIZE = 2
+STAGE2_BATCH_SIZE = 4
 STAGE2_LR = 2e-5
 STAGE2_WEIGHT_DECAY = 0.0
 STAGE2_MAX_INPUT_LEN = 192
