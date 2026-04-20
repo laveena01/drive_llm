@@ -645,16 +645,21 @@ def _train_stage1_prefix(captioning_path: str):
         bleu1_val = 0.0
         rouge_l_val = 0.0
 
-        should_validate = (accelerator.num_processes == 1) or ((epoch + 1) == cfg.STAGE1_EPOCHS)
-        if accelerator.is_main_process and should_validate:
+        # In multi-GPU mode: always validate (val loss is fast), but skip beam search
+        # generation (slow — causes NCCL watchdog timeout). BLEU/ROUGE = None in logs.
+        # In single-GPU mode: full validation including generation every epoch.
+        run_generation = (accelerator.num_processes == 1)
+
+        if accelerator.is_main_process:
             unwrapped = accelerator.unwrap_model(model)
             val_loss, val_preds_text, val_refs_text = _validate_stage1_prefix(
-                unwrapped, val_loader, tokenizer, accelerator.device
+                unwrapped, val_loader, tokenizer, accelerator.device,
+                generate=run_generation,
             )
 
-            # Compute caption metrics
-            bleu1_val = _compute_bleu1_list(val_preds_text, val_refs_text)
-            rouge_l_val = _compute_rouge_l_list(val_preds_text, val_refs_text)
+            # Compute caption metrics (only meaningful when generation ran)
+            bleu1_val = _compute_bleu1_list(val_preds_text, val_refs_text) if run_generation else None
+            rouge_l_val = _compute_rouge_l_list(val_preds_text, val_refs_text) if run_generation else None
 
             epoch_log = {
                 "epoch": epoch + 1,
@@ -665,13 +670,21 @@ def _train_stage1_prefix(captioning_path: str):
             }
             training_log.append(epoch_log)
 
-            logger.info(
-                f"[Stage-1] Epoch {epoch+1}/{cfg.STAGE1_EPOCHS} -- "
-                f"Train Loss: {avg_train_loss:.4f}, "
-                f"Val Loss: {val_loss:.4f}, "
-                f"BLEU-1: {bleu1_val:.4f}, "
-                f"ROUGE-L: {rouge_l_val:.4f}"
-            )
+            if run_generation:
+                logger.info(
+                    f"[Stage-1] Epoch {epoch+1}/{cfg.STAGE1_EPOCHS} -- "
+                    f"Train Loss: {avg_train_loss:.4f}, "
+                    f"Val Loss: {val_loss:.4f}, "
+                    f"BLEU-1: {bleu1_val:.4f}, "
+                    f"ROUGE-L: {rouge_l_val:.4f}"
+                )
+            else:
+                logger.info(
+                    f"[Stage-1] Epoch {epoch+1}/{cfg.STAGE1_EPOCHS} -- "
+                    f"Train Loss: {avg_train_loss:.4f}, "
+                    f"Val Loss: {val_loss:.4f}  "
+                    f"(BLEU/ROUGE skipped in multi-GPU mode)"
+                )
 
             # Log sample predictions
             if val_preds_text:
@@ -682,20 +695,12 @@ def _train_stage1_prefix(captioning_path: str):
                     logger.info(f"  [ref]  {val_refs_text[i][:200]}")
                     logger.info("")
 
-            # Save best checkpoint
+            # Save best checkpoint by val loss
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 ckpt_dir = os.path.join(STAGE1_OUTPUT_DIR, "best_checkpoint")
                 save_checkpoint(unwrapped, ckpt_dir, epoch=epoch + 1)
                 logger.info(f"[Stage-1] Saved best checkpoint (val_loss={val_loss:.4f})")
-            elif accelerator.is_main_process:
-            # Multi-GPU mid-training: save by train loss as proxy
-                if avg_train_loss < best_val_loss:
-                    best_val_loss = avg_train_loss
-                    unwrapped = accelerator.unwrap_model(model)
-                    ckpt_dir = os.path.join(STAGE1_OUTPUT_DIR, "best_checkpoint")
-                    save_checkpoint(unwrapped, ckpt_dir, epoch=epoch + 1)
-                    logger.info(f"[Stage-1] Saved best checkpoint (train_loss={avg_train_loss:.4f})")
 
         # Sync all processes before next epoch
         accelerator.wait_for_everyone()
@@ -738,8 +743,12 @@ def _train_stage1_prefix(captioning_path: str):
     return accelerator.unwrap_model(model), tokenizer
 
 
-def _validate_stage1_prefix(model, val_loader, tokenizer, device):
-    """Run validation: compute loss + generate captions."""
+def _validate_stage1_prefix(model, val_loader, tokenizer, device, generate=True):
+    """Run validation: compute loss, and optionally generate captions for BLEU/ROUGE.
+
+    Pass generate=False in multi-GPU mode — the forward-pass-only path takes
+    ~30s and will not trigger the NCCL watchdog timeout.
+    """
     model.eval()
     total_loss = 0.0
     n_batches = 0
@@ -754,7 +763,7 @@ def _validate_stage1_prefix(model, val_loader, tokenizer, device):
             attention_mask = batch["attention_mask"].to(device)
             labels = batch["labels"].to(device)
 
-            # Loss
+            # Loss (always computed — fast forward pass)
             outputs = model(
                 vectors=vectors,
                 num_objects=num_objects,
@@ -765,23 +774,23 @@ def _validate_stage1_prefix(model, val_loader, tokenizer, device):
             total_loss += outputs.loss.item()
             n_batches += 1
 
-            # Generate
-            gen_ids = model.generate(
-                vectors=vectors,
-                num_objects=num_objects,
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                max_new_tokens=cfg.GEN_MAX_NEW_TOKENS_STAGE1,
-                num_beams=cfg.GEN_NUM_BEAMS,
-            )
-            preds = tokenizer.batch_decode(gen_ids, skip_special_tokens=True)
-            all_preds.extend(preds)
+            if generate:
+                # Beam search generation — slow, skipped in multi-GPU mode
+                gen_ids = model.generate(
+                    vectors=vectors,
+                    num_objects=num_objects,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    max_new_tokens=cfg.GEN_MAX_NEW_TOKENS_STAGE1,
+                    num_beams=cfg.GEN_NUM_BEAMS,
+                )
+                preds = tokenizer.batch_decode(gen_ids, skip_special_tokens=True)
+                all_preds.extend(preds)
 
-            # Decode references (replace -100 with pad_token_id)
-            ref_ids = labels.clone()
-            ref_ids[ref_ids == -100] = tokenizer.pad_token_id
-            refs = tokenizer.batch_decode(ref_ids, skip_special_tokens=True)
-            all_refs.extend(refs)
+                ref_ids = labels.clone()
+                ref_ids[ref_ids == -100] = tokenizer.pad_token_id
+                refs = tokenizer.batch_decode(ref_ids, skip_special_tokens=True)
+                all_refs.extend(refs)
 
     avg_loss = total_loss / max(n_batches, 1)
     return avg_loss, all_preds, all_refs
