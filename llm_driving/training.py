@@ -602,48 +602,85 @@ def _train_stage1_prefix(captioning_path: str):
         epoch_loss = 0.0
         n_batches = 0
 
-        for step, batch in enumerate(train_loader):
-            # Accelerate's prepared loader places tensors on the correct device
-            vectors = batch["vectors"]
-            num_objects = batch["num_objects"]
-            input_ids = batch["input_ids"]
-            attention_mask = batch["attention_mask"]
-            labels = batch["labels"]
+        if accelerator.is_main_process:
+            logger.info(f"[Stage-1] === Epoch {epoch+1}/{cfg.STAGE1_EPOCHS} started ===")
 
-            outputs = model(
-                vectors=vectors,
-                num_objects=num_objects,
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                labels=labels,
+        try:
+            for step, batch in enumerate(train_loader):
+                try:
+                    # Accelerate's prepared loader places tensors on the correct device
+                    vectors = batch["vectors"]
+                    num_objects = batch["num_objects"]
+                    input_ids = batch["input_ids"]
+                    attention_mask = batch["attention_mask"]
+                    labels = batch["labels"]
+
+                    outputs = model(
+                        vectors=vectors,
+                        num_objects=num_objects,
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        labels=labels,
+                    )
+                    loss = outputs.loss
+
+                    if torch.isnan(loss) or torch.isinf(loss):
+                        logger.error(
+                            f"[Stage-1] NaN/Inf loss at epoch={epoch+1} step={step+1}. "
+                            f"Skipping batch. loss={loss.item()}"
+                        )
+                        optimizer.zero_grad()
+                        continue
+
+                    accelerator.backward(loss)
+                    if accelerator.sync_gradients:
+                        accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad()
+
+                    epoch_loss += loss.item()
+                    n_batches += 1
+
+                    if accelerator.is_main_process and ((step + 1) % cfg.LOGGING_STEPS == 0 or step == 0):
+                        logger.info(
+                            f"[Stage-1] Epoch {epoch+1}/{cfg.STAGE1_EPOCHS}, "
+                            f"Step {step+1}/{len(train_loader)}, "
+                            f"Loss: {loss.item():.4f}"
+                        )
+
+                except RuntimeError as e:
+                    logger.error(
+                        f"[Stage-1] RuntimeError at epoch={epoch+1} step={step+1}: {e}",
+                        exc_info=True,
+                    )
+                    optimizer.zero_grad()
+                    if "out of memory" in str(e).lower():
+                        logger.error("[Stage-1] CUDA OOM — skipping batch and clearing cache.")
+                        torch.cuda.empty_cache()
+                    else:
+                        raise  # non-OOM errors should still crash loudly
+
+        except Exception as e:
+            logger.error(
+                f"[Stage-1] Fatal error during training at epoch={epoch+1}: {e}",
+                exc_info=True,
             )
-            loss = outputs.loss
-
-            accelerator.backward(loss)
-            if accelerator.sync_gradients:
-                accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-            scheduler.step()
-            optimizer.zero_grad()
-
-            epoch_loss += loss.item()
-            n_batches += 1
-
-            if accelerator.is_main_process and ((step + 1) % cfg.LOGGING_STEPS == 0 or step == 0):
-                logger.info(
-                    f"[Stage-1] Epoch {epoch+1}/{cfg.STAGE1_EPOCHS}, "
-                    f"Step {step+1}/{len(train_loader)}, "
-                    f"Loss: {loss.item():.4f}"
-                )
+            raise
 
         avg_train_loss = epoch_loss / max(n_batches, 1)
+        if accelerator.is_main_process:
+            logger.info(
+                f"[Stage-1] Epoch {epoch+1}/{cfg.STAGE1_EPOCHS} training done — "
+                f"avg_loss={avg_train_loss:.4f}, batches={n_batches}"
+            )
 
         # Validation — main process only, using unwrapped model
         val_loss = 0.0
         val_preds_text = []
         val_refs_text = []
-        bleu1_val = 0.0
-        rouge_l_val = 0.0
+        bleu1_val = None
+        rouge_l_val = None
 
         # In multi-GPU mode: always validate (val loss is fast), but skip beam search
         # generation (slow — causes NCCL watchdog timeout). BLEU/ROUGE = None in logs.
@@ -651,11 +688,19 @@ def _train_stage1_prefix(captioning_path: str):
         run_generation = (accelerator.num_processes == 1)
 
         if accelerator.is_main_process:
-            unwrapped = accelerator.unwrap_model(model)
-            val_loss, val_preds_text, val_refs_text = _validate_stage1_prefix(
-                unwrapped, val_loader, tokenizer, accelerator.device,
-                generate=run_generation,
-            )
+            logger.info(f"[Stage-1] Starting validation for epoch {epoch+1} ...")
+            try:
+                unwrapped = accelerator.unwrap_model(model)
+                val_loss, val_preds_text, val_refs_text = _validate_stage1_prefix(
+                    unwrapped, val_loader, tokenizer, accelerator.device,
+                    generate=run_generation,
+                )
+            except Exception as e:
+                logger.error(
+                    f"[Stage-1] Validation failed at epoch={epoch+1}: {e}",
+                    exc_info=True,
+                )
+                val_loss = float("inf")
 
             # Compute caption metrics (only meaningful when generation ran)
             bleu1_val = _compute_bleu1_list(val_preds_text, val_refs_text) if run_generation else None
@@ -696,47 +741,58 @@ def _train_stage1_prefix(captioning_path: str):
                     logger.info("")
 
             # Save best checkpoint by val loss
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                ckpt_dir = os.path.join(STAGE1_OUTPUT_DIR, "best_checkpoint")
-                save_checkpoint(unwrapped, ckpt_dir, epoch=epoch + 1)
-                logger.info(f"[Stage-1] Saved best checkpoint (val_loss={val_loss:.4f})")
+            try:
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    ckpt_dir = os.path.join(STAGE1_OUTPUT_DIR, "best_checkpoint")
+                    save_checkpoint(unwrapped, ckpt_dir, epoch=epoch + 1)
+                    logger.info(f"[Stage-1] Saved best checkpoint (val_loss={val_loss:.4f})")
+            except Exception as e:
+                logger.error(f"[Stage-1] Failed to save checkpoint at epoch={epoch+1}: {e}", exc_info=True)
 
         # Sync all processes before next epoch
+        if accelerator.is_main_process:
+            logger.info(f"[Stage-1] Epoch {epoch+1} complete. Waiting for all ranks to sync...")
         accelerator.wait_for_everyone()
+        if accelerator.is_main_process:
+            logger.info(f"[Stage-1] All ranks synced. Proceeding to epoch {epoch+2}.")
 
     # Save final checkpoint + logs (main process only)
     if accelerator.is_main_process:
-        unwrapped = accelerator.unwrap_model(model)
+        logger.info("[Stage-1] All epochs done. Saving final checkpoint and logs...")
+        try:
+            unwrapped = accelerator.unwrap_model(model)
 
-        final_dir = os.path.join(STAGE1_OUTPUT_DIR, "final_checkpoint")
-        save_checkpoint(unwrapped, final_dir, epoch=cfg.STAGE1_EPOCHS)
+            final_dir = os.path.join(STAGE1_OUTPUT_DIR, "final_checkpoint")
+            save_checkpoint(unwrapped, final_dir, epoch=cfg.STAGE1_EPOCHS)
 
-        # Save training log
-        log_path = os.path.join(STAGE1_OUTPUT_DIR, "stage1_training_log.json")
-        with open(log_path, "w") as f:
-            json.dump(training_log, f, indent=2)
-        logger.info(f"[Stage-1] Training log saved to {log_path}")
+            # Save training log
+            log_path = os.path.join(STAGE1_OUTPUT_DIR, "stage1_training_log.json")
+            with open(log_path, "w") as f:
+                json.dump(training_log, f, indent=2)
+            logger.info(f"[Stage-1] Training log saved to {log_path}")
 
-        # Save eval metrics
-        eval_metrics = {
-            "eval_loss": best_val_loss,
-            "bleu1": bleu1_val,
-            "rouge_l": rouge_l_val,
-        }
-        metrics_path = os.path.join(STAGE1_OUTPUT_DIR, "eval_metrics.json")
-        with open(metrics_path, "w") as f:
-            json.dump(eval_metrics, f, indent=2)
+            # Save eval metrics
+            eval_metrics = {
+                "eval_loss": best_val_loss,
+                "bleu1": bleu1_val,
+                "rouge_l": rouge_l_val,
+            }
+            metrics_path = os.path.join(STAGE1_OUTPUT_DIR, "eval_metrics.json")
+            with open(metrics_path, "w") as f:
+                json.dump(eval_metrics, f, indent=2)
 
-        # Save sample predictions
-        pred_path = os.path.join(STAGE1_OUTPUT_DIR, "val_predictions.json")
-        preds_data = [
-            {"prediction": p, "ground_truth": r}
-            for p, r in zip(val_preds_text, val_refs_text)
-        ]
-        with open(pred_path, "w") as f:
-            json.dump(preds_data, f, indent=2)
-        logger.info(f"[STAGE 1] Saved {len(preds_data)} validation predictions to {pred_path}")
+            # Save sample predictions
+            pred_path = os.path.join(STAGE1_OUTPUT_DIR, "val_predictions.json")
+            preds_data = [
+                {"prediction": p, "ground_truth": r}
+                for p, r in zip(val_preds_text, val_refs_text)
+            ]
+            with open(pred_path, "w") as f:
+                json.dump(preds_data, f, indent=2)
+            logger.info(f"[STAGE 1] Saved {len(preds_data)} validation predictions to {pred_path}")
+        except Exception as e:
+            logger.error(f"[Stage-1] Failed to save final outputs: {e}", exc_info=True)
 
     accelerator.wait_for_everyone()
     logger.info("[STAGE 1] Done.\n" + "=" * 80)
