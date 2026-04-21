@@ -758,6 +758,7 @@ def _train_stage1_prefix(captioning_path: str):
             logger.info(f"[Stage-1] All ranks synced. Proceeding to epoch {epoch+2}.")
 
     # Save final checkpoint + logs (main process only)
+    is_multi_gpu = (accelerator.num_processes > 1)
     if accelerator.is_main_process:
         logger.info("[Stage-1] All epochs done. Saving final checkpoint and logs...")
         try:
@@ -772,25 +773,38 @@ def _train_stage1_prefix(captioning_path: str):
                 json.dump(training_log, f, indent=2)
             logger.info(f"[Stage-1] Training log saved to {log_path}")
 
-            # Save eval metrics
-            eval_metrics = {
-                "eval_loss": best_val_loss,
-                "bleu1": bleu1_val,
-                "rouge_l": rouge_l_val,
-            }
-            metrics_path = os.path.join(STAGE1_OUTPUT_DIR, "eval_metrics.json")
-            with open(metrics_path, "w") as f:
-                json.dump(eval_metrics, f, indent=2)
+            # --- Full eval + predictions ---
+            # Single-GPU: runs as before (reuses val_preds_text/val_refs_text from the
+            # last epoch's in-training generation + BLEU/ROUGE).
+            # Multi-GPU: skipped. Original lines are preserved below for reference —
+            # run `python eval_stage1.py --run <RUN_ID>` after training to produce
+            # val_predictions.json + BLEU/ROUGE over the full val set.
+            if not is_multi_gpu:
+                # Save eval metrics
+                eval_metrics = {
+                    "eval_loss": best_val_loss,
+                    "bleu1": bleu1_val,
+                    "rouge_l": rouge_l_val,
+                }
+                metrics_path = os.path.join(STAGE1_OUTPUT_DIR, "eval_metrics.json")
+                with open(metrics_path, "w") as f:
+                    json.dump(eval_metrics, f, indent=2)
 
-            # Save sample predictions
-            pred_path = os.path.join(STAGE1_OUTPUT_DIR, "val_predictions.json")
-            preds_data = [
-                {"prediction": p, "ground_truth": r}
-                for p, r in zip(val_preds_text, val_refs_text)
-            ]
-            with open(pred_path, "w") as f:
-                json.dump(preds_data, f, indent=2)
-            logger.info(f"[STAGE 1] Saved {len(preds_data)} validation predictions to {pred_path}")
+                # Save sample predictions
+                pred_path = os.path.join(STAGE1_OUTPUT_DIR, "val_predictions.json")
+                preds_data = [
+                    {"prediction": p, "ground_truth": r}
+                    for p, r in zip(val_preds_text, val_refs_text)
+                ]
+                with open(pred_path, "w") as f:
+                    json.dump(preds_data, f, indent=2)
+                logger.info(f"[STAGE 1] Saved {len(preds_data)} validation predictions to {pred_path}")
+            else:
+                logger.info(
+                    "[Stage-1] Multi-GPU mode — skipping in-training eval/predictions. "
+                    f"Run 'python eval_stage1.py --run {cfg.RUN_ID}' for full val "
+                    "predictions + BLEU/ROUGE."
+                )
         except Exception as e:
             logger.error(f"[Stage-1] Failed to save final outputs: {e}", exc_info=True)
 
@@ -1417,40 +1431,52 @@ def _train_stage2_with_lora(model_stage1, tokenizer, qa_path: str):
         return metrics, outputs
 
     # Run evaluation only on main process (avoids duplicate work in multi-GPU)
+    # Single-GPU: full in-training eval runs as before.
+    # Multi-GPU: skipped — full eval is slow beam-search generation on rank 0 which
+    # risks NCCL watchdog timeout. Run `python eval_stage2.py --run <RUN_ID>` after
+    # training for full predictions + metrics.
+    is_multi_gpu_s2 = int(os.environ.get("WORLD_SIZE", "1")) > 1
     if not hasattr(trainer, 'is_world_process_zero') or trainer.is_world_process_zero():
-        logger.info("[STAGE 2] Computing metrics: oracle_caption...")
-        oracle_metrics, oracle_outputs = run_eval("oracle_caption")
-        logger.info(f"[STAGE 2] oracle_caption metrics: {oracle_metrics}")
-        _print_eval_risk_summary(oracle_outputs, "oracle_caption")
+        if not is_multi_gpu_s2:
+            logger.info("[STAGE 2] Computing metrics: oracle_caption...")
+            oracle_metrics, oracle_outputs = run_eval("oracle_caption")
+            logger.info(f"[STAGE 2] oracle_caption metrics: {oracle_metrics}")
+            _print_eval_risk_summary(oracle_outputs, "oracle_caption")
 
-        logger.info("[STAGE 2] Computing metrics: stage1_caption...")
-        stage1_metrics, stage1_outputs = run_eval("stage1_caption")
-        logger.info(f"[STAGE 2] stage1_caption metrics: {stage1_metrics}")
-        _print_eval_risk_summary(stage1_outputs, "stage1_caption")
+            logger.info("[STAGE 2] Computing metrics: stage1_caption...")
+            stage1_metrics, stage1_outputs = run_eval("stage1_caption")
+            logger.info(f"[STAGE 2] stage1_caption metrics: {stage1_metrics}")
+            _print_eval_risk_summary(stage1_outputs, "stage1_caption")
 
-        eval_metrics: Dict = {}
-        if isinstance(raw_eval, dict):
-            for k, v in raw_eval.items():
-                try:
-                    eval_metrics[k] = float(v)
-                except Exception:
-                    eval_metrics[k] = v
+            eval_metrics: Dict = {}
+            if isinstance(raw_eval, dict):
+                for k, v in raw_eval.items():
+                    try:
+                        eval_metrics[k] = float(v)
+                    except Exception:
+                        eval_metrics[k] = v
 
-        eval_metrics["oracle_caption"] = oracle_metrics
-        eval_metrics["stage1_caption"] = stage1_metrics
+            eval_metrics["oracle_caption"] = oracle_metrics
+            eval_metrics["stage1_caption"] = stage1_metrics
 
-        metrics_path = os.path.join(STAGE2_OUTPUT_DIR, "eval_metrics.json")
-        with open(metrics_path, "w") as f:
-            json.dump(eval_metrics, f, indent=2)
-        logger.info(f"[STAGE 2] Saved eval metrics to {metrics_path}")
+            metrics_path = os.path.join(STAGE2_OUTPUT_DIR, "eval_metrics.json")
+            with open(metrics_path, "w") as f:
+                json.dump(eval_metrics, f, indent=2)
+            logger.info(f"[STAGE 2] Saved eval metrics to {metrics_path}")
 
-        preds_path1 = os.path.join(STAGE2_OUTPUT_DIR, "val_predictions_oracle_caption.json")
-        with open(preds_path1, "w") as f:
-            json.dump(oracle_outputs, f, indent=2)
+            preds_path1 = os.path.join(STAGE2_OUTPUT_DIR, "val_predictions_oracle_caption.json")
+            with open(preds_path1, "w") as f:
+                json.dump(oracle_outputs, f, indent=2)
 
-        preds_path2 = os.path.join(STAGE2_OUTPUT_DIR, "val_predictions_stage1_caption.json")
-        with open(preds_path2, "w") as f:
-            json.dump(stage1_outputs, f, indent=2)
+            preds_path2 = os.path.join(STAGE2_OUTPUT_DIR, "val_predictions_stage1_caption.json")
+            with open(preds_path2, "w") as f:
+                json.dump(stage1_outputs, f, indent=2)
+        else:
+            logger.info(
+                "[STAGE 2] Multi-GPU mode — skipping in-training eval/predictions. "
+                f"Run 'python eval_stage2.py --run {cfg.RUN_ID}' for full val "
+                "predictions + metrics."
+            )
 
     logger.info("[STAGE 2] Done.\n" + "=" * 80)
     return model_stage2
