@@ -9,9 +9,17 @@ generation over the validation split, producing:
 This script is the multi-GPU-safe replacement for the in-training eval block
 that was skipped when `accelerate launch --num_processes>1 main.py` is used.
 
-Usage:
+Single-GPU usage:
     python eval_stage1.py --run 20260421_120000
     python eval_stage1.py --run <RUN_ID> --device cuda:0 --batch_size 4
+
+Multi-GPU (embarrassingly-parallel sharding — no NCCL, no hangs):
+    # Launch one process per GPU, each handling a disjoint slice of the val set.
+    CUDA_VISIBLE_DEVICES=0 python eval_stage1.py --run <RUN_ID> --shard_idx 0 --num_shards 3 &
+    CUDA_VISIBLE_DEVICES=1 python eval_stage1.py --run <RUN_ID> --shard_idx 1 --num_shards 3 &
+    CUDA_VISIBLE_DEVICES=2 python eval_stage1.py --run <RUN_ID> --shard_idx 2 --num_shards 3 &
+    wait
+    python merge_shards.py --run <RUN_ID> --stage 1 --num_shards 3
 """
 
 from __future__ import annotations
@@ -28,6 +36,7 @@ from transformers import AutoTokenizer
 
 from llm_driving import config as cfg
 from llm_driving.data_collator import VectorPrefixDataCollator
+from llm_driving.logging_utils import setup_logging
 from llm_driving.lora_utils import load_checkpoint
 from llm_driving.training import (
     VectorPrefixDataset,
@@ -37,12 +46,7 @@ from llm_driving.training import (
 )
 from llm_driving.vector_encoder import parse_vec_str
 
-logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-    level=logging.INFO,
-)
-logger = logging.getLogger("eval_stage1")
+logger = logging.getLogger("llm_driving")
 
 
 def _parse_args() -> argparse.Namespace:
@@ -64,23 +68,58 @@ def _parse_args() -> argparse.Namespace:
         default=cfg.STAGE1_BATCH_SIZE,
         help=f"Eval batch size (default: {cfg.STAGE1_BATCH_SIZE})",
     )
+    p.add_argument(
+        "--shard_idx",
+        type=int,
+        default=0,
+        help="Shard index (0-based). Used with --num_shards for multi-GPU.",
+    )
+    p.add_argument(
+        "--num_shards",
+        type=int,
+        default=1,
+        help="Total number of shards. Each process handles samples[shard_idx::num_shards].",
+    )
     return p.parse_args()
 
 
 def main() -> None:
     args = _parse_args()
 
+    if args.num_shards < 1 or args.shard_idx < 0 or args.shard_idx >= args.num_shards:
+        logging.basicConfig(level=logging.INFO)
+        logger.error(
+            f"Invalid sharding args: shard_idx={args.shard_idx} num_shards={args.num_shards}"
+        )
+        sys.exit(1)
+    is_sharded = args.num_shards > 1
+
     run_dir = os.path.join(cfg.RUNS_DIR, args.run)
     stage1_dir = os.path.join(run_dir, "stage1")
     checkpoint_dir = os.path.join(stage1_dir, args.checkpoint)
     captioning_path = os.path.join(run_dir, "data", "vector_captioning_data.json")
 
+    # Validate inputs BEFORE creating any directories, to avoid leaking empty
+    # runs/<bogus_id>/stage1/ folders if the user passes a wrong --run.
+    if not os.path.isdir(stage1_dir):
+        logging.basicConfig(level=logging.INFO)
+        logger.error(f"Stage 1 dir not found: {stage1_dir}")
+        sys.exit(1)
     if not os.path.isdir(checkpoint_dir):
+        logging.basicConfig(level=logging.INFO)
         logger.error(f"Checkpoint dir not found: {checkpoint_dir}")
         sys.exit(1)
     if not os.path.isfile(captioning_path):
+        logging.basicConfig(level=logging.INFO)
         logger.error(f"Captioning data not found: {captioning_path}")
         sys.exit(1)
+
+    # All inputs valid — wire up combined file + stdout logging
+    # (writes to runs/<run>/stage1/eval_stage1[_shardN].log).
+    log_filename = (
+        f"eval_stage1_shard{args.shard_idx}.log" if is_sharded else "eval_stage1.log"
+    )
+    setup_logging(stage1_dir, log_filename)
 
     device = args.device or ("cuda:0" if torch.cuda.is_available() else "cpu")
     logger.info(f"[EVAL1] Run          : {args.run}")
@@ -88,6 +127,8 @@ def main() -> None:
     logger.info(f"[EVAL1] Captioning   : {captioning_path}")
     logger.info(f"[EVAL1] Device       : {device}")
     logger.info(f"[EVAL1] Batch size   : {args.batch_size}")
+    if is_sharded:
+        logger.info(f"[EVAL1] Sharding     : shard {args.shard_idx} of {args.num_shards}")
 
     # --- Load data and reproduce the same train/val split used in training ---
     with open(captioning_path, "r") as f:
@@ -106,7 +147,18 @@ def main() -> None:
     n_train = len(data) - n_val
     indices = torch.randperm(len(data)).tolist()
     val_samples = [data[i] for i in indices[n_train:]]
-    logger.info(f"[EVAL1] Total samples: {len(data)} | Val: {len(val_samples)}")
+    full_val_size = len(val_samples)
+
+    # Shard the val samples: shard i handles samples[i::N]. Stride-slicing keeps
+    # each shard roughly equal in size and preserves sample identity.
+    if is_sharded:
+        val_samples = val_samples[args.shard_idx :: args.num_shards]
+        logger.info(
+            f"[EVAL1] Total samples: {len(data)} | Full val: {full_val_size} | "
+            f"This shard: {len(val_samples)}"
+        )
+    else:
+        logger.info(f"[EVAL1] Total samples: {len(data)} | Val: {len(val_samples)}")
 
     # Stage 1 uses the minimal prompt
     for s in val_samples:
@@ -150,33 +202,58 @@ def main() -> None:
     )
 
     # --- Write predictions ---
-    os.makedirs(stage1_dir, exist_ok=True)
-    pred_path = os.path.join(stage1_dir, "val_predictions.json")
+    if is_sharded:
+        pred_filename = f"val_predictions_shard{args.shard_idx}.json"
+    else:
+        pred_filename = "val_predictions.json"
+    pred_path = os.path.join(stage1_dir, pred_filename)
     preds_data = [{"prediction": p, "ground_truth": r} for p, r in zip(preds, refs)]
     with open(pred_path, "w") as f:
         json.dump(preds_data, f, indent=2)
     logger.info(f"[EVAL1] Wrote {len(preds_data)} predictions to {pred_path}")
 
     # --- Update eval_metrics.json (merge with anything training wrote) ---
-    metrics_path = os.path.join(stage1_dir, "eval_metrics.json")
-    metrics: dict = {}
-    if os.path.isfile(metrics_path):
-        try:
-            with open(metrics_path, "r") as f:
-                metrics = json.load(f) or {}
-        except Exception:
-            metrics = {}
-    metrics.update(
-        {
+    # In sharded mode, write a per-shard metrics file so merge_shards.py has
+    # the shard's val_loss (loss is computed directly on local forward passes;
+    # bleu/rouge will be recomputed by merge_shards.py from concatenated preds).
+    if is_sharded:
+        metrics_path = os.path.join(
+            stage1_dir, f"eval_metrics_shard{args.shard_idx}.json"
+        )
+        metrics: dict = {
             "eval_loss": float(val_loss),
             "bleu1": float(bleu1_score),
             "rouge_l": float(rouge_l_score),
             "n_val_samples": len(val_samples),
+            "shard_idx": int(args.shard_idx),
+            "num_shards": int(args.num_shards),
         }
-    )
+    else:
+        metrics_path = os.path.join(stage1_dir, "eval_metrics.json")
+        metrics = {}
+        if os.path.isfile(metrics_path):
+            try:
+                with open(metrics_path, "r") as f:
+                    metrics = json.load(f) or {}
+            except Exception:
+                metrics = {}
+        metrics.update(
+            {
+                "eval_loss": float(val_loss),
+                "bleu1": float(bleu1_score),
+                "rouge_l": float(rouge_l_score),
+                "n_val_samples": len(val_samples),
+            }
+        )
     with open(metrics_path, "w") as f:
         json.dump(metrics, f, indent=2)
     logger.info(f"[EVAL1] Wrote metrics to {metrics_path}")
+    if is_sharded:
+        logger.info(
+            f"[EVAL1] Shard {args.shard_idx} done. Run "
+            f"'python merge_shards.py --run {args.run} --stage 1 "
+            f"--num_shards {args.num_shards}' after all shards finish."
+        )
     logger.info("[EVAL1] Done.")
 
 

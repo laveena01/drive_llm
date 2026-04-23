@@ -12,9 +12,17 @@ This script is the multi-GPU-safe replacement for the in-training post-Stage-2
 eval block that was skipped when `accelerate launch --num_processes>1 main.py`
 is used.
 
-Usage:
+Single-GPU usage:
     python eval_stage2.py --run 20260421_120000
     python eval_stage2.py --run <RUN_ID> --device cuda:0
+
+Multi-GPU (embarrassingly-parallel sharding — no NCCL, no hangs):
+    # Launch one process per GPU, each handling a disjoint slice of the val set.
+    CUDA_VISIBLE_DEVICES=0 python eval_stage2.py --run <RUN_ID> --shard_idx 0 --num_shards 3 &
+    CUDA_VISIBLE_DEVICES=1 python eval_stage2.py --run <RUN_ID> --shard_idx 1 --num_shards 3 &
+    CUDA_VISIBLE_DEVICES=2 python eval_stage2.py --run <RUN_ID> --shard_idx 2 --num_shards 3 &
+    wait
+    python merge_shards.py --run <RUN_ID> --stage 2 --num_shards 3
 """
 
 from __future__ import annotations
@@ -31,6 +39,7 @@ from datasets import Dataset
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
 from llm_driving import config as cfg
+from llm_driving.logging_utils import setup_logging
 from llm_driving.lora_utils import load_checkpoint as load_stage1_checkpoint
 from llm_driving.training import (
     _build_stage2_prompt_from_caption,
@@ -46,12 +55,7 @@ from llm_driving.training import (
 )
 from llm_driving.vector_encoder import parse_vec_str
 
-logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-    level=logging.INFO,
-)
-logger = logging.getLogger("eval_stage2")
+logger = logging.getLogger("llm_driving")
 
 
 def _parse_args() -> argparse.Namespace:
@@ -77,11 +81,31 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Skip the stage1_caption evaluation pass (no Stage 1 model needed).",
     )
+    p.add_argument(
+        "--shard_idx",
+        type=int,
+        default=0,
+        help="Shard index (0-based). Used with --num_shards for multi-GPU.",
+    )
+    p.add_argument(
+        "--num_shards",
+        type=int,
+        default=1,
+        help="Total number of shards. Each process handles samples[shard_idx::num_shards].",
+    )
     return p.parse_args()
 
 
 def main() -> None:
     args = _parse_args()
+
+    if args.num_shards < 1 or args.shard_idx < 0 or args.shard_idx >= args.num_shards:
+        logging.basicConfig(level=logging.INFO)
+        logger.error(
+            f"Invalid sharding args: shard_idx={args.shard_idx} num_shards={args.num_shards}"
+        )
+        sys.exit(1)
+    is_sharded = args.num_shards > 1
 
     run_dir = os.path.join(cfg.RUNS_DIR, args.run)
     stage1_ckpt_dir = os.path.join(run_dir, "stage1", args.stage1_checkpoint)
@@ -89,8 +113,18 @@ def main() -> None:
     qa_path = os.path.join(run_dir, "data", "driving_qa_data.json")
 
     if not os.path.isdir(stage2_dir):
+        # stage2_dir missing -> can't set up file logging under it. Log to terminal
+        # via a minimal basicConfig and exit.
+        logging.basicConfig(level=logging.INFO)
         logger.error(f"Stage 2 checkpoint dir not found: {stage2_dir}")
         sys.exit(1)
+
+    # stage2_dir exists (Stage 2 training produced it). Wire up combined
+    # file + stdout logging (writes to runs/<run>/stage2/eval_stage2[_shardN].log).
+    log_filename = (
+        f"eval_stage2_shard{args.shard_idx}.log" if is_sharded else "eval_stage2.log"
+    )
+    setup_logging(stage2_dir, log_filename)
     if not os.path.isfile(qa_path):
         logger.error(f"QA data not found: {qa_path}")
         sys.exit(1)
@@ -107,6 +141,8 @@ def main() -> None:
     logger.info(f"[EVAL2] Stage2 dir   : {stage2_dir}")
     logger.info(f"[EVAL2] QA data      : {qa_path}")
     logger.info(f"[EVAL2] Device       : {device}")
+    if is_sharded:
+        logger.info(f"[EVAL2] Sharding     : shard {args.shard_idx} of {args.num_shards}")
 
     # --- Load Stage 2 (action model) + tokenizer ---
     tokenizer = AutoTokenizer.from_pretrained(stage2_dir)
@@ -132,7 +168,18 @@ def main() -> None:
     full_ds = Dataset.from_list(data)
     split = full_ds.train_test_split(test_size=0.2, seed=42)
     eval_ds = split["test"]
-    logger.info(f"[EVAL2] Total samples: {len(full_ds)} | Val: {len(eval_ds)}")
+    full_val_size = len(eval_ds)
+
+    # Shard: stride-slice with samples[i::N]. Dataset.select preserves order.
+    if is_sharded:
+        shard_indices = list(range(args.shard_idx, full_val_size, args.num_shards))
+        eval_ds = eval_ds.select(shard_indices)
+        logger.info(
+            f"[EVAL2] Total samples: {len(full_ds)} | Full val: {full_val_size} | "
+            f"This shard: {len(eval_ds)}"
+        )
+    else:
+        logger.info(f"[EVAL2] Total samples: {len(full_ds)} | Val: {len(eval_ds)}")
 
     # --- Helpers ---
     def _gen_text_s2(prompt: str, max_new_tokens: int, ensure_paper: bool) -> str:
@@ -331,8 +378,13 @@ def main() -> None:
         return metrics, outputs
 
     # --- Run eval passes ---
-    os.makedirs(stage2_dir, exist_ok=True)
     combined_metrics: Dict = {}
+
+    def _pred_filename(mode: str) -> str:
+        base = f"val_predictions_{mode}"
+        if is_sharded:
+            return f"{base}_shard{args.shard_idx}.json"
+        return f"{base}.json"
 
     if not args.skip_oracle:
         logger.info("[EVAL2] Running oracle_caption pass...")
@@ -340,7 +392,7 @@ def main() -> None:
         logger.info(f"[EVAL2] oracle_caption metrics: {oracle_metrics}")
         _print_eval_risk_summary(oracle_outputs, "oracle_caption")
 
-        preds_path1 = os.path.join(stage2_dir, "val_predictions_oracle_caption.json")
+        preds_path1 = os.path.join(stage2_dir, _pred_filename("oracle_caption"))
         with open(preds_path1, "w") as f:
             json.dump(oracle_outputs, f, indent=2)
         logger.info(f"[EVAL2] Wrote {len(oracle_outputs)} oracle preds to {preds_path1}")
@@ -352,25 +404,47 @@ def main() -> None:
         logger.info(f"[EVAL2] stage1_caption metrics: {stage1_metrics}")
         _print_eval_risk_summary(stage1_outputs, "stage1_caption")
 
-        preds_path2 = os.path.join(stage2_dir, "val_predictions_stage1_caption.json")
+        preds_path2 = os.path.join(stage2_dir, _pred_filename("stage1_caption"))
         with open(preds_path2, "w") as f:
             json.dump(stage1_outputs, f, indent=2)
         logger.info(f"[EVAL2] Wrote {len(stage1_outputs)} stage1 preds to {preds_path2}")
         combined_metrics["stage1_caption"] = stage1_metrics
 
     # --- Merge + write eval_metrics.json ---
-    metrics_path = os.path.join(stage2_dir, "eval_metrics.json")
-    existing: Dict = {}
-    if os.path.isfile(metrics_path):
-        try:
-            with open(metrics_path, "r") as f:
-                existing = json.load(f) or {}
-        except Exception:
-            existing = {}
-    existing.update(combined_metrics)
-    with open(metrics_path, "w") as f:
-        json.dump(existing, f, indent=2)
-    logger.info(f"[EVAL2] Wrote metrics to {metrics_path}")
+    # Sharded mode: write shard-local metrics to eval_metrics_shard{i}.json.
+    # merge_shards.py will recompute the canonical eval_metrics.json from the
+    # concatenated predictions (more accurate than averaging shard metrics).
+    if is_sharded:
+        metrics_path = os.path.join(
+            stage2_dir, f"eval_metrics_shard{args.shard_idx}.json"
+        )
+        shard_metrics = {
+            **combined_metrics,
+            "shard_idx": int(args.shard_idx),
+            "num_shards": int(args.num_shards),
+            "n_shard_samples": len(eval_ds),
+        }
+        with open(metrics_path, "w") as f:
+            json.dump(shard_metrics, f, indent=2)
+        logger.info(f"[EVAL2] Wrote shard metrics to {metrics_path}")
+        logger.info(
+            f"[EVAL2] Shard {args.shard_idx} done. Run "
+            f"'python merge_shards.py --run {args.run} --stage 2 "
+            f"--num_shards {args.num_shards}' after all shards finish."
+        )
+    else:
+        metrics_path = os.path.join(stage2_dir, "eval_metrics.json")
+        existing: Dict = {}
+        if os.path.isfile(metrics_path):
+            try:
+                with open(metrics_path, "r") as f:
+                    existing = json.load(f) or {}
+            except Exception:
+                existing = {}
+        existing.update(combined_metrics)
+        with open(metrics_path, "w") as f:
+            json.dump(existing, f, indent=2)
+        logger.info(f"[EVAL2] Wrote metrics to {metrics_path}")
     logger.info("[EVAL2] Done.")
 
 

@@ -146,7 +146,6 @@ COMPUTE_CONTROL_METRICS = True
 # runs
 # -----------------------------
 RUNS_DIR = "runs"
-os.makedirs(RUNS_DIR, exist_ok=True)
 
 RUN_ID = datetime.now().strftime("%Y%m%d_%H%M%S")
 RUN_DIR = os.path.join(RUNS_DIR, RUN_ID)
@@ -154,10 +153,6 @@ RUN_DIR = os.path.join(RUNS_DIR, RUN_ID)
 DATA_DIR = os.path.join(RUN_DIR, "data")
 STAGE1_OUTPUT_DIR = os.path.join(RUN_DIR, "stage1")
 STAGE2_OUTPUT_DIR = os.path.join(RUN_DIR, "stage2")
-
-os.makedirs(DATA_DIR, exist_ok=True)
-os.makedirs(STAGE1_OUTPUT_DIR, exist_ok=True)
-os.makedirs(STAGE2_OUTPUT_DIR, exist_ok=True)
 
 CAPTIONING_DATA_PATH = os.path.join(DATA_DIR, "vector_captioning_data.json")
 QA_DATA_PATH = os.path.join(DATA_DIR, "driving_qa_data.json")

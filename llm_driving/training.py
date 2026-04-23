@@ -885,6 +885,11 @@ def _compute_rouge_l_list(predictions: List[str], references: List[str]) -> floa
 # ---------------------------
 
 def train_stage1(captioning_path: str):
+    # Ensure RUN_DIR and DATA_DIR exist (previously created as a config.py import
+    # side effect; moved here so config imports are side-effect-free).
+    os.makedirs(cfg.RUN_DIR, exist_ok=True)
+    os.makedirs(cfg.DATA_DIR, exist_ok=True)
+
     if cfg.USE_VECTOR_PREFIX:
         return _train_stage1_prefix(captioning_path)
     else:
