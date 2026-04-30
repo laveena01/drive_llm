@@ -21,6 +21,7 @@ import re
 from .nuscenes_data import get_scene_frames_vectors, init_nuscenes
 from .langen import lanGen, vector_to_string
 from .config import CAPTIONING_DATA_PATH, QA_DATA_PATH, MAX_OBJECTS
+from llm_driving.eval_extras import enrich_qa_samples
 from llm_driving.risk_calculator import calculate_risk_from_vectors, get_risk_summary_text, policy_from_risk
 
 logger = logging.getLogger("llm_driving")
@@ -334,6 +335,13 @@ def build_datasets_full_mini(
         )
 
     _print_policy_summary()
+
+    # E1+E2: enrich QA samples with future-aware oracle labels (look-ahead
+    # over H=4 keyframes), risk transitions vs the previous frame, and
+    # density buckets. Persisting these at build time keeps eval scripts
+    # idempotent — eval_stage2.py also calls enrich_qa_samples for
+    # backwards compatibility with older datasets.
+    enrich_qa_samples(qa_samples, horizon=4)
 
     logger.info(f"\n[datasets_builder] Saving captioning dataset to: {captioning_path}")
     with open(captioning_path, "w") as f:

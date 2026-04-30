@@ -39,6 +39,12 @@ from datasets import Dataset
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
 from llm_driving import config as cfg
+from llm_driving.eval_extras import (
+    compute_future_summary,
+    compute_slice_metrics,
+    enrich_qa_samples,
+    extract_hard_cases,
+)
 from llm_driving.logging_utils import setup_logging
 from llm_driving.lora_utils import load_checkpoint as load_stage1_checkpoint
 from llm_driving.training import (
@@ -165,6 +171,10 @@ def main() -> None:
     # --- Dataset + reproduce same 80/20 split as training ---
     with open(qa_path, "r") as f:
         data = json.load(f)
+    # E1+E2: attach future-aware oracle labels, risk transitions, and density
+    # buckets to every QA sample. Idempotent: if a future build already wrote
+    # these fields, the values will be overwritten with the same content.
+    enrich_qa_samples(data, horizon=4)
     full_ds = Dataset.from_list(data)
     split = full_ds.train_test_split(test_size=0.2, seed=42)
     eval_ds = split["test"]
@@ -259,6 +269,8 @@ def main() -> None:
             )
             risk_text = sample.get("risk_text", "")
             risk_level = sample.get("risk_level", None)
+            gt_brake_pct: float | None = None
+            pred_brake_pct: float | None = None
 
             try:
                 if mode == "oracle_caption":
@@ -292,10 +304,12 @@ def main() -> None:
                             unsafe_continue_high += 1
 
                     if gt_action == "BRAKE":
-                        gt_brk = _extract_brake_percent(gt_text)
-                        pr_brk = _extract_brake_percent(pred_fixed)
-                        if gt_brk is not None and pr_brk is not None:
-                            brake_mae_sum_on_brake_gt += abs(float(pr_brk) - float(gt_brk))
+                        gt_brake_pct = _extract_brake_percent(gt_text)
+                        pred_brake_pct = _extract_brake_percent(pred_fixed)
+                        if gt_brake_pct is not None and pred_brake_pct is not None:
+                            brake_mae_sum_on_brake_gt += abs(
+                                float(pred_brake_pct) - float(gt_brake_pct)
+                            )
                             brake_mae_count_on_brake_gt += 1
 
                     if gt_action != "OTHER":
@@ -347,6 +361,22 @@ def main() -> None:
                     "parse_ok": int(parse_ok),
                     "caption_used": caption_used,
                     "risk_level": risk_level,
+                    # E2/E3 metadata: needed both for slice metrics here and
+                    # for the merge_shards.py recomputation pass.
+                    "scene_idx": sample.get("scene_idx"),
+                    "frame_in_scene": sample.get("frame_in_scene"),
+                    "frame_idx": sample.get("frame_idx"),
+                    "num_objects": sample.get("num_objects"),
+                    "density_bucket": sample.get("density_bucket"),
+                    "risk_transition": sample.get("risk_transition"),
+                    "risk_level_future": sample.get("risk_level_future"),
+                    "brake_required_future": sample.get("brake_required_future"),
+                    "gt_brake_pct": gt_brake_pct,
+                    "pred_brake_pct": pred_brake_pct,
+                    # Vectors carried only to support the hard-case dump (E3).
+                    # Adds bytes to the per-shard predictions JSON but keeps
+                    # everything self-contained for offline analysis.
+                    "vectors": sample.get("vectors"),
                 }
             )
 
@@ -386,6 +416,41 @@ def main() -> None:
             return f"{base}_shard{args.shard_idx}.json"
         return f"{base}.json"
 
+    def _hard_cases_filename(mode: str) -> str:
+        base = f"hard_cases_{mode}"
+        if is_sharded:
+            return f"{base}_shard{args.shard_idx}.json"
+        return f"{base}.json"
+
+    def _strip_vectors_for_preds(outs: List[Dict]) -> List[Dict]:
+        """Drop the per-sample `vectors` field before writing predictions JSON.
+        Vectors are large (~80 floats per row); we only need them in the
+        hard-cases dump for offline analysis."""
+        slim: List[Dict] = []
+        for o in outs:
+            o2 = {k: v for k, v in o.items() if k != "vectors"}
+            slim.append(o2)
+        return slim
+
+    def _finalize_mode(mode: str, metrics: Dict, outputs: List[Dict]) -> Dict:
+        """Augment per-mode metrics with slice metrics + future-aware summary,
+        and dump per-mode hard cases. Returns the augmented metrics dict."""
+        slice_metrics = compute_slice_metrics(outputs)
+        future_summary = compute_future_summary(outputs)
+        augmented = {
+            **metrics,
+            **future_summary,
+            "slices": slice_metrics,
+        }
+        hard_cases = extract_hard_cases(outputs, max_per_kind=200)
+        hc_path = os.path.join(stage2_dir, _hard_cases_filename(mode))
+        with open(hc_path, "w") as f:
+            json.dump(hard_cases, f, indent=2)
+        logger.info(
+            f"[EVAL2] {mode}: wrote {len(hard_cases)} hard cases to {hc_path}"
+        )
+        return augmented
+
     if not args.skip_oracle:
         logger.info("[EVAL2] Running oracle_caption pass...")
         oracle_metrics, oracle_outputs = run_eval("oracle_caption")
@@ -394,9 +459,11 @@ def main() -> None:
 
         preds_path1 = os.path.join(stage2_dir, _pred_filename("oracle_caption"))
         with open(preds_path1, "w") as f:
-            json.dump(oracle_outputs, f, indent=2)
+            json.dump(_strip_vectors_for_preds(oracle_outputs), f, indent=2)
         logger.info(f"[EVAL2] Wrote {len(oracle_outputs)} oracle preds to {preds_path1}")
-        combined_metrics["oracle_caption"] = oracle_metrics
+        combined_metrics["oracle_caption"] = _finalize_mode(
+            "oracle_caption", oracle_metrics, oracle_outputs
+        )
 
     if not args.skip_stage1:
         logger.info("[EVAL2] Running stage1_caption pass...")
@@ -406,9 +473,11 @@ def main() -> None:
 
         preds_path2 = os.path.join(stage2_dir, _pred_filename("stage1_caption"))
         with open(preds_path2, "w") as f:
-            json.dump(stage1_outputs, f, indent=2)
+            json.dump(_strip_vectors_for_preds(stage1_outputs), f, indent=2)
         logger.info(f"[EVAL2] Wrote {len(stage1_outputs)} stage1 preds to {preds_path2}")
-        combined_metrics["stage1_caption"] = stage1_metrics
+        combined_metrics["stage1_caption"] = _finalize_mode(
+            "stage1_caption", stage1_metrics, stage1_outputs
+        )
 
     # --- Merge + write eval_metrics.json ---
     # Sharded mode: write shard-local metrics to eval_metrics_shard{i}.json.

@@ -35,6 +35,10 @@ import sys
 from typing import Any, Dict, List
 
 from llm_driving import config as cfg
+from llm_driving.eval_extras import (
+    compute_future_summary,
+    compute_slice_metrics,
+)
 from llm_driving.logging_utils import setup_logging
 from llm_driving.training import (
     _compute_bleu1_list,
@@ -293,8 +297,47 @@ def _merge_stage2(run_dir: str, num_shards: int) -> None:
         logger.info(f"[MERGE2] Wrote {out_path}")
 
         metrics = _recompute_stage2_metrics(merged_outputs)
-        logger.info(f"[MERGE2] {mode} metrics: {metrics}")
+        # E1+E2: recompute future-aware summary and stratified slice metrics
+        # over the concatenated predictions. The per-sample fields needed
+        # (risk_level_future, brake_required_future, risk_transition,
+        # density_bucket, gt_brake_pct, pred_brake_pct) are persisted per
+        # shard by eval_stage2.py.
+        future_summary = compute_future_summary(merged_outputs)
+        slice_metrics = compute_slice_metrics(merged_outputs)
+        metrics = {**metrics, **future_summary, "slices": slice_metrics}
+        logger.info(
+            f"[MERGE2] {mode} metrics (with future + slices): "
+            f"action_acc={metrics.get('action_accuracy'):.4f} "
+            f"missed_brake={metrics.get('missed_brake_rate'):.4f} "
+            f"future_brake_recall={metrics.get('future_brake_recall'):.4f}"
+        )
         combined_metrics[mode] = metrics
+
+        # E3: concat per-shard hard_cases_<mode>_shard{i}.json into a
+        # canonical hard_cases_<mode>.json. Per-shard files were emitted
+        # by eval_stage2._finalize_mode. If any are missing (e.g. an older
+        # eval run), skip silently.
+        hc_records: List[Dict] = []
+        any_missing = False
+        for i in range(num_shards):
+            hc_path_i = os.path.join(
+                stage2_dir, f"hard_cases_{mode}_shard{i}.json"
+            )
+            if not os.path.isfile(hc_path_i):
+                any_missing = True
+                logger.warning(f"[MERGE2] Missing hard cases shard: {hc_path_i}")
+                continue
+            with open(hc_path_i, "r") as f:
+                shard_hc = json.load(f) or []
+            hc_records.extend(shard_hc)
+        if hc_records or not any_missing:
+            hc_out = os.path.join(stage2_dir, f"hard_cases_{mode}.json")
+            with open(hc_out, "w") as f:
+                json.dump(hc_records, f, indent=2)
+            logger.info(
+                f"[MERGE2] {mode}: wrote {len(hc_records)} merged hard cases "
+                f"to {hc_out}"
+            )
 
     metrics_path = os.path.join(stage2_dir, "eval_metrics.json")
     existing: Dict = {}
