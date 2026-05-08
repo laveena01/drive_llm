@@ -109,14 +109,26 @@ class VectorPrefixEncoder(nn.Module):
         # --- Project from hidden_dim to t5_d_model ---
         self.to_prefix = nn.Linear(cfg.hidden_dim, cfg.t5_d_model)
 
-    def forward(self, vectors: torch.Tensor, num_objects: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        vectors: torch.Tensor,
+        num_objects: torch.Tensor,
+        return_hidden: bool = False,
+    ) -> torch.Tensor:
         """
         Args:
             vectors:     (B, MAX_OBJECTS, VECTOR_DIM) raw object vectors.
                          Last dim is type_id (categorical).
             num_objects:  (B,) number of valid objects per sample.
+            return_hidden: if True, return the pre-projection prefix in
+                hidden_dim space `(B, PREFIX_LEN, hidden_dim)` instead of the
+                T5-projected output. Used by `TemporalVectorEncoder` so the
+                temporal attention runs in hidden_dim before sharing the
+                final `to_prefix` projection.
+
         Returns:
-            prefix:      (B, PREFIX_LEN, t5_d_model) prefix embeddings for T5.
+            prefix:      (B, PREFIX_LEN, t5_d_model) prefix embeddings for T5,
+                         or `(B, PREFIX_LEN, hidden_dim)` when `return_hidden`.
         """
         B, M, D = vectors.shape
         device = vectors.device
@@ -194,8 +206,169 @@ class VectorPrefixEncoder(nn.Module):
         slot_positions = torch.arange(self.cfg.prefix_len, device=device)
         prefix = prefix + self.slot_position_embed(slot_positions).unsqueeze(0)
 
+        if return_hidden:
+            return prefix  # (B, prefix_len, hidden_dim)
+
         # --- Project to T5 embedding space ---
         out = self.to_prefix(prefix)  # (B, prefix_len, t5_d_model)
+        return out
+
+
+# ---------------------------------------------------------------------------
+# Step 2 / Part B — TemporalVectorEncoder
+# ---------------------------------------------------------------------------
+
+
+class TemporalVectorEncoder(nn.Module):
+    """
+    Adds a temporal axis to the vector-prefix pipeline.
+
+    Pipeline:
+
+        vectors_window: (B, K, MAX_OBJECTS, VECTOR_DIM)
+        num_objects_window: (B, K)
+        window_len: (B,)
+
+            ── shared VectorPrefixEncoder applied per frame, returning
+               hidden_dim prefix (no projection yet) ──>
+        per_frame_hidden: (B, K, prefix_len, hidden_dim)
+
+            ── add learned frame-position embedding along K ──>
+            ── per prefix slot, attend across K frames with a small
+               TransformerEncoder; key_padding_mask blanks scene-start
+               padding slots so the temporal axis only sees real frames ──>
+            ── readout: take the *last* frame (slot K-1, the current
+               frame), giving a temporally-conditioned prefix in
+               hidden_dim ──>
+        out_hidden: (B, prefix_len, hidden_dim)
+
+            ── reuse the inner encoder's `to_prefix` projection so the
+               output lives in T5 embedding space ──>
+        prefix: (B, prefix_len, t5_d_model)   ← matches single-frame shape
+
+    Output shape into T5 is identical to the per-frame encoder, so
+    `VectorPrefixT5._build_prefix_inputs` can swap one for the other
+    without surgery on the rest of Stage 1.
+
+    Notes:
+    - The per-frame encoder is *shared* across the K frames (parameter-
+      efficient, forces generalisation across timesteps).
+    - Slot position embeddings come from the inner encoder; frame position
+      embeddings are added here, on the K axis.
+    - The readout takes the *last* frame deliberately so the model learns
+      to summarise "what happened up to now" rather than averaging across
+      time. Mean-pooling readouts collapse the temporal asymmetry.
+    """
+
+    def __init__(
+        self,
+        cfg: VectorEncoderConfig,
+        temporal_window: int = 4,
+        temporal_n_layers: int = 2,
+        temporal_n_heads: int = 4,
+        temporal_dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.cfg = cfg
+        if temporal_window < 1:
+            raise ValueError(f"temporal_window must be >= 1, got {temporal_window}")
+        self.K = int(temporal_window)
+
+        # Shared per-frame encoder (re-used for every frame in the window).
+        self.inner = VectorPrefixEncoder(cfg)
+
+        # Frame-position embedding (one per slot in the K-window).
+        self.frame_position_embed = nn.Embedding(self.K, cfg.hidden_dim)
+
+        # Temporal transformer: small, attends across K tokens per slot.
+        layer = nn.TransformerEncoderLayer(
+            d_model=cfg.hidden_dim,
+            nhead=temporal_n_heads,
+            dim_feedforward=cfg.hidden_dim * 4,
+            dropout=temporal_dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.temporal_encoder = nn.TransformerEncoder(layer, num_layers=temporal_n_layers)
+
+    @property
+    def to_prefix(self) -> nn.Linear:
+        """Expose the inner encoder's projection so checkpoint paths that
+        save/load this module find the same name."""
+        return self.inner.to_prefix
+
+    def forward(
+        self,
+        vectors_window: torch.Tensor,
+        num_objects_window: torch.Tensor,
+        window_len: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Args:
+            vectors_window:     (B, K, MAX_OBJECTS, VECTOR_DIM)
+            num_objects_window: (B, K) long tensor; valid objects per past frame
+            window_len:         (B,) long tensor; number of *real* frames in
+                                the right-aligned window (1..K). Frames at
+                                slots [0 .. K - window_len - 1] are padding.
+
+        Returns:
+            prefix: (B, prefix_len, t5_d_model)
+        """
+        if vectors_window.dim() != 4:
+            raise ValueError(
+                f"vectors_window must be 4-D (B, K, M, D); got {tuple(vectors_window.shape)}"
+            )
+        B, K, M, D = vectors_window.shape
+        if K != self.K:
+            raise ValueError(
+                f"vectors_window has K={K}, but TemporalVectorEncoder was "
+                f"configured with K={self.K}"
+            )
+        device = vectors_window.device
+
+        # 1) Per-frame encode (shared weights). Hidden-dim path so we can
+        #    aggregate before the T5 projection.
+        vw_flat = vectors_window.reshape(B * K, M, D)
+        nw_flat = num_objects_window.reshape(B * K)
+        per_frame_hidden = self.inner(
+            vw_flat, nw_flat, return_hidden=True
+        )  # (B*K, prefix_len, hidden_dim)
+        prefix_len = per_frame_hidden.shape[1]
+        H = per_frame_hidden.shape[2]
+        per_frame_hidden = per_frame_hidden.reshape(B, K, prefix_len, H)
+
+        # 2) Add frame-position embedding along K.
+        frame_idx = torch.arange(K, device=device)
+        frame_pos = self.frame_position_embed(frame_idx)  # (K, H)
+        per_frame_hidden = per_frame_hidden + frame_pos.view(1, K, 1, H)
+
+        # 3) Per prefix slot, attend across K frames. Reshape so each slot
+        #    is its own sequence of length K. Each slot's embedding evolves
+        #    over time.
+        x = per_frame_hidden.permute(0, 2, 1, 3).reshape(B * prefix_len, K, H)
+
+        # 4) Build temporal padding mask. Window is right-aligned, so the
+        #    leading (K - window_len) slots per sample are padding.
+        slot_idx = torch.arange(K, device=device).unsqueeze(0)              # (1, K)
+        threshold = (K - window_len.to(device)).unsqueeze(1)                # (B, 1)
+        kp_mask_per_sample = (slot_idx < threshold)                          # (B, K) True=pad
+        # Defensive: never let *all* K slots be masked (would NaN attention);
+        # the data path already guarantees window_len >= 1, so the last slot
+        # is always real.
+        kp_mask_per_sample[:, K - 1] = False
+        kp_mask = (
+            kp_mask_per_sample.unsqueeze(1)
+            .expand(B, prefix_len, K)
+            .reshape(B * prefix_len, K)
+        )
+
+        x = self.temporal_encoder(x, src_key_padding_mask=kp_mask)
+        # (B*prefix_len, K, H)
+
+        # 5) Read out the last (current) frame and project to T5 d_model.
+        x = x.reshape(B, prefix_len, K, H)[:, :, K - 1, :]  # (B, prefix_len, H)
+        out = self.inner.to_prefix(x)  # (B, prefix_len, t5_d_model)
         return out
 
 

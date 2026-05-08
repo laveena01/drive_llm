@@ -223,6 +223,27 @@ def main() -> None:
         vectors_t = torch.tensor([vectors], dtype=torch.float32).to(cap_device)
         num_obj_t = torch.tensor([num_obj], dtype=torch.long).to(cap_device)
 
+        # Step 2 / Part B — temporal-window kwargs for temporal caption model.
+        vw_t = now_t = wl_t = None
+        if getattr(caption_model, "use_temporal", False):
+            K = int(getattr(cfg, "TEMPORAL_WINDOW", 4))
+            vw_sample = sample.get("vectors_window", None)
+            now_sample = sample.get("num_objects_window", None)
+            wl_sample = sample.get("window_len", None)
+            if vw_sample is not None and now_sample is not None and wl_sample is not None:
+                vw_t = torch.tensor([vw_sample], dtype=torch.float32).to(cap_device)
+                now_t = torch.tensor([now_sample], dtype=torch.long).to(cap_device)
+                wl_t = torch.tensor([int(wl_sample)], dtype=torch.long).to(cap_device)
+            else:
+                vw_t = torch.zeros(
+                    1, K, cfg.MAX_OBJECTS, cfg.VECTOR_DIM,
+                    dtype=torch.float32, device=cap_device,
+                )
+                vw_t[0, K - 1] = vectors_t[0]
+                now_t = torch.zeros(1, K, dtype=torch.long, device=cap_device)
+                now_t[0, K - 1] = num_obj_t[0]
+                wl_t = torch.tensor([1], dtype=torch.long, device=cap_device)
+
         text_inputs = tokenizer(
             cfg.STAGE1_TEXT_PROMPT,
             return_tensors="pt",
@@ -233,6 +254,9 @@ def main() -> None:
         pred_ids = caption_model.generate(
             vectors=vectors_t,
             num_objects=num_obj_t,
+            vectors_window=vw_t,
+            num_objects_window=now_t,
+            window_len=wl_t,
             input_ids=text_inputs["input_ids"],
             attention_mask=text_inputs["attention_mask"],
             max_new_tokens=cfg.GEN_MAX_NEW_TOKENS_STAGE1,

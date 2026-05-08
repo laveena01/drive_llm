@@ -72,6 +72,23 @@ VECTOR_ENCODER_CONFIG = dict(
     tokens_per_object=TOKENS_PER_OBJECT,  # 6
 )
 
+# -----------------------------
+# Temporal context (Step 2 / Part B)
+# -----------------------------
+# When True, the encoder consumes a sliding window of K=TEMPORAL_WINDOW
+# keyframes [t-K+1 .. t] (past frames + current). The shared
+# VectorPrefixEncoder is applied per frame; a small TemporalTransformer
+# aggregates across frames per prefix slot before the result is injected
+# into T5. Output shape into T5 is unchanged: (B, PREFIX_LEN, T5_D_MODEL).
+#
+# When False, the data path produces single-frame samples (legacy behaviour
+# bit-for-bit) — useful as the K=1 ablation row for the thesis table.
+USE_TEMPORAL = True
+TEMPORAL_WINDOW = 4
+TEMPORAL_TRANSFORMER_LAYERS = 2
+TEMPORAL_TRANSFORMER_HEADS = 4
+TEMPORAL_TRANSFORMER_DROPOUT = 0.1
+
 # Whether to freeze base FLAN-T5 weights (False = full fine-tuning, like the paper)
 FREEZE_BASE_MODEL = False
 

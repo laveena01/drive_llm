@@ -553,12 +553,22 @@ def _train_stage1_prefix(captioning_path: str):
         s["input"] = cfg.STAGE1_TEXT_PROMPT
 
     # Data loaders
+    # Step 2 / Part B — when USE_TEMPORAL is on, the collator must emit
+    # `vectors_window` / `num_objects_window` / `window_len` for the
+    # TemporalVectorEncoder. When off, `temporal_window=0` keeps the batch
+    # bit-for-bit identical to the pre-Step-2 baseline.
+    _collator_temporal_window = (
+        int(getattr(cfg, "TEMPORAL_WINDOW", 4))
+        if bool(getattr(cfg, "USE_TEMPORAL", False))
+        else 0
+    )
     collator = VectorPrefixDataCollator(
         tokenizer=tokenizer,
         max_input_length=cfg.STAGE1_MAX_INPUT_LEN,
         max_target_length=cfg.STAGE1_MAX_TARGET_LEN,
         max_objects=cfg.MAX_OBJECTS,
         vector_dim=cfg.VECTOR_DIM,
+        temporal_window=_collator_temporal_window,
     )
 
     train_loader = DataLoader(
@@ -615,12 +625,24 @@ def _train_stage1_prefix(captioning_path: str):
                     attention_mask = batch["attention_mask"]
                     labels = batch["labels"]
 
+                    # Step 2 / Part B — temporal-window batch keys are
+                    # present iff the collator was constructed with
+                    # `temporal_window > 0`. Pass them through unconditionally;
+                    # the wrapper picks the right path based on its own
+                    # `use_temporal` flag.
+                    vectors_window = batch.get("vectors_window", None)
+                    num_objects_window = batch.get("num_objects_window", None)
+                    window_len = batch.get("window_len", None)
+
                     outputs = model(
                         vectors=vectors,
                         num_objects=num_objects,
                         input_ids=input_ids,
                         attention_mask=attention_mask,
                         labels=labels,
+                        vectors_window=vectors_window,
+                        num_objects_window=num_objects_window,
+                        window_len=window_len,
                     )
                     loss = outputs.loss
 
@@ -833,6 +855,17 @@ def _validate_stage1_prefix(model, val_loader, tokenizer, device, generate=True)
             attention_mask = batch["attention_mask"].to(device)
             labels = batch["labels"].to(device)
 
+            # Step 2 / Part B — temporal kwargs propagated to val loop too.
+            vectors_window = batch.get("vectors_window", None)
+            num_objects_window = batch.get("num_objects_window", None)
+            window_len = batch.get("window_len", None)
+            if vectors_window is not None:
+                vectors_window = vectors_window.to(device)
+            if num_objects_window is not None:
+                num_objects_window = num_objects_window.to(device)
+            if window_len is not None:
+                window_len = window_len.to(device)
+
             # Loss (always computed — fast forward pass)
             outputs = model(
                 vectors=vectors,
@@ -840,6 +873,9 @@ def _validate_stage1_prefix(model, val_loader, tokenizer, device, generate=True)
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 labels=labels,
+                vectors_window=vectors_window,
+                num_objects_window=num_objects_window,
+                window_len=window_len,
             )
             total_loss += outputs.loss.item()
             n_batches += 1
@@ -851,6 +887,9 @@ def _validate_stage1_prefix(model, val_loader, tokenizer, device, generate=True)
                     num_objects=num_objects,
                     input_ids=input_ids,
                     attention_mask=attention_mask,
+                    vectors_window=vectors_window,
+                    num_objects_window=num_objects_window,
+                    window_len=window_len,
                     max_new_tokens=cfg.GEN_MAX_NEW_TOKENS_STAGE1,
                     num_beams=cfg.GEN_NUM_BEAMS,
                 )
@@ -1287,6 +1326,32 @@ def _train_stage2_with_lora(model_stage1, tokenizer, qa_path: str):
         vectors_t = torch.tensor([vectors], dtype=torch.float32).to(cap_device)
         num_obj_t = torch.tensor([num_obj], dtype=torch.long).to(cap_device)
 
+        # Step 2 / Part B — when caption_model is a temporal VectorPrefixT5,
+        # also build a (1, K, M, D) window from sample fields. Falls back to
+        # a 1-frame window made of the current sample's vectors if window
+        # fields are missing (e.g. dataset built before Part B).
+        vw_t = now_t = wl_t = None
+        if getattr(caption_model, "use_temporal", False):
+            K = int(getattr(cfg, "TEMPORAL_WINDOW", 4))
+            vw_sample = sample.get("vectors_window", None)
+            now_sample = sample.get("num_objects_window", None)
+            wl_sample = sample.get("window_len", None)
+            if vw_sample is not None and now_sample is not None and wl_sample is not None:
+                vw_t = torch.tensor([vw_sample], dtype=torch.float32).to(cap_device)
+                now_t = torch.tensor([now_sample], dtype=torch.long).to(cap_device)
+                wl_t = torch.tensor([int(wl_sample)], dtype=torch.long).to(cap_device)
+            else:
+                # Fallback: synthesise a 1-frame window from `vectors` so the
+                # model still runs (with no temporal context to leverage).
+                vw_t = torch.zeros(
+                    1, K, cfg.MAX_OBJECTS, cfg.VECTOR_DIM,
+                    dtype=torch.float32, device=cap_device,
+                )
+                vw_t[0, K - 1] = vectors_t[0]
+                now_t = torch.zeros(1, K, dtype=torch.long, device=cap_device)
+                now_t[0, K - 1] = num_obj_t[0]
+                wl_t = torch.tensor([1], dtype=torch.long, device=cap_device)
+
         text_inputs = tokenizer(
             cfg.STAGE1_TEXT_PROMPT,
             return_tensors="pt",
@@ -1297,6 +1362,9 @@ def _train_stage2_with_lora(model_stage1, tokenizer, qa_path: str):
         pred_ids = caption_model.generate(
             vectors=vectors_t,
             num_objects=num_obj_t,
+            vectors_window=vw_t,
+            num_objects_window=now_t,
+            window_len=wl_t,
             input_ids=text_inputs["input_ids"],
             attention_mask=text_inputs["attention_mask"],
             max_new_tokens=cfg.GEN_MAX_NEW_TOKENS_STAGE1,

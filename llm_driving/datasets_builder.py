@@ -20,7 +20,13 @@ import re
 
 from .nuscenes_data import get_scene_frames_vectors, init_nuscenes
 from .langen import lanGen, vector_to_string
-from .config import CAPTIONING_DATA_PATH, QA_DATA_PATH, MAX_OBJECTS
+from .config import (
+    CAPTIONING_DATA_PATH,
+    QA_DATA_PATH,
+    MAX_OBJECTS,
+    USE_TEMPORAL,
+    TEMPORAL_WINDOW,
+)
 from llm_driving.eval_extras import enrich_qa_samples
 from llm_driving.risk_calculator import calculate_risk_from_vectors, get_risk_summary_text, policy_from_risk
 
@@ -28,6 +34,11 @@ logger = logging.getLogger("llm_driving")
 
 # Track policy decisions for logging (per-frame, not per-question)
 _policy_log: List[Dict] = []
+
+# Step 2 / Part A — log the first observed real ego_speed once per build run
+# so a regression that silently falls back to DEFAULT_EGO_SPEED is easy to
+# spot in the build log.
+_logged_first_ego_speed: bool = False
 
 PAPER_FORMAT_INSTRUCTION = (
     "You are an AI Driver.\n"
@@ -131,11 +142,29 @@ def _make_samples_from_frames(
         num_objects = int(frame["num_objects"])
         use_n = min(num_objects, MAX_OBJECTS)
 
+        # Step 2 / Part A — real ego-motion. `ego_speed` now arrives from
+        # `nuscenes_data.get_scene_frames_vectors` (central-difference of
+        # consecutive ego-pose translations). Pre-Part-A code passed
+        # `ego_speed=None`, which caused `risk_calculator` to fall back to
+        # the constant `DEFAULT_EGO_SPEED=10.0`. We log the first non-None
+        # value once per builder invocation so a build run that silently
+        # regresses to the constant fallback is easy to spot.
+        ego_speed = frame.get("ego_speed", None)
+        if ego_speed is not None:
+            ego_speed = float(ego_speed)
+        global _logged_first_ego_speed
+        if not _logged_first_ego_speed and ego_speed is not None:
+            logger.info(
+                f"[datasets_builder] First non-None ego_speed observed: "
+                f"{ego_speed:.2f} m/s (scene_idx={scene_idx}, frame_in_scene={idx})"
+            )
+            _logged_first_ego_speed = True
+
         # Risk (Stage-2 only)
         risk_data = calculate_risk_from_vectors(
             vectors=frame["vectors"],
             use_n=use_n,
-            ego_speed=None,
+            ego_speed=ego_speed,
             traffic_light=None,
         )
         risk_text = get_risk_summary_text(risk_data)
@@ -148,12 +177,31 @@ def _make_samples_from_frames(
 
         vec_str = vector_to_string(frame["vectors"], num_objects)
 
+        # Step 2 / Part B — temporal-window fields, present iff USE_TEMPORAL.
+        # `vectors_window` is right-aligned (current frame at slot K-1) and
+        # zero-padded for scene-start frames. `window_len` reports how many
+        # real frames the window contains; the temporal transformer uses it
+        # as a key_padding_mask to ignore the leading padding slots.
+        temporal_extras: Dict = {}
+        if "vectors_window" in frame:
+            vw = frame["vectors_window"]
+            now = frame["num_objects_window"]
+            temporal_extras = {
+                "vectors_window": vw.tolist() if hasattr(vw, "tolist") else vw,
+                "num_objects_window": now.tolist() if hasattr(now, "tolist") else list(now),
+                "window_len": int(frame["window_len"]),
+            }
+
         # --- Stage 1: vector -> caption (caption-only target) ---
         captioning_samples.append({
             "input": f"Describe the driving scene from object vectors:\n{vec_str}",
             "target": caption,
             "vectors": frame["vectors"].tolist(),
             "num_objects": int(use_n),
+            # Step 2 / Part A: persist real ego_speed so it round-trips
+            # through JSON and is available at inference + analysis time.
+            "ego_speed": float(ego_speed) if ego_speed is not None else None,
+            **temporal_extras,
         })
 
         # --- metadata: min_dist ---
@@ -220,10 +268,13 @@ def _make_samples_from_frames(
                 "min_dist": float(min_dist),
                 "policy_label": str(policy_label),
                 "use_n": int(use_n),
+                # Step 2 / Part A: real ego_speed persisted on every QA row.
+                "ego_speed": float(ego_speed) if ego_speed is not None else None,
 
                 "frame_idx": int(frame_idx_global),
                 "scene_idx": int(scene_idx),
                 "frame_in_scene": int(idx),
+                **temporal_extras,  # Step 2 / Part B
             })
 
         # --- Stage 2 samples: RISK questions ---
@@ -258,10 +309,13 @@ def _make_samples_from_frames(
                 "min_dist": float(min_dist),
                 "policy_label": str(policy_label),
                 "use_n": int(use_n),
+                # Step 2 / Part A: real ego_speed persisted on every QA row.
+                "ego_speed": float(ego_speed) if ego_speed is not None else None,
 
                 "frame_idx": int(frame_idx_global),
                 "scene_idx": int(scene_idx),
                 "frame_in_scene": int(idx),
+                **temporal_extras,  # Step 2 / Part B
             })
 
         if (idx + 1) % 50 == 0:
@@ -306,8 +360,9 @@ def build_datasets_full_mini(
     captioning_path: str = CAPTIONING_DATA_PATH,
     qa_path: str = QA_DATA_PATH,
 ) -> tuple[list, list]:
-    global _policy_log
+    global _policy_log, _logged_first_ego_speed
     _policy_log = []  # Reset for fresh run
+    _logged_first_ego_speed = False  # so the first ego_speed log fires again
 
     logger.info("[datasets_builder] Initializing nuScenes for full-mini dataset creation...")
     nusc = init_nuscenes()
@@ -320,12 +375,25 @@ def build_datasets_full_mini(
     logger.info(f"[datasets_builder]   max_frames_per_scene = {max_frames_per_scene}")
     logger.info(f"[datasets_builder]   action_questions={len(ACTION_QUESTIONS)} risk_questions={len(RISK_QUESTIONS)}")
 
+    # Step 2 / Part B: when USE_TEMPORAL is on, get_scene_frames_vectors
+    # also attaches `vectors_window`, `num_objects_window`, `window_len` per
+    # frame (right-aligned K-frame window in the *current* frame's ego
+    # coordinates). When USE_TEMPORAL is off, those keys are absent and the
+    # data path remains bit-for-bit identical to the pre-Step-2 baseline.
+    temporal_window_arg = TEMPORAL_WINDOW if USE_TEMPORAL else None
+    if USE_TEMPORAL:
+        logger.info(
+            f"[datasets_builder] Temporal context enabled: K={TEMPORAL_WINDOW} "
+            f"keyframes (≈{TEMPORAL_WINDOW * 0.5:.1f}s at 2Hz)"
+        )
+
     for scene_idx in range(num_scenes):
         logger.info(f"\n[datasets_builder] Processing scene {scene_idx}/{num_scenes - 1}...")
         frames = get_scene_frames_vectors(
             nusc,
             scene_idx=scene_idx,
             max_frames=max_frames_per_scene,
+            temporal_window=temporal_window_arg,
         )
         logger.info(f"[datasets_builder]   Retrieved {len(frames)} frames from scene {scene_idx}.")
         _make_samples_from_frames(frames, captioning_samples, qa_samples, scene_idx=scene_idx)

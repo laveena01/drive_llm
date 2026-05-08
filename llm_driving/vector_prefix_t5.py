@@ -23,7 +23,12 @@ import torch
 import torch.nn as nn
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
-from llm_driving.vector_encoder import VectorPrefixEncoder, VectorEncoderConfig
+from llm_driving.vector_encoder import (
+    TemporalVectorEncoder,
+    VectorPrefixEncoder,
+    VectorEncoderConfig,
+)
+from llm_driving import config as cfg
 
 logger = logging.getLogger("llm_driving")
 
@@ -41,6 +46,12 @@ class VectorPrefixT5(nn.Module):
 
     On generate():
         Same prefix injection, then call T5.generate() with inputs_embeds.
+
+    Step 2 / Part B: when ``cfg.USE_TEMPORAL`` is True, the wrapped encoder
+    is `TemporalVectorEncoder` and the forward/generate paths consume
+    ``vectors_window`` / ``num_objects_window`` / ``window_len`` instead of
+    the single-frame ``vectors`` / ``num_objects`` (which are still accepted
+    as kwargs for backward compatibility).
     """
 
     def __init__(
@@ -48,6 +59,7 @@ class VectorPrefixT5(nn.Module):
         model_name: str,
         encoder_config: VectorEncoderConfig,
         tokenizer: Optional[AutoTokenizer] = None,
+        use_temporal: Optional[bool] = None,
     ):
         super().__init__()
 
@@ -57,8 +69,33 @@ class VectorPrefixT5(nn.Module):
         # Load or accept tokenizer
         self.tokenizer = tokenizer or AutoTokenizer.from_pretrained(model_name)
 
-        # Vector prefix encoder
-        self.vector_encoder = VectorPrefixEncoder(encoder_config)
+        # Decide encoder variant. Default reads `USE_TEMPORAL` from config so
+        # an `accelerate launch ... main.py` run with the flag flipped does
+        # the right thing without code changes elsewhere. Tests can override
+        # explicitly via the constructor arg.
+        self.use_temporal = (
+            bool(getattr(cfg, "USE_TEMPORAL", False))
+            if use_temporal is None
+            else bool(use_temporal)
+        )
+
+        if self.use_temporal:
+            self.vector_encoder = TemporalVectorEncoder(
+                cfg=encoder_config,
+                temporal_window=int(getattr(cfg, "TEMPORAL_WINDOW", 4)),
+                temporal_n_layers=int(getattr(cfg, "TEMPORAL_TRANSFORMER_LAYERS", 2)),
+                temporal_n_heads=int(getattr(cfg, "TEMPORAL_TRANSFORMER_HEADS", 4)),
+                temporal_dropout=float(getattr(cfg, "TEMPORAL_TRANSFORMER_DROPOUT", 0.1)),
+            )
+            logger.info(
+                "[VectorPrefixT5] Using TemporalVectorEncoder "
+                f"(K={getattr(cfg, 'TEMPORAL_WINDOW', 4)}, "
+                f"layers={getattr(cfg, 'TEMPORAL_TRANSFORMER_LAYERS', 2)}, "
+                f"heads={getattr(cfg, 'TEMPORAL_TRANSFORMER_HEADS', 4)})"
+            )
+        else:
+            self.vector_encoder = VectorPrefixEncoder(encoder_config)
+            logger.info("[VectorPrefixT5] Using single-frame VectorPrefixEncoder")
 
         # Store config
         self.encoder_config = encoder_config
@@ -76,14 +113,25 @@ class VectorPrefixT5(nn.Module):
 
     def _build_prefix_inputs(
         self,
-        vectors: torch.Tensor,
-        num_objects: torch.Tensor,
+        vectors: Optional[torch.Tensor],
+        num_objects: Optional[torch.Tensor],
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
+        vectors_window: Optional[torch.Tensor] = None,
+        num_objects_window: Optional[torch.Tensor] = None,
+        window_len: Optional[torch.Tensor] = None,
     ):
         """
         Build inputs_embeds and extended attention_mask by prepending
         vector prefix embeddings to text embeddings.
+
+        Single-frame path (legacy, ``self.use_temporal=False``): consumes
+        ``vectors`` (B, M, D) + ``num_objects`` (B,).
+
+        Temporal path (Step 2 / Part B, ``self.use_temporal=True``): consumes
+        ``vectors_window`` (B, K, M, D) + ``num_objects_window`` (B, K) +
+        ``window_len`` (B,). The single-frame kwargs may also be passed
+        through (e.g. by HF Trainer) but are unused on this path.
 
         Returns:
             inputs_embeds: (B, prefix_len + seq_len, d_model)
@@ -93,7 +141,26 @@ class VectorPrefixT5(nn.Module):
         device = input_ids.device
 
         # 1. Encode vectors -> prefix embeddings
-        prefix_embeds = self.vector_encoder(vectors, num_objects)  # (B, prefix_len, d_model)
+        if self.use_temporal:
+            if vectors_window is None or num_objects_window is None or window_len is None:
+                raise ValueError(
+                    "VectorPrefixT5 was constructed with use_temporal=True but "
+                    "vectors_window / num_objects_window / window_len were not "
+                    "provided. Check that the data collator was instantiated "
+                    "with temporal_window > 0 and that batch keys are passed "
+                    "through the training loop."
+                )
+            prefix_embeds = self.vector_encoder(
+                vectors_window, num_objects_window, window_len
+            )
+        else:
+            if vectors is None or num_objects is None:
+                raise ValueError(
+                    "VectorPrefixT5 was constructed with use_temporal=False but "
+                    "vectors / num_objects were not provided."
+                )
+            prefix_embeds = self.vector_encoder(vectors, num_objects)
+        # prefix_embeds: (B, prefix_len, d_model)
 
         # 2. Embed text input_ids
         text_embeds = self.t5.shared(input_ids)  # (B, seq_len, d_model)
@@ -112,21 +179,31 @@ class VectorPrefixT5(nn.Module):
 
     def forward(
         self,
-        vectors: torch.Tensor,
-        num_objects: torch.Tensor,
         input_ids: torch.Tensor,
+        vectors: Optional[torch.Tensor] = None,
+        num_objects: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
         decoder_input_ids: Optional[torch.Tensor] = None,
         decoder_attention_mask: Optional[torch.Tensor] = None,
+        vectors_window: Optional[torch.Tensor] = None,
+        num_objects_window: Optional[torch.Tensor] = None,
+        window_len: Optional[torch.Tensor] = None,
         **kwargs,
     ):
         """
         Forward pass with vector prefix injection.
 
-        Args:
+        Single-frame path (use_temporal=False):
             vectors:         (B, MAX_OBJECTS, VECTOR_DIM) raw object vectors
             num_objects:     (B,) valid object count per sample
+
+        Temporal path (use_temporal=True, Step 2 / Part B):
+            vectors_window:     (B, K, MAX_OBJECTS, VECTOR_DIM)
+            num_objects_window: (B, K)
+            window_len:         (B,)
+
+        Common:
             input_ids:       (B, seq_len) tokenized text input
             attention_mask:  (B, seq_len) text attention mask
             labels:          (B, target_len) decoder target token IDs
@@ -137,7 +214,13 @@ class VectorPrefixT5(nn.Module):
             Seq2SeqLMOutput with loss (if labels provided) and logits
         """
         inputs_embeds, extended_mask = self._build_prefix_inputs(
-            vectors, num_objects, input_ids, attention_mask
+            vectors=vectors,
+            num_objects=num_objects,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            vectors_window=vectors_window,
+            num_objects_window=num_objects_window,
+            window_len=window_len,
         )
 
         # Forward through T5 with inputs_embeds (NOT input_ids)
@@ -152,27 +235,31 @@ class VectorPrefixT5(nn.Module):
 
     def generate(
         self,
-        vectors: torch.Tensor,
-        num_objects: torch.Tensor,
         input_ids: torch.Tensor,
+        vectors: Optional[torch.Tensor] = None,
+        num_objects: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        vectors_window: Optional[torch.Tensor] = None,
+        num_objects_window: Optional[torch.Tensor] = None,
+        window_len: Optional[torch.Tensor] = None,
         **generate_kwargs,
     ):
         """
-        Generate text with vector prefix injection.
-
-        Args:
-            vectors:         (B, MAX_OBJECTS, VECTOR_DIM) raw object vectors
-            num_objects:     (B,) valid object count per sample
-            input_ids:       (B, seq_len) tokenized text prompt
-            attention_mask:  (B, seq_len) text attention mask
-            **generate_kwargs: passed to T5.generate() (max_new_tokens, num_beams, etc.)
+        Generate text with vector prefix injection. Accepts either the
+        single-frame inputs or the temporal-window inputs depending on
+        ``self.use_temporal`` (the encoder enforces the right one).
 
         Returns:
             Generated token IDs (B, gen_len)
         """
         inputs_embeds, extended_mask = self._build_prefix_inputs(
-            vectors, num_objects, input_ids, attention_mask
+            vectors=vectors,
+            num_objects=num_objects,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            vectors_window=vectors_window,
+            num_objects_window=num_objects_window,
+            window_len=window_len,
         )
 
         # Use T5.generate() with inputs_embeds
