@@ -164,12 +164,34 @@ COMPUTE_CONTROL_METRICS = True
 # -----------------------------
 RUNS_DIR = "runs"
 
-# RUN_ID can be pinned via env var so a pre-build step (e.g. `build_data.py`)
-# and the subsequent multi-GPU `accelerate launch main.py` resolve to the
-# *same* runs/<RUN_ID>/ folder, letting the second run skip dataset building
-# and avoid the NCCL distributed-barrier timeout (default 10 min) that
-# otherwise fires while rank 0 builds trainval data alone for ~hours.
-RUN_ID = os.environ.get("RUN_ID") or datetime.now().strftime("%Y%m%d_%H%M%S")
+# RUN_ID resolution order (so `python build_data.py` followed by
+# `accelerate launch main.py` shares runs/<RUN_ID>/data/ without the user
+# having to manage an env var):
+#
+#   1. RUN_ID env var if set — explicit override always wins.
+#   2. runs/.latest_build_run_id pointer file — written by build_data.py
+#      after a successful build. Lets subsequent training runs auto-pick
+#      up the most recent dataset build with no extra typing.
+#   3. Fresh timestamp — used when neither of the above is available
+#      (e.g. first invocation of build_data.py, or a totally fresh repo).
+def _resolve_run_id() -> str:
+    env = os.environ.get("RUN_ID")
+    if env:
+        return env
+    pointer_path = os.path.join("runs", ".latest_build_run_id")
+    try:
+        if os.path.isfile(pointer_path):
+            with open(pointer_path, "r") as f:
+                pinned = f.read().strip()
+            if pinned:
+                return pinned
+    except Exception:
+        # Defensive: a corrupt pointer file should never block the run.
+        pass
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+RUN_ID = _resolve_run_id()
 RUN_DIR = os.path.join(RUNS_DIR, RUN_ID)
 
 DATA_DIR = os.path.join(RUN_DIR, "data")

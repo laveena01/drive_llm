@@ -97,14 +97,30 @@ def main() -> None:
         qa_path=QA_DATA_PATH,
     )
 
+    # Drop a pointer to this RUN_ID so the next `accelerate launch main.py`
+    # auto-resolves to the same run dir without the user having to export
+    # RUN_ID manually. config._resolve_run_id() reads it. Explicit RUN_ID
+    # env var still wins over this pointer.
+    pointer_path = os.path.join("runs", ".latest_build_run_id")
+    try:
+        os.makedirs(os.path.dirname(pointer_path), exist_ok=True)
+        with open(pointer_path, "w") as f:
+            f.write(RUN_ID + "\n")
+        logger.info(f"[BUILD_DATA] Wrote latest-build pointer: {pointer_path} -> {RUN_ID}")
+    except Exception as e:
+        logger.warning(
+            f"[BUILD_DATA] Could not write pointer {pointer_path}: {e}. "
+            f"Falling back: pass RUN_ID={RUN_ID} explicitly to the next launch."
+        )
+
     logger.info(
         f"[BUILD_DATA] DONE. "
         f"{len(captioning_samples)} captioning samples, "
         f"{len(qa_samples)} QA samples."
     )
     logger.info(
-        "[BUILD_DATA] Next step: "
-        f"`RUN_ID={RUN_ID} accelerate launch --num_processes=3 main.py`"
+        "[BUILD_DATA] Next step: `accelerate launch --num_processes=3 main.py` "
+        "(RUN_ID auto-detected from the pointer file)."
     )
 
 
