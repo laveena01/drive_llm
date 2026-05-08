@@ -164,7 +164,12 @@ COMPUTE_CONTROL_METRICS = True
 # -----------------------------
 RUNS_DIR = "runs"
 
-RUN_ID = datetime.now().strftime("%Y%m%d_%H%M%S")
+# RUN_ID can be pinned via env var so a pre-build step (e.g. `build_data.py`)
+# and the subsequent multi-GPU `accelerate launch main.py` resolve to the
+# *same* runs/<RUN_ID>/ folder, letting the second run skip dataset building
+# and avoid the NCCL distributed-barrier timeout (default 10 min) that
+# otherwise fires while rank 0 builds trainval data alone for ~hours.
+RUN_ID = os.environ.get("RUN_ID") or datetime.now().strftime("%Y%m%d_%H%M%S")
 RUN_DIR = os.path.join(RUNS_DIR, RUN_ID)
 
 DATA_DIR = os.path.join(RUN_DIR, "data")
