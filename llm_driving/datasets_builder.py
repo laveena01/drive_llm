@@ -16,6 +16,7 @@ from typing import List, Dict
 from collections import Counter
 import json
 import logging
+import os
 import re
 
 from .nuscenes_data import get_scene_frames_vectors, init_nuscenes
@@ -410,6 +411,14 @@ def build_datasets_full_mini(
     # idempotent — eval_stage2.py also calls enrich_qa_samples for
     # backwards compatibility with older datasets.
     enrich_qa_samples(qa_samples, horizon=4)
+
+    # Ensure the parent directories of the output JSON paths exist. The Step 1
+    # "side-effect-free config" refactor removed import-time dir creation, and
+    # `setup_logging` only creates RUN_DIR — it does NOT create RUN_DIR/data/.
+    # Without this, `open(captioning_path, "w")` raises FileNotFoundError on
+    # a fresh run dir.
+    os.makedirs(os.path.dirname(captioning_path), exist_ok=True)
+    os.makedirs(os.path.dirname(qa_path), exist_ok=True)
 
     logger.info(f"\n[datasets_builder] Saving captioning dataset to: {captioning_path}")
     with open(captioning_path, "w") as f:
