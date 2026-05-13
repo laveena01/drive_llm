@@ -175,12 +175,22 @@ def main() -> None:
     model.eval()
 
     # --- DataLoader ---
+    # Step 2 / Part B: when USE_TEMPORAL is on, the model expects
+    # vectors_window / num_objects_window / window_len in every batch.
+    # Mirror the training-time collator config so the eval batch shape
+    # matches what TemporalVectorEncoder consumes.
+    _collator_temporal_window = (
+        int(getattr(cfg, "TEMPORAL_WINDOW", 4))
+        if bool(getattr(cfg, "USE_TEMPORAL", False))
+        else 0
+    )
     collator = VectorPrefixDataCollator(
         tokenizer=tokenizer,
         max_input_length=cfg.STAGE1_MAX_INPUT_LEN,
         max_target_length=cfg.STAGE1_MAX_TARGET_LEN,
         max_objects=cfg.MAX_OBJECTS,
         vector_dim=cfg.VECTOR_DIM,
+        temporal_window=_collator_temporal_window,
     )
     val_loader = DataLoader(
         VectorPrefixDataset(val_samples),
