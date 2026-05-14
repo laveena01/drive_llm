@@ -91,7 +91,11 @@ def main() -> None:
         data = json.load(f)
 
     # Pick mid-scene action samples with a fully-populated window.
+    # Deduplicate by (scene_idx, frame_in_scene) so each unique frame
+    # appears at most once — the 5 action questions per frame would
+    # otherwise inflate the sample count without adding diversity.
     K = int(cfg.TEMPORAL_WINDOW)
+    seen_frames = set()
     candidates = []
     for sample in data:
         if (
@@ -99,16 +103,20 @@ def main() -> None:
             and int(sample.get("frame_in_scene", 0)) > K
             and int(sample.get("window_len", 1)) == K
         ):
+            key = (sample.get("scene_idx"), sample.get("frame_in_scene"))
+            if key in seen_frames:
+                continue
+            seen_frames.add(key)
             candidates.append(sample)
-        if len(candidates) >= args.n_samples * 3:
+        if len(candidates) >= args.n_samples:
             break
 
     if not candidates:
         print("[M1] No suitable mid-scene samples found.")
         sys.exit(2)
 
-    # Deterministic sub-sample.
-    selected = candidates[: args.n_samples]
+    # Already deduplicated and trimmed to n_samples above.
+    selected = candidates
 
     n_passed = 0
     print(f"\n[M1] Inspecting {len(selected)} captions (mid-scene, fully-populated window):\n")
