@@ -79,9 +79,12 @@ def main() -> None:
     model.eval()
     print(f"[M1] Loaded. use_temporal={getattr(model, 'use_temporal', False)}")
 
-    # Tokenizer for the text prompt.
+    # Tokenizer for the text prompt. Stage 1 saves raw .pt state dicts,
+    # not HF save_pretrained format, so the checkpoint dir doesn't have a
+    # config.json / tokenizer.json. Load from the base model name instead
+    # (same arch ⇒ same tokenizer).
     from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained(stage1_ckpt)
+    tokenizer = AutoTokenizer.from_pretrained(cfg.MODEL_NAME)
 
     print(f"[M1] Loading QA data from {qa_path}")
     with open(qa_path, "r") as f:
