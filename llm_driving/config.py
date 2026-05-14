@@ -142,7 +142,12 @@ STAGE1_BATCH_SIZE = 4
 STAGE1_LR = 2e-5
 STAGE1_WEIGHT_DECAY = 0.0
 STAGE1_MAX_INPUT_LEN = 128
-STAGE1_MAX_TARGET_LEN = 256
+# Step 4 / Part C: bumped from 256 -> 320. The single-frame dense caption
+# (10 objects, ~20 tokens each via `describe_object`) already takes ~200
+# tokens; adding 3 temporal lines for Part C pushed worst-case to 257.
+# 320 leaves a comfortable ~60-token safety margin. Memory cost on
+# FLAN-T5-base at batch 4 is ~+1 GB — negligible on A100 40 GB.
+STAGE1_MAX_TARGET_LEN = 320
 
 # Stage1 text prompt — minimal, forces decoder to rely on prefix embeddings
 STAGE1_TEXT_PROMPT = "Describe:"
