@@ -492,6 +492,57 @@ def policy_from_risk(risk_data: FrameRiskData) -> Tuple[int, int, str, str, str]
     return 20, 0, steer, "Minimal risk, safe to continue.", "CONTINUE"
 
 
+def compute_future_aware_action(
+    risk_data_window: List[FrameRiskData],
+    horizon_seconds_per_step: float = 0.5,
+) -> Tuple[int, int, str, str, str]:
+    """
+    Step 4 / Part B: produce a "future-aware" action for the CURRENT frame
+    given the risk_data sequence [risk_t, risk_{t+1}, ..., risk_{t+H}].
+
+    Semantics: "what should I do NOW knowing what's coming?"
+
+    Rule: if any frame within the lookahead window has a BRAKE policy_label,
+    return that earliest-brake action with a reason explaining that it
+    anticipates future risk. The brake percentage / steer come from the
+    *earliest* future BRAKE so the model learns to react in advance, not
+    wait until current frame is already CRITICAL.
+
+    Falls back to the current frame's per-frame action if no future BRAKE is
+    required. Always returns a 5-tuple of the same shape as policy_from_risk:
+    (accel, brake, steer, reason, policy_label).
+
+    Handles scene-end edge case naturally: if `risk_data_window` is shorter
+    than expected (truncated near scene end), this still works — just
+    examines whatever frames are available.
+    """
+    if not risk_data_window:
+        # Defensive: no frames at all -> CONTINUE.
+        return 20, 0, "straight", "No data available.", "CONTINUE"
+
+    current = risk_data_window[0]
+    current_action = policy_from_risk(current)
+
+    # If current frame ALREADY requires BRAKE, the future-aware action is
+    # the same — keep label consistent.
+    if current_action[4] == "BRAKE":
+        return current_action
+
+    # Look for the earliest future BRAKE.
+    for k in range(1, len(risk_data_window)):
+        future_action = policy_from_risk(risk_data_window[k])
+        if future_action[4] == "BRAKE":
+            accel, brake, steer, reason, label = future_action
+            lookahead_s = k * horizon_seconds_per_step
+            anticipation_reason = (
+                f"Anticipating risk in {lookahead_s:.1f}s: {reason}"
+            )
+            return accel, brake, steer, anticipation_reason, label
+
+    # No future BRAKE in the window — return current frame's action.
+    return current_action
+
+
 def get_risk_summary_text(risk_data: FrameRiskData) -> str:
     """
     Compact, Stage-2 friendly summary (keep short to avoid token bloat).

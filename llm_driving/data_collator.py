@@ -112,7 +112,7 @@ class VectorPrefixDataCollator:
         model_inputs["vectors"] = vectors_batch
         model_inputs["num_objects"] = num_objects_batch
 
-        # --- Build temporal-window tensors (Step 2 / Part B, opt-in) ---
+        # --- Build temporal-window tensors (Step 2 / Part B + Step 4 / Part A) ---
         if self.temporal_window > 0:
             K = self.temporal_window
             vectors_window_batch = torch.zeros(
@@ -120,6 +120,14 @@ class VectorPrefixDataCollator:
             )
             num_objects_window_batch = torch.zeros(batch_size, K, dtype=torch.long)
             window_len_batch = torch.zeros(batch_size, dtype=torch.long)
+            # Step 4 / Part A: per-(frame, slot) "object present" mask. True
+            # means slot j of frame s carries a real object; False means
+            # either scene-start padding or "the anchor object wasn't
+            # visible in that past frame." Defaults to all-True for samples
+            # that pre-date Part A (collator-side backward compatibility).
+            object_present_mask_batch = torch.ones(
+                batch_size, K, self.max_objects, dtype=torch.bool
+            )
 
             for i, f in enumerate(features):
                 vw = f.get("vectors_window", None)
@@ -145,6 +153,27 @@ class VectorPrefixDataCollator:
 
                     wl = f.get("window_len", k_sample)
                     window_len_batch[i] = max(1, min(int(wl), K))
+
+                    # Object-present mask (Step 4 / Part A). When absent,
+                    # default to "all slots present in all real frames,
+                    # padding-frames not present" — derived from window_len.
+                    opm = f.get("object_present_mask", None)
+                    if opm is not None and len(opm) > 0:
+                        # Reset to False then copy in (covers any
+                        # padding-slots that should be False).
+                        object_present_mask_batch[i] = False
+                        for s in range(min(len(opm), K)):
+                            row = opm[s]
+                            for j in range(min(len(row), self.max_objects)):
+                                object_present_mask_batch[i, s, j] = bool(row[j])
+                    else:
+                        # Conservative fallback: scene-start padding frames
+                        # have all slots False; real frames keep True.
+                        object_present_mask_batch[i] = False
+                        wl_int = int(window_len_batch[i].item())
+                        for s in range(K - wl_int, K):
+                            for j in range(int(num_objects_window_batch[i, s].item())):
+                                object_present_mask_batch[i, s, j] = True
                 else:
                     # Sample is missing the window — fall back to a 1-frame
                     # window built from the single-frame vectors so the
@@ -152,9 +181,13 @@ class VectorPrefixDataCollator:
                     vectors_window_batch[i, K - 1] = vectors_batch[i]
                     num_objects_window_batch[i, K - 1] = num_objects_batch[i]
                     window_len_batch[i] = 1
+                    object_present_mask_batch[i] = False
+                    for j in range(int(num_objects_batch[i].item())):
+                        object_present_mask_batch[i, K - 1, j] = True
 
             model_inputs["vectors_window"] = vectors_window_batch
             model_inputs["num_objects_window"] = num_objects_window_batch
             model_inputs["window_len"] = window_len_batch
+            model_inputs["object_present_mask"] = object_present_mask_batch
 
         return model_inputs

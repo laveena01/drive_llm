@@ -351,6 +351,21 @@ def _tokenize_qa(batch, tokenizer):
     pad_id = tokenizer.pad_token_id
     labels = [[(tok if tok != pad_id else -100) for tok in seq] for seq in labels]
     model_inputs["labels"] = labels
+
+    # Step 4 / M4: per-sample loss weight based on question_type. Lets the
+    # custom Stage 2 trainer (WeightedLossTrainer below) upweight the
+    # `action_future` question so its gradient signal isn't drowned out by
+    # the 5 per-frame action questions (5:1 imbalance otherwise).
+    qtypes = batch.get("question_type", None)
+    if qtypes is None:
+        qtypes = ["action"] * len(batch["input"])
+    weights = [
+        float(cfg.ACTION_FUTURE_LOSS_WEIGHT)
+        if str(qt).strip().lower() == "action_future"
+        else 1.0
+        for qt in qtypes
+    ]
+    model_inputs["question_weight"] = weights
     return model_inputs
 
 
@@ -369,6 +384,56 @@ class VectorPrefixDataset(TorchDataset):
 
     def __getitem__(self, idx):
         return self.samples[idx]
+
+
+class WeightedLossTrainer(Trainer):
+    """
+    Step 4 / M4: HuggingFace Trainer subclass that applies a per-sample
+    loss weight read from `inputs["question_weight"]`.
+
+    Used by Stage 2 to upweight `action_future` questions so their
+    gradient signal is comparable to the 5 per-frame action questions
+    (5:1 imbalance otherwise → model ignores the temporal-anticipation
+    signal). The weight is set by `_tokenize_qa` based on `question_type`.
+
+    Requires `TrainingArguments(remove_unused_columns=False)` so the
+    `question_weight` column survives the data-collator pipeline.
+    """
+
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        question_weight = inputs.pop("question_weight", None)
+        outputs = model(**inputs)
+
+        if question_weight is None:
+            loss = outputs.loss
+            return (loss, outputs) if return_outputs else loss
+
+        # Manual per-sample loss to apply the weight.
+        logits = outputs.logits           # (B, L, V)
+        labels = inputs["labels"]         # (B, L), -100 = ignore
+        loss_fct = torch.nn.CrossEntropyLoss(reduction="none", ignore_index=-100)
+        flat_losses = loss_fct(
+            logits.view(-1, logits.size(-1)),
+            labels.view(-1),
+        )
+        per_token_loss = flat_losses.view(labels.size(0), -1)  # (B, L)
+        valid_mask = (labels != -100).float()
+        per_sample_loss = (
+            per_token_loss * valid_mask
+        ).sum(dim=1) / valid_mask.sum(dim=1).clamp(min=1)         # (B,)
+
+        if not torch.is_tensor(question_weight):
+            question_weight = torch.tensor(
+                question_weight, dtype=per_sample_loss.dtype, device=per_sample_loss.device
+            )
+        else:
+            question_weight = question_weight.to(
+                device=per_sample_loss.device, dtype=per_sample_loss.dtype
+            )
+
+        weighted = per_sample_loss * question_weight
+        loss = weighted.mean()
+        return (loss, outputs) if return_outputs else loss
 
 
 # ---------------------------
@@ -625,14 +690,15 @@ def _train_stage1_prefix(captioning_path: str):
                     attention_mask = batch["attention_mask"]
                     labels = batch["labels"]
 
-                    # Step 2 / Part B — temporal-window batch keys are
-                    # present iff the collator was constructed with
-                    # `temporal_window > 0`. Pass them through unconditionally;
-                    # the wrapper picks the right path based on its own
-                    # `use_temporal` flag.
+                    # Step 2 / Part B + Step 4 / Part A — temporal-window
+                    # batch keys are present iff the collator was constructed
+                    # with `temporal_window > 0`. Pass them through
+                    # unconditionally; the wrapper picks the right path based
+                    # on its own `use_temporal` flag.
                     vectors_window = batch.get("vectors_window", None)
                     num_objects_window = batch.get("num_objects_window", None)
                     window_len = batch.get("window_len", None)
+                    object_present_mask = batch.get("object_present_mask", None)
 
                     outputs = model(
                         vectors=vectors,
@@ -643,6 +709,7 @@ def _train_stage1_prefix(captioning_path: str):
                         vectors_window=vectors_window,
                         num_objects_window=num_objects_window,
                         window_len=window_len,
+                        object_present_mask=object_present_mask,
                     )
                     loss = outputs.loss
 
@@ -855,16 +922,19 @@ def _validate_stage1_prefix(model, val_loader, tokenizer, device, generate=True)
             attention_mask = batch["attention_mask"].to(device)
             labels = batch["labels"].to(device)
 
-            # Step 2 / Part B — temporal kwargs propagated to val loop too.
+            # Step 2 / Part B + Step 4 / Part A — temporal kwargs.
             vectors_window = batch.get("vectors_window", None)
             num_objects_window = batch.get("num_objects_window", None)
             window_len = batch.get("window_len", None)
+            object_present_mask = batch.get("object_present_mask", None)
             if vectors_window is not None:
                 vectors_window = vectors_window.to(device)
             if num_objects_window is not None:
                 num_objects_window = num_objects_window.to(device)
             if window_len is not None:
                 window_len = window_len.to(device)
+            if object_present_mask is not None:
+                object_present_mask = object_present_mask.to(device)
 
             # Loss (always computed — fast forward pass)
             outputs = model(
@@ -876,6 +946,7 @@ def _validate_stage1_prefix(model, val_loader, tokenizer, device, generate=True)
                 vectors_window=vectors_window,
                 num_objects_window=num_objects_window,
                 window_len=window_len,
+                object_present_mask=object_present_mask,
             )
             total_loss += outputs.loss.item()
             n_batches += 1
@@ -890,6 +961,7 @@ def _validate_stage1_prefix(model, val_loader, tokenizer, device, generate=True)
                     vectors_window=vectors_window,
                     num_objects_window=num_objects_window,
                     window_len=window_len,
+                    object_present_mask=object_present_mask,
                     max_new_tokens=cfg.GEN_MAX_NEW_TOKENS_STAGE1,
                     num_beams=cfg.GEN_NUM_BEAMS,
                 )
@@ -982,9 +1054,12 @@ def _train_stage2_text(model_stage1, tokenizer, qa_path: str):
         logging_steps=50,
         save_steps=500,
         save_total_limit=2,
+        # Step 4 / M4: keep the `question_weight` column through the collator
+        # so WeightedLossTrainer.compute_loss can apply per-sample weights.
+        remove_unused_columns=False,
     )
 
-    trainer = Trainer(
+    trainer = WeightedLossTrainer(
         model=model_stage2,
         args=training_args,
         train_dataset=tokenized_train,
@@ -1270,9 +1345,11 @@ def _train_stage2_with_lora(model_stage1, tokenizer, qa_path: str):
         save_strategy=cfg.SAVE_STRATEGY,
         save_total_limit=cfg.SAVE_TOTAL_LIMIT,
         disable_tqdm=cfg.DISABLE_TQDM,
+        # Step 4 / M4: preserve `question_weight` column for WeightedLossTrainer.
+        remove_unused_columns=False,
     )
 
-    trainer = Trainer(
+    trainer = WeightedLossTrainer(
         model=model_stage2,
         args=training_args,
         train_dataset=tokenized_train,
@@ -1326,20 +1403,27 @@ def _train_stage2_with_lora(model_stage1, tokenizer, qa_path: str):
         vectors_t = torch.tensor([vectors], dtype=torch.float32).to(cap_device)
         num_obj_t = torch.tensor([num_obj], dtype=torch.long).to(cap_device)
 
-        # Step 2 / Part B — when caption_model is a temporal VectorPrefixT5,
-        # also build a (1, K, M, D) window from sample fields. Falls back to
-        # a 1-frame window made of the current sample's vectors if window
-        # fields are missing (e.g. dataset built before Part B).
-        vw_t = now_t = wl_t = None
+        # Step 2 / Part B + Step 4 / Part A — when caption_model is a
+        # temporal VectorPrefixT5, also build a (1, K, M, D) window from
+        # sample fields. Falls back to a 1-frame window made of the
+        # current sample's vectors if window fields are missing.
+        vw_t = now_t = wl_t = opm_t = None
         if getattr(caption_model, "use_temporal", False):
             K = int(getattr(cfg, "TEMPORAL_WINDOW", 4))
             vw_sample = sample.get("vectors_window", None)
             now_sample = sample.get("num_objects_window", None)
             wl_sample = sample.get("window_len", None)
+            opm_sample = sample.get("object_present_mask", None)
             if vw_sample is not None and now_sample is not None and wl_sample is not None:
                 vw_t = torch.tensor([vw_sample], dtype=torch.float32).to(cap_device)
                 now_t = torch.tensor([now_sample], dtype=torch.long).to(cap_device)
                 wl_t = torch.tensor([int(wl_sample)], dtype=torch.long).to(cap_device)
+                if opm_sample is not None:
+                    opm_t = torch.tensor([opm_sample], dtype=torch.bool).to(cap_device)
+                else:
+                    opm_t = torch.ones(
+                        1, K, cfg.MAX_OBJECTS, dtype=torch.bool, device=cap_device,
+                    )
             else:
                 # Fallback: synthesise a 1-frame window from `vectors` so the
                 # model still runs (with no temporal context to leverage).
@@ -1351,6 +1435,9 @@ def _train_stage2_with_lora(model_stage1, tokenizer, qa_path: str):
                 now_t = torch.zeros(1, K, dtype=torch.long, device=cap_device)
                 now_t[0, K - 1] = num_obj_t[0]
                 wl_t = torch.tensor([1], dtype=torch.long, device=cap_device)
+                opm_t = torch.zeros(1, K, cfg.MAX_OBJECTS, dtype=torch.bool, device=cap_device)
+                for j in range(int(num_obj_t[0].item())):
+                    opm_t[0, K - 1, j] = True
 
         text_inputs = tokenizer(
             cfg.STAGE1_TEXT_PROMPT,
@@ -1365,6 +1452,7 @@ def _train_stage2_with_lora(model_stage1, tokenizer, qa_path: str):
             vectors_window=vw_t,
             num_objects_window=now_t,
             window_len=wl_t,
+            object_present_mask=opm_t,
             input_ids=text_inputs["input_ids"],
             attention_mask=text_inputs["attention_mask"],
             max_new_tokens=cfg.GEN_MAX_NEW_TOKENS_STAGE1,

@@ -27,9 +27,18 @@ from .config import (
     MAX_OBJECTS,
     USE_TEMPORAL,
     TEMPORAL_WINDOW,
+    USE_FUTURE_AWARE_SUPERVISION,
+    FUTURE_AWARE_HORIZON,
+    USE_TEMPORAL_CAPTIONS,
+    TEMPORAL_CAPTION_TOP_N,
 )
 from llm_driving.eval_extras import enrich_qa_samples
-from llm_driving.risk_calculator import calculate_risk_from_vectors, get_risk_summary_text, policy_from_risk
+from llm_driving.risk_calculator import (
+    calculate_risk_from_vectors,
+    compute_future_aware_action,
+    get_risk_summary_text,
+    policy_from_risk,
+)
 
 logger = logging.getLogger("llm_driving")
 
@@ -68,6 +77,17 @@ ACTION_QUESTIONS: List[str] = [
     "What brake percentage should be applied and why?",
     "Should the ego slow down, maintain speed, or speed up?",
     "What caution should the vehicle take in the next 2 seconds?",
+]
+
+# Step 4 / Part B: future-aware question(s). These ask the model to act on
+# what's coming, not just what's visible right now. Their targets come from
+# `compute_future_aware_action` (looks H=FUTURE_AWARE_HORIZON frames ahead)
+# rather than from `policy_from_risk` on the current frame alone. Tagged
+# `question_type="action_future"` so eval metric filters (which check
+# `question_type=="action"`) EXCLUDE these from per-slice metrics — keeps
+# eval apples-to-apples with the Step 1 baseline.
+ACTION_FUTURE_QUESTIONS: List[str] = [
+    "Considering the next 2 seconds of trajectory, what action should you take now?",
 ]
 
 RISK_QUESTIONS: List[str] = [
@@ -139,6 +159,24 @@ def _make_samples_from_frames(
     scene_idx: int = 0,
 ):
     logger.info(f"[datasets_builder]   Converting {len(frames)} frames into captioning + QA samples...")
+
+    # Step 4 / Part B: precompute risk_data for every frame in the scene
+    # so the per-frame loop can do H-frame lookahead for the future-aware
+    # action target without redundant recomputation.
+    all_risk_data = []
+    for f in frames:
+        n = min(int(f["num_objects"]), MAX_OBJECTS)
+        es = f.get("ego_speed", None)
+        if es is not None:
+            es = float(es)
+        rd = calculate_risk_from_vectors(
+            vectors=f["vectors"],
+            use_n=n,
+            ego_speed=es,
+            traffic_light=None,
+        )
+        all_risk_data.append(rd)
+
     for idx, frame in enumerate(frames):
         num_objects = int(frame["num_objects"])
         use_n = min(num_objects, MAX_OBJECTS)
@@ -162,36 +200,55 @@ def _make_samples_from_frames(
             _logged_first_ego_speed = True
 
         # Risk (Stage-2 only)
-        risk_data = calculate_risk_from_vectors(
-            vectors=frame["vectors"],
-            use_n=use_n,
-            ego_speed=ego_speed,
-            traffic_light=None,
-        )
+        # Use precomputed risk_data (Step 4 / Part B refactor). Same value
+        # as inline `calculate_risk_from_vectors(...)` would have produced;
+        # we just precomputed the whole scene above so the look-ahead is
+        # cheap.
+        risk_data = all_risk_data[idx]
         risk_text = get_risk_summary_text(risk_data)
 
         # IMPORTANT: caption must NOT see risk_data (Option-B)
         frame_for_caption = dict(frame)
         frame_for_caption.pop("risk_data", None)
-        caption = lanGen(frame_for_caption)
+        # Step 4 / Part C: pass the tracked K-frame window so lanGen can
+        # emit compact motion descriptors. When USE_TEMPORAL_CAPTIONS is
+        # off OR the frame has no window (scene start, USE_TEMPORAL=False),
+        # lanGen falls back to single-frame output.
+        if USE_TEMPORAL_CAPTIONS and "vectors_window" in frame and "object_present_mask" in frame:
+            caption = lanGen(
+                frame_for_caption,
+                vectors_window=frame["vectors_window"],
+                object_present_mask=frame["object_present_mask"],
+                window_len=int(frame.get("window_len", 1)),
+                temporal_top_n=int(TEMPORAL_CAPTION_TOP_N),
+            )
+        else:
+            caption = lanGen(frame_for_caption)
         caption = _strip_any_risk_lines_from_caption(caption)
 
         vec_str = vector_to_string(frame["vectors"], num_objects)
 
-        # Step 2 / Part B — temporal-window fields, present iff USE_TEMPORAL.
-        # `vectors_window` is right-aligned (current frame at slot K-1) and
-        # zero-padded for scene-start frames. `window_len` reports how many
-        # real frames the window contains; the temporal transformer uses it
-        # as a key_padding_mask to ignore the leading padding slots.
+        # Step 2 / Part B + Step 4 / Part A — temporal-window fields, present
+        # iff USE_TEMPORAL. `vectors_window` is right-aligned (current frame
+        # at slot K-1) and zero-padded for scene-start frames.
+        # `object_present_mask` (Step 4 / Part A) marks slot×frame cells
+        # where the anchor object identity (from current frame) was
+        # actually visible — required for per-slot temporal masking in
+        # `TemporalVectorEncoder`.
         temporal_extras: Dict = {}
         if "vectors_window" in frame:
             vw = frame["vectors_window"]
             now = frame["num_objects_window"]
+            opm = frame.get("object_present_mask", None)
             temporal_extras = {
                 "vectors_window": vw.tolist() if hasattr(vw, "tolist") else vw,
                 "num_objects_window": now.tolist() if hasattr(now, "tolist") else list(now),
                 "window_len": int(frame["window_len"]),
             }
+            if opm is not None:
+                temporal_extras["object_present_mask"] = (
+                    opm.tolist() if hasattr(opm, "tolist") else opm
+                )
 
         # --- Stage 1: vector -> caption (caption-only target) ---
         captioning_samples.append({
@@ -277,6 +334,57 @@ def _make_samples_from_frames(
                 "frame_in_scene": int(idx),
                 **temporal_extras,  # Step 2 / Part B
             })
+
+        # --- Stage 2 samples: future-aware ACTION question(s) (Step 4 / Part B) ---
+        # Target is computed from the H-frame lookahead so the model has a
+        # supervision signal that requires temporal anticipation. Tagged
+        # question_type="action_future" so eval slice metrics (which filter
+        # question_type=="action") exclude these — keeps eval apples-to-apples
+        # with the Step 1 baseline.
+        if USE_FUTURE_AWARE_SUPERVISION:
+            future_window = all_risk_data[idx : idx + FUTURE_AWARE_HORIZON + 1]
+            fa_accel, fa_brake, fa_steer, fa_reason, fa_label = compute_future_aware_action(
+                future_window
+            )
+            qa_target_future = _paper_target(fa_accel, fa_brake, fa_steer, fa_reason)
+
+            for fqid, qa_question in enumerate(ACTION_FUTURE_QUESTIONS):
+                qa_input = (
+                    "### OBSERVATION\n"
+                    f"{caption}\n\n"
+                    "### RISK\n"
+                    f"{risk_text}\n\n"
+                    "### QUESTION\n"
+                    f"{qa_question}\n\n"
+                    "### OUTPUT FORMAT\n"
+                    f"{PAPER_FORMAT_INSTRUCTION}"
+                )
+
+                qa_samples.append({
+                    "input": qa_input,
+                    "target": qa_target_future,
+
+                    "question_type": "action_future",
+                    "question_id": int(len(ACTION_QUESTIONS) + fqid),
+                    "question": qa_question,
+
+                    "vec_str": vec_str,
+                    "vectors": frame["vectors"].tolist(),
+                    "num_objects": int(use_n),
+                    "oracle_caption_debug": caption,
+                    "risk_text": risk_text,
+                    "risk_level": str(getattr(risk_data, "risk_level", "UNKNOWN")),
+
+                    "min_dist": float(min_dist),
+                    "policy_label": str(fa_label),  # future-aware label
+                    "use_n": int(use_n),
+                    "ego_speed": float(ego_speed) if ego_speed is not None else None,
+
+                    "frame_idx": int(frame_idx_global),
+                    "scene_idx": int(scene_idx),
+                    "frame_in_scene": int(idx),
+                    **temporal_extras,
+                })
 
         # --- Stage 2 samples: RISK questions ---
         risk_target = _risk_target_from_risk_data(risk_data)

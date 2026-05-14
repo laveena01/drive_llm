@@ -120,6 +120,7 @@ class VectorPrefixT5(nn.Module):
         vectors_window: Optional[torch.Tensor] = None,
         num_objects_window: Optional[torch.Tensor] = None,
         window_len: Optional[torch.Tensor] = None,
+        object_present_mask: Optional[torch.Tensor] = None,
     ):
         """
         Build inputs_embeds and extended attention_mask by prepending
@@ -151,7 +152,10 @@ class VectorPrefixT5(nn.Module):
                     "through the training loop."
                 )
             prefix_embeds = self.vector_encoder(
-                vectors_window, num_objects_window, window_len
+                vectors_window,
+                num_objects_window,
+                window_len,
+                object_present_mask=object_present_mask,
             )
         else:
             if vectors is None or num_objects is None:
@@ -189,6 +193,7 @@ class VectorPrefixT5(nn.Module):
         vectors_window: Optional[torch.Tensor] = None,
         num_objects_window: Optional[torch.Tensor] = None,
         window_len: Optional[torch.Tensor] = None,
+        object_present_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ):
         """
@@ -221,6 +226,7 @@ class VectorPrefixT5(nn.Module):
             vectors_window=vectors_window,
             num_objects_window=num_objects_window,
             window_len=window_len,
+            object_present_mask=object_present_mask,
         )
 
         # Forward through T5 with inputs_embeds (NOT input_ids)
@@ -242,6 +248,7 @@ class VectorPrefixT5(nn.Module):
         vectors_window: Optional[torch.Tensor] = None,
         num_objects_window: Optional[torch.Tensor] = None,
         window_len: Optional[torch.Tensor] = None,
+        object_present_mask: Optional[torch.Tensor] = None,
         **generate_kwargs,
     ):
         """
@@ -260,6 +267,7 @@ class VectorPrefixT5(nn.Module):
             vectors_window=vectors_window,
             num_objects_window=num_objects_window,
             window_len=window_len,
+            object_present_mask=object_present_mask,
         )
 
         # Use T5.generate() with inputs_embeds

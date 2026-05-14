@@ -52,24 +52,32 @@ def get_object_vectors_for_sample(
     sample_token: str,
     override_ego_t: Optional[np.ndarray] = None,
     override_ego_q: Optional[Quaternion] = None,
-) -> Tuple[np.ndarray, int, List[str]]:
+    target_instance_tokens: Optional[List[str]] = None,
+) -> Tuple[np.ndarray, int, List[str], List[str]]:
     """
     Extract object vectors for a given sample token.
     Uses ego pose (LIDAR_TOP) to convert global boxes -> ego frame.
 
     Step 2 / Part B: when `override_ego_t` and `override_ego_q` are both
     provided, object positions and velocities are re-expressed in *that*
-    ego frame instead of this sample's own ego frame. This is what lets
-    `get_frame_window` express past-frame objects in the *current* frame's
-    coordinates so the temporal transformer sees a consistent reference
-    (without this, a parked car would appear to drift across the window
-    simply because ego moved between frames).
+    ego frame instead of this sample's own ego frame.
+
+    Step 4 / Part A: when `target_instance_tokens` is provided (length =
+    MAX_OBJECTS), the returned vectors are aligned to those identities
+    rather than sorted by distance — slot j of the output carries the
+    vector for `target_instance_tokens[j]` (or zeros if that instance is
+    not present in this sample). The `count` returned in this mode is the
+    number of slots that were successfully filled (i.e. how many of the
+    target instances appeared here). `categories` is aligned to the
+    target slots; empty string for missing slots.
 
     Returns:
-        Tuple of (vectors, count, category_names)
+        Tuple of (vectors, count, category_names, instance_tokens)
         - vectors: (MAX_OBJECTS, VECTOR_DIM) array
-        - count: number of valid objects
-        - category_names: list of category names for each object (optional use)
+        - count: number of valid (filled) slots
+        - category_names: list of category names per slot
+        - instance_tokens: list of instance_tokens per slot (empty string
+          for missing/zero slots in tracked mode)
     """
     sample = nusc.get("sample", sample_token)
 
@@ -85,11 +93,12 @@ def get_object_vectors_for_sample(
         ego_q = Quaternion(ego_pose["rotation"])  # (w,x,y,z)
     ego_q_inv = ego_q.inverse
 
-    vectors: List[List[float]] = []
-    categories: List[str] = []
+    # Per-annotation parse → dict keyed by instance_token for fast lookup.
+    parsed: Dict[str, Tuple[List[float], str]] = {}
 
     for ann_token in sample["anns"]:
         ann = nusc.get("sample_annotation", ann_token)
+        instance_token = ann.get("instance_token", "")
 
         obj_t = np.array(ann["translation"], dtype=np.float32)
         obj_q = Quaternion(ann["rotation"])
@@ -102,7 +111,7 @@ def get_object_vectors_for_sample(
         rel_y = float(rel_ego[1])
         dist = float(np.sqrt(rel_x * rel_x + rel_y * rel_y + 1e-6))
 
-        # --- Velocity: global -> ego frame components (UPDATED) ---
+        # --- Velocity: global -> ego frame components ---
         rel_vx, rel_vy = 0.0, 0.0
         try:
             vx, vy, vz = nusc.box_velocity(ann_token)
@@ -133,23 +142,49 @@ def get_object_vectors_for_sample(
         else:
             type_id = 3
 
-        # UPDATED vector: [x, y, dist, vx, vy, heading, size, type_id]
-        vectors.append([rel_x, rel_y, dist, rel_vx, rel_vy, heading, size, float(type_id)])
-        categories.append(category)
-
-    # Sort by distance so MAX_OBJECTS are nearest ones
-    if vectors:
-        sorted_pairs = sorted(zip(vectors, categories), key=lambda x: x[0][2])
-        vectors = [p[0] for p in sorted_pairs]
-        categories = [p[1] for p in sorted_pairs]
+        vec = [rel_x, rel_y, dist, rel_vx, rel_vy, heading, size, float(type_id)]
+        parsed[instance_token] = (vec, category)
 
     padded = np.zeros((MAX_OBJECTS, VECTOR_DIM), dtype=np.float32)
-    count = min(len(vectors), MAX_OBJECTS)
-    if count > 0:
-        padded[:count, :] = np.array(vectors[:count], dtype=np.float32)
 
-    categories = categories[:count]
-    return padded, count, categories
+    if target_instance_tokens is None:
+        # --- Original sort-by-distance behaviour ---
+        vectors_list = [v for v, _ in parsed.values()]
+        categories_list = [c for _, c in parsed.values()]
+        instance_tokens_list = list(parsed.keys())
+        if vectors_list:
+            sort_idx = sorted(
+                range(len(vectors_list)), key=lambda i: vectors_list[i][2]
+            )
+            vectors_list = [vectors_list[i] for i in sort_idx]
+            categories_list = [categories_list[i] for i in sort_idx]
+            instance_tokens_list = [instance_tokens_list[i] for i in sort_idx]
+
+        count = min(len(vectors_list), MAX_OBJECTS)
+        if count > 0:
+            padded[:count, :] = np.array(vectors_list[:count], dtype=np.float32)
+        categories_out = categories_list[:count]
+        instance_tokens_out = instance_tokens_list[:count]
+        return padded, count, categories_out, instance_tokens_out
+
+    # --- Step 4 / Part A: tracked mode ---
+    # Output is aligned to target_instance_tokens; missing instances get
+    # zero rows. Slots beyond len(target_instance_tokens) stay zero.
+    categories_out = ["" for _ in range(MAX_OBJECTS)]
+    instance_tokens_out = ["" for _ in range(MAX_OBJECTS)]
+    count = 0
+    n_targets = min(len(target_instance_tokens), MAX_OBJECTS)
+    for slot in range(n_targets):
+        tok = target_instance_tokens[slot]
+        if tok and tok in parsed:
+            vec, cat = parsed[tok]
+            padded[slot, :] = np.array(vec, dtype=np.float32)
+            categories_out[slot] = cat
+            instance_tokens_out[slot] = tok
+            count += 1
+        # else: leave zero row, empty category/token (marks "object absent
+        # in this frame" — caller composes object_present_mask).
+    return padded, count, categories_out, instance_tokens_out
 
 
 def _compute_ego_speeds(
@@ -236,7 +271,9 @@ def get_scene_frames_vectors(
         if max_frames is not None and frame_idx >= max_frames:
             break
 
-        vecs, num_obj, categories = get_object_vectors_for_sample(nusc, token)
+        vecs, num_obj, categories, instance_tokens = get_object_vectors_for_sample(
+            nusc, token
+        )
         sample = nusc.get("sample", token)
 
         # Fetch ego pose tied to the LIDAR_TOP keyframe — same pose that
@@ -254,6 +291,10 @@ def get_scene_frames_vectors(
                 "num_objects": num_obj,
                 "sample_token": token,
                 "categories": categories,
+                # Step 4 / Part A: instance_tokens per slot. Slot j's token
+                # follows the same physical object across frames when used
+                # by `get_frame_window_tracked`.
+                "instance_tokens": instance_tokens,
                 "ego_pose_translation": [float(ego_t[0]), float(ego_t[1]), float(ego_t[2])],
                 "ego_pose_rotation": [float(c) for c in ego_q],
                 "lidar_timestamp_us": ts_us,
@@ -282,19 +323,42 @@ def get_scene_frames_vectors(
             f"max={float(speeds_arr.max()):.2f}"
         )
 
-    # Step 2 / Part B — opt-in temporal window. Run a third pass once
-    # per-frame ego data is in place so each window can re-express past
-    # frames in the *current* frame's ego coordinates.
+    # Step 2 / Part B + Step 4 / Part A — opt-in temporal window. Dispatch
+    # between the buggy sort-by-distance variant (kept for ablation) and
+    # the tracked-identity variant based on cfg.USE_TRACKED_TEMPORAL.
     if temporal_window is not None and temporal_window > 0 and pending_frames:
-        for i in range(len(pending_frames)):
-            vw, nw, wl = get_frame_window(nusc, pending_frames, i, temporal_window)
-            pending_frames[i]["vectors_window"] = vw
-            pending_frames[i]["num_objects_window"] = nw
-            pending_frames[i]["window_len"] = wl
-        logger.info(
-            f"[nuscenes_data] Scene {scene_idx}: built K={temporal_window} "
-            f"temporal window for {len(pending_frames)} frames"
-        )
+        # Import here to avoid a circular at module load time.
+        from .config import USE_TRACKED_TEMPORAL as _USE_TRACKED
+
+        if _USE_TRACKED:
+            for i in range(len(pending_frames)):
+                vw, nw, opm, wl = get_frame_window_tracked(
+                    nusc, pending_frames, i, temporal_window
+                )
+                pending_frames[i]["vectors_window"] = vw
+                pending_frames[i]["num_objects_window"] = nw
+                pending_frames[i]["object_present_mask"] = opm
+                pending_frames[i]["window_len"] = wl
+            logger.info(
+                f"[nuscenes_data] Scene {scene_idx}: built K={temporal_window} "
+                f"TRACKED temporal window for {len(pending_frames)} frames"
+            )
+        else:
+            for i in range(len(pending_frames)):
+                vw, nw, wl = get_frame_window(nusc, pending_frames, i, temporal_window)
+                pending_frames[i]["vectors_window"] = vw
+                pending_frames[i]["num_objects_window"] = nw
+                pending_frames[i]["window_len"] = wl
+                # Legacy sort-by-distance path has no identity tracking —
+                # synthesize an all-True mask so downstream collator code
+                # still works (treats every slot as present in every frame).
+                pending_frames[i]["object_present_mask"] = np.ones(
+                    (temporal_window, MAX_OBJECTS), dtype=bool
+                )
+            logger.info(
+                f"[nuscenes_data] Scene {scene_idx}: built K={temporal_window} "
+                f"sort-by-distance temporal window for {len(pending_frames)} frames"
+            )
 
     logger.info(f"[nuscenes_data] Extracted {len(pending_frames)} frames for scene {scene_idx}")
     return pending_frames
@@ -364,7 +428,7 @@ def get_frame_window(
         else:
             # Past frame: recompute object vectors using *current* ego pose
             # so positions/velocities sit in a consistent reference frame.
-            vecs, n, _ = get_object_vectors_for_sample(
+            vecs, n, _, _ = get_object_vectors_for_sample(
                 nusc,
                 past_frame["sample_token"],
                 override_ego_t=cur_ego_t,
@@ -374,3 +438,107 @@ def get_frame_window(
             num_objects_window[slot] = int(n)
 
     return vectors_window, num_objects_window, window_len
+
+
+def get_frame_window_tracked(
+    nusc: NuScenes,
+    scene_frames: List[Dict],
+    current_idx: int,
+    k: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+    """
+    Build a K-frame temporal window with **object identity preserved across
+    frames** using nuScenes `instance_token`.
+
+    Step 4 / Part A: this fixes the silent correctness bug in
+    `get_frame_window` (the sort-by-distance variant), where "slot 0 at
+    t-3" might be a completely different physical object than "slot 0 at
+    t". Here, slot j across all K frames refers to the SAME instance_token
+    (taken from the current frame's slot j), or is zero-padded with
+    `object_present_mask[k, j] = False` when that instance wasn't visible
+    in frame k.
+
+    Layout (right-aligned: current frame at slot k-1):
+        slot:        0          1     ...     k-2        k-1
+        frame:    t-(K-1)   t-(K-2)   ...    t-1          t
+
+    Identity anchor = current frame's instance_tokens (slot 0..M-1).
+    Past frames are re-expressed in the *current* ego frame via
+    `override_ego_t/q`.
+
+    Args:
+        nusc:          initialised NuScenes
+        scene_frames:  list returned by `get_scene_frames_vectors`. Each
+                       frame must already carry `instance_tokens`,
+                       `ego_pose_translation`, `ego_pose_rotation`.
+        current_idx:   index of the current frame in `scene_frames`
+        k:             window size (>= 1)
+
+    Returns:
+        vectors_window:      (k, MAX_OBJECTS, VECTOR_DIM) float32
+        num_objects_window:  (k,) int64 — valid slot count per frame
+        object_present_mask: (k, MAX_OBJECTS) bool — True if slot j was
+                             present in frame k. Slots beyond
+                             num_anchor_objects are always False.
+        window_len:          int in [1, k] — number of real frames (the
+                             K - window_len leading slots are zero-padded
+                             for scene-start cases)
+    """
+    if k < 1:
+        raise ValueError(f"k must be >= 1, got {k}")
+    if not 0 <= current_idx < len(scene_frames):
+        raise IndexError(
+            f"current_idx={current_idx} out of range for {len(scene_frames)} frames"
+        )
+
+    cur_frame = scene_frames[current_idx]
+    cur_ego_t = np.asarray(cur_frame["ego_pose_translation"], dtype=np.float32)
+    cur_ego_q = Quaternion(cur_frame["ego_pose_rotation"])
+    # The anchor identities are the current frame's slot 0..num_objects-1.
+    # Padded slots beyond num_objects have empty instance_tokens — those
+    # rows stay zero in every frame's window slot.
+    anchor_tokens: List[str] = list(cur_frame.get("instance_tokens", []))
+    # Pad / truncate to MAX_OBJECTS.
+    anchor_tokens = (anchor_tokens + [""] * MAX_OBJECTS)[:MAX_OBJECTS]
+    num_anchor = int(cur_frame["num_objects"])
+
+    start = max(0, current_idx - k + 1)
+    real_indices = list(range(start, current_idx + 1))
+    window_len = len(real_indices)
+
+    vectors_window = np.zeros((k, MAX_OBJECTS, VECTOR_DIM), dtype=np.float32)
+    num_objects_window = np.zeros((k,), dtype=np.int64)
+    object_present_mask = np.zeros((k, MAX_OBJECTS), dtype=bool)
+
+    # Right-align: current frame at slot k-1.
+    for slot_in_window, frame_idx in enumerate(real_indices, start=k - window_len):
+        past_frame = scene_frames[frame_idx]
+
+        if frame_idx == current_idx:
+            # Current frame: the anchors ARE this frame's first
+            # num_anchor slots — copy directly without re-walking nuScenes.
+            vectors_window[slot_in_window] = np.asarray(
+                past_frame["vectors"], dtype=np.float32
+            )
+            num_objects_window[slot_in_window] = int(past_frame["num_objects"])
+            for j in range(num_anchor):
+                if anchor_tokens[j]:
+                    object_present_mask[slot_in_window, j] = True
+        else:
+            # Past frame: re-extract objects aligned to anchor identities
+            # AND in the current ego frame (so positions are comparable
+            # across the window).
+            vecs, n_present, _, present_tokens = get_object_vectors_for_sample(
+                nusc,
+                past_frame["sample_token"],
+                override_ego_t=cur_ego_t,
+                override_ego_q=cur_ego_q,
+                target_instance_tokens=anchor_tokens,
+            )
+            vectors_window[slot_in_window] = vecs
+            num_objects_window[slot_in_window] = int(n_present)
+            for j in range(num_anchor):
+                if present_tokens[j]:
+                    object_present_mask[slot_in_window, j] = True
+
+    return vectors_window, num_objects_window, object_present_mask, window_len

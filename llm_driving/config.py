@@ -89,6 +89,36 @@ TEMPORAL_TRANSFORMER_LAYERS = 2
 TEMPORAL_TRANSFORMER_HEADS = 4
 TEMPORAL_TRANSFORMER_DROPOUT = 0.1
 
+# Step 4: when True, the K-frame window aligns object identity across frames
+# using nuScenes instance_token (so slot j refers to the same physical
+# object across all K frames). When False, falls back to Step 2's
+# sort-by-distance per-frame slotting (the buggy behaviour that produced
+# null results — kept for ablation parity).
+USE_TRACKED_TEMPORAL = True
+
+# Step 4: when True, the dataset builder adds an extra "action_future"
+# question per frame whose target is computed from the H-frame look-ahead
+# (`compute_future_aware_action` in risk_calculator.py). This gives Stage 2
+# a label channel that requires anticipation. The new question is tagged
+# `question_type="action_future"` so existing eval metrics (which filter
+# question_type=="action") remain comparable to Step 1 baseline.
+USE_FUTURE_AWARE_SUPERVISION = True
+FUTURE_AWARE_HORIZON = 4
+# Per-sample loss weight applied to action_future questions during Stage 2
+# training. > 1.0 boosts the gradient signal from this question type so the
+# model actually uses temporal cues rather than ignoring them as a minority
+# class (only 1 of 6 action questions). 3.0 brings its share to ~27% of
+# action-question gradient.
+ACTION_FUTURE_LOSS_WEIGHT = 3.0
+
+# Step 4: when True, lanGen produces motion-aware captions that include
+# compact temporal descriptors (e.g. "Obj1 closing 3.5m/s decel 4.9m/s")
+# for the top-3 closest objects. Without this, Stage 1 captioning targets
+# don't reward encoding temporal info into text, so the temporal signal in
+# Stage 1's encoder gets discarded at the caption boundary.
+USE_TEMPORAL_CAPTIONS = True
+TEMPORAL_CAPTION_TOP_N = 3
+
 # Whether to freeze base FLAN-T5 weights (False = full fine-tuning, like the paper)
 FREEZE_BASE_MODEL = False
 
@@ -122,9 +152,15 @@ STAGE1_TEXT_PROMPT = "Describe:"
 # -----------------------------
 STAGE2_EPOCHS = 8
 STAGE2_BATCH_SIZE = 4
+# Step 4: bumped from 192 → 384 to accommodate Part C's temporal captions.
+# Stage 2 input layout: OBSERVATION + caption + RISK + risk_text + QUESTION
+# + qa_question + OUTPUT FORMAT + paper_format. Headers + risk + question +
+# format ≈ 140 tokens. With temporal-aware captions reaching ~200 tokens
+# in dense scenes, the previous 192 limit truncated the OUTPUT FORMAT block
+# and broke 5-line parsing. 384 gives a comfortable safety margin.
 STAGE2_LR = 2e-5
 STAGE2_WEIGHT_DECAY = 0.0
-STAGE2_MAX_INPUT_LEN = 192
+STAGE2_MAX_INPUT_LEN = 384
 STAGE2_MAX_TARGET_LEN = 128
 
 STAGE2_QUESTION = "How should the car drive in this situation and why?"

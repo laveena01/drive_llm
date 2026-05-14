@@ -3,7 +3,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from math import sqrt
-from typing import Tuple
+from typing import Optional, Tuple
 import logging
 import numpy as np
 import torch
@@ -303,6 +303,7 @@ class TemporalVectorEncoder(nn.Module):
         vectors_window: torch.Tensor,
         num_objects_window: torch.Tensor,
         window_len: torch.Tensor,
+        object_present_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -311,6 +312,14 @@ class TemporalVectorEncoder(nn.Module):
             window_len:         (B,) long tensor; number of *real* frames in
                                 the right-aligned window (1..K). Frames at
                                 slots [0 .. K - window_len - 1] are padding.
+            object_present_mask: optional (B, K, MAX_OBJECTS) bool. True
+                                where slot j of frame k carries a real
+                                (identity-tracked) object; False where the
+                                anchor identity wasn't visible in that
+                                past frame OR the frame is scene-start
+                                padding. When None, falls back to the
+                                per-sample scene-start padding mask.
+                                (Step 4 / Part A.)
 
         Returns:
             prefix: (B, prefix_len, t5_d_model)
@@ -348,20 +357,70 @@ class TemporalVectorEncoder(nn.Module):
         #    over time.
         x = per_frame_hidden.permute(0, 2, 1, 3).reshape(B * prefix_len, K, H)
 
-        # 4) Build temporal padding mask. Window is right-aligned, so the
-        #    leading (K - window_len) slots per sample are padding.
+        # 4) Build temporal padding mask.
+        # ---------------------------------------------------------------
+        # Two cases:
+        # (a) object_present_mask is None (Step 2 legacy / sort-by-distance):
+        #     mask is per-sample (scene-start padding) — uniform across slots.
+        # (b) object_present_mask is provided (Step 4 / Part A):
+        #     mask is per-(sample, slot, frame) — object-prefix slots use
+        #     the per-object identity mask; global tokens (last `extra_tokens`
+        #     positions of the prefix) use the scene-start padding mask.
+        # ---------------------------------------------------------------
         slot_idx = torch.arange(K, device=device).unsqueeze(0)              # (1, K)
         threshold = (K - window_len.to(device)).unsqueeze(1)                # (B, 1)
-        kp_mask_per_sample = (slot_idx < threshold)                          # (B, K) True=pad
-        # Defensive: never let *all* K slots be masked (would NaN attention);
-        # the data path already guarantees window_len >= 1, so the last slot
-        # is always real.
-        kp_mask_per_sample[:, K - 1] = False
-        kp_mask = (
-            kp_mask_per_sample.unsqueeze(1)
-            .expand(B, prefix_len, K)
-            .reshape(B * prefix_len, K)
-        )
+        scene_pad_mask = (slot_idx < threshold)                              # (B, K) True=pad
+        # Defensive: never let *all* K frames be masked (would NaN attention);
+        # the data path already guarantees window_len >= 1, so slot K-1 is real.
+        scene_pad_mask = scene_pad_mask.clone()
+        scene_pad_mask[:, K - 1] = False
+
+        tokens_per_object = self.inner.tokens_per_object
+        object_prefix_len = self.inner.object_prefix_len   # M * tokens_per_object
+        extra_tokens = self.inner.extra_tokens
+
+        if object_present_mask is None:
+            # Legacy uniform per-sample mask, expanded to all prefix slots.
+            kp_mask = (
+                scene_pad_mask.unsqueeze(1)
+                .expand(B, prefix_len, K)
+                .reshape(B * prefix_len, K)
+            )
+        else:
+            # Build per-slot per-frame mask.
+            # object_present_mask: (B, K, M) bool — True = object present.
+            # Convert to "padding mask" semantics (True = MASK OUT):
+            obj_pad_mask = ~object_present_mask.to(torch.bool)              # (B, K, M)
+            # Expand each object j to tokens_per_object prefix slots:
+            obj_slots_pad_mask = obj_pad_mask.repeat_interleave(
+                tokens_per_object, dim=2
+            )                                                                # (B, K, M*tokens_per_object)
+            if extra_tokens > 0:
+                # Global tokens: scene-start padding mask, same for all global slots.
+                # Shape (B, K, extra_tokens)
+                global_pad_mask = scene_pad_mask.unsqueeze(2).expand(
+                    B, K, extra_tokens
+                )
+                full_pad_mask = torch.cat(
+                    [obj_slots_pad_mask, global_pad_mask], dim=2
+                )  # (B, K, prefix_len)
+            else:
+                full_pad_mask = obj_slots_pad_mask  # (B, K, prefix_len)
+
+            # Defensive: per (sample, slot), guarantee at least one frame
+            # unmasked to avoid NaN softmax. Unmask the last frame for any
+            # row that would otherwise be fully True.
+            all_pad = full_pad_mask.all(dim=1)               # (B, prefix_len)
+            if all_pad.any():
+                # Unmask the last frame (K-1) on those rows.
+                full_pad_mask = full_pad_mask.clone()
+                full_pad_mask[:, K - 1, :] = torch.where(
+                    all_pad, torch.zeros_like(all_pad), full_pad_mask[:, K - 1, :]
+                )
+
+            # Reshape to (B*prefix_len, K) expected by nn.TransformerEncoder:
+            # current layout is (B, K, prefix_len) → want (B, prefix_len, K).
+            kp_mask = full_pad_mask.permute(0, 2, 1).reshape(B * prefix_len, K)
 
         x = self.temporal_encoder(x, src_key_padding_mask=kp_mask)
         # (B*prefix_len, K, H)
