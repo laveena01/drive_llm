@@ -102,7 +102,7 @@ USE_TRACKED_TEMPORAL = False
 # a label channel that requires anticipation. The new question is tagged
 # `question_type="action_future"` so existing eval metrics (which filter
 # question_type=="action") remain comparable to Step 1 baseline.
-USE_FUTURE_AWARE_SUPERVISION = False
+USE_FUTURE_AWARE_SUPERVISION = True
 FUTURE_AWARE_HORIZON = 4
 # Per-sample loss weight applied to action_future questions during Stage 2
 # training. > 1.0 boosts the gradient signal from this question type so the
@@ -125,7 +125,19 @@ TEMPORAL_CAPTION_TOP_N = 3
 # model never sees it as input. Tests the question "does the model need
 # risk handed to it explicitly, or can the encoder learn it from vectors?".
 # Default True = current behaviour (risk in prompt).
-USE_RISK_IN_PROMPT = False
+USE_RISK_IN_PROMPT = True
+
+# Step 5-lite: oversample "hard brake-future" cases (LOW/MINIMAL current
+# risk + brake_required_future) in Stage 2 training to break the
+# LOW.future_brake_recall = 0% floor. Only `action_future` rows are
+# duplicated (target=BRAKE); `action` rows on the same frames are NOT
+# duplicated (target=CONTINUE would reinforce the wrong direction).
+# Cross-question parameter sharing in Stage 2's FLAN-T5 means lifting
+# the action_future channel generalizes back to the action question
+# on the same scene — which is what the LOW.future_brake_recall metric
+# rewards (it's computed on action questions, not action_future).
+OVERSAMPLE_HARD_BRAKE_LOW = True
+HARD_BRAKE_LOW_OVERSAMPLE_FACTOR = 5
 
 # Whether to freeze base FLAN-T5 weights (False = full fine-tuning, like the paper)
 FREEZE_BASE_MODEL = False

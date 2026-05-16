@@ -275,7 +275,7 @@ def _merge_stage2(run_dir: str, num_shards: int) -> None:
     logger.info(f"[MERGE2] Merging {num_shards} shards under {stage2_dir}")
 
     combined_metrics: Dict = {}
-    for mode in ("oracle_caption", "stage1_caption"):
+    for mode in ("oracle_caption", "stage1_caption", "risk_masked_caption"):
         # Detect which modes actually ran — if shard 0 doesn't have the file,
         # assume the whole mode was skipped.
         shard0 = os.path.join(stage2_dir, f"val_predictions_{mode}_shard0.json")

@@ -88,6 +88,11 @@ def _parse_args() -> argparse.Namespace:
         help="Skip the stage1_caption evaluation pass (no Stage 1 model needed).",
     )
     p.add_argument(
+        "--skip_risk_masked",
+        action="store_true",
+        help="Skip the risk_masked_caption evaluation pass (Step 5-lite ablation column).",
+    )
+    p.add_argument(
         "--shard_idx",
         type=int,
         default=0,
@@ -311,6 +316,21 @@ def main() -> None:
                 if mode == "oracle_caption":
                     stage2_prompt = raw_input_text
                     caption_used = None
+                elif mode == "risk_masked_caption":
+                    # Step 5-lite: use the oracle caption (stored on sample)
+                    # but rebuild the prompt with empty risk_text so the
+                    # `### RISK` block is stripped (per-call override in the
+                    # strengthened gate at training.py:_build_stage2_prompt_from_caption).
+                    # Exposes what the model has learned from caption + question
+                    # alone, separating real capability from prompt-leak.
+                    oracle_cap = sample.get("oracle_caption_debug", "") or ""
+                    caption_used = oracle_cap
+                    stage2_prompt = _build_stage2_prompt_from_caption(
+                        oracle_cap,
+                        risk_text="",
+                        qa_question=question,
+                        question_type=qtype,
+                    )
                 else:
                     caption_pred = _gen_caption_from_vectors(sample)
                     caption_used = caption_pred
@@ -512,6 +532,24 @@ def main() -> None:
         logger.info(f"[EVAL2] Wrote {len(stage1_outputs)} stage1 preds to {preds_path2}")
         combined_metrics["stage1_caption"] = _finalize_mode(
             "stage1_caption", stage1_metrics, stage1_outputs
+        )
+
+    if not args.skip_risk_masked:
+        # Step 5-lite: third eval pass — rebuild oracle-caption prompt with
+        # empty risk_text. Same trained model, only the input is lesioned.
+        # Exposes prompt-leak: any saturation that drops here was the model
+        # cribbing from `Risk level: HIGH` in the input rather than learning.
+        logger.info("[EVAL2] Running risk_masked_caption pass...")
+        rm_metrics, rm_outputs = run_eval("risk_masked_caption")
+        logger.info(f"[EVAL2] risk_masked_caption metrics: {rm_metrics}")
+        _print_eval_risk_summary(rm_outputs, "risk_masked_caption")
+
+        preds_path3 = os.path.join(stage2_dir, _pred_filename("risk_masked_caption"))
+        with open(preds_path3, "w") as f:
+            json.dump(_strip_vectors_for_preds(rm_outputs), f, indent=2)
+        logger.info(f"[EVAL2] Wrote {len(rm_outputs)} risk_masked preds to {preds_path3}")
+        combined_metrics["risk_masked_caption"] = _finalize_mode(
+            "risk_masked_caption", rm_metrics, rm_outputs
         )
 
     # --- Merge + write eval_metrics.json ---

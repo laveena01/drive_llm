@@ -87,7 +87,14 @@ def _build_stage2_prompt_from_caption(
 
     # Ablation: when USE_RISK_IN_PROMPT is False, strip the ### RISK block.
     # Must match the dataset_builder templates so train and eval prompts agree.
-    risk_block = f"### RISK\n{risk_text}\n\n" if getattr(cfg, "USE_RISK_IN_PROMPT", True) else ""
+    # Step 5-lite: also strip when risk_text is empty (per-call override used by
+    # the risk_masked_caption eval pass — model trained with risk on, but eval
+    # lesions the block by passing risk_text="").
+    risk_block = (
+        f"### RISK\n{risk_text}\n\n"
+        if getattr(cfg, "USE_RISK_IN_PROMPT", True) and risk_text
+        else ""
+    )
     prompt = (
         "### OBSERVATION\n"
         f"{caption}\n\n"
@@ -369,6 +376,58 @@ def _tokenize_qa(batch, tokenizer):
     ]
     model_inputs["question_weight"] = weights
     return model_inputs
+
+
+# ===================================================================
+# Step 5-lite: hard-case oversampling for Stage 2 training
+# ===================================================================
+
+def _oversample_hard_brake_low(train_ds, factor: int):
+    """Duplicate `action_future` rows on LOW/MINIMAL + brake_required_future
+    frames `factor-1` extra times. Stage 2 training only. Val set is NOT
+    touched. Returns the new HF Dataset.
+
+    Criterion is asymmetric on purpose: we DON'T duplicate `action` rows
+    on these frames because their target is CONTINUE (would reinforce the
+    wrong direction). Only `action_future` rows have target=BRAKE on
+    LOW+brake_future frames, which is what we want the model to learn.
+
+    Cross-question parameter sharing in Stage 2's FLAN-T5 generalizes the
+    lifted `action_future` signal back to the per-frame `action` question
+    on the same scene — which is what the `LOW.future_brake_recall` metric
+    rewards (the metric filters to question_type=="action").
+    """
+    from datasets import concatenate_datasets
+
+    if factor <= 1:
+        return train_ds
+
+    def _is_hard(row):
+        if (row.get("question_type") or "").strip().lower() != "action_future":
+            return False
+        rl = (row.get("risk_level") or "").strip().upper()
+        if rl not in ("LOW", "MINIMAL"):
+            return False
+        return bool(row.get("brake_required_future", False))
+
+    hard_ds = train_ds.filter(_is_hard)
+    n_before = len(train_ds)
+    n_hard = len(hard_ds)
+    if n_hard == 0:
+        logger.warning(
+            "[OVERSAMPLE] No hard brake-future rows found. "
+            "Check USE_FUTURE_AWARE_SUPERVISION=True and that the dataset "
+            "was rebuilt; falling back to natural distribution."
+        )
+        return train_ds
+
+    extras = [hard_ds] * (factor - 1)
+    out = concatenate_datasets([train_ds] + extras)
+    logger.info(
+        f"[OVERSAMPLE] train before={n_before}, hard-case rows={n_hard}, "
+        f"factor={factor}, train after={len(out)}"
+    )
+    return out
 
 
 # ===================================================================
@@ -1034,6 +1093,17 @@ def _train_stage2_text(model_stage1, tokenizer, qa_path: str):
     eval_ds = split_ds["test"]
     logger.info(f"[STAGE 2] Train samples: {len(train_ds)}  |  Val samples: {len(eval_ds)}")
 
+    # Step 5-lite: oversample hard brake-future cases (LOW+brake_required_future)
+    # on training set only. Val set untouched so eval stays on natural distribution.
+    if getattr(cfg, "OVERSAMPLE_HARD_BRAKE_LOW", False):
+        train_ds = _oversample_hard_brake_low(
+            train_ds, int(getattr(cfg, "HARD_BRAKE_LOW_OVERSAMPLE_FACTOR", 5))
+        )
+        logger.info(
+            f"[STAGE 2] After oversampling — train: {len(train_ds)}, "
+            f"val unchanged: {len(eval_ds)}"
+        )
+
     def tokenize_fn(batch):
         return _tokenize_qa(batch, tokenizer)
 
@@ -1322,6 +1392,17 @@ def _train_stage2_with_lora(model_stage1, tokenizer, qa_path: str):
     train_ds = split_ds["train"]
     eval_ds = split_ds["test"]
     logger.info(f"[STAGE 2] Train: {len(train_ds)} | Val: {len(eval_ds)}")
+
+    # Step 5-lite: oversample hard brake-future cases (LOW+brake_required_future)
+    # on training set only. Val set untouched so eval stays on natural distribution.
+    if getattr(cfg, "OVERSAMPLE_HARD_BRAKE_LOW", False):
+        train_ds = _oversample_hard_brake_low(
+            train_ds, int(getattr(cfg, "HARD_BRAKE_LOW_OVERSAMPLE_FACTOR", 5))
+        )
+        logger.info(
+            f"[STAGE 2] After oversampling — train: {len(train_ds)}, "
+            f"val unchanged: {len(eval_ds)}"
+        )
 
     def tokenize_fn(batch):
         return _tokenize_qa(batch, tokenizer)
