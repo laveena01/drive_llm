@@ -85,11 +85,13 @@ def _build_stage2_prompt_from_caption(
     else:
         out_fmt = "### OUTPUT FORMAT\n" + _ensure_paper_format("").strip()
 
+    # Ablation: when USE_RISK_IN_PROMPT is False, strip the ### RISK block.
+    # Must match the dataset_builder templates so train and eval prompts agree.
+    risk_block = f"### RISK\n{risk_text}\n\n" if getattr(cfg, "USE_RISK_IN_PROMPT", True) else ""
     prompt = (
         "### OBSERVATION\n"
         f"{caption}\n\n"
-        "### RISK\n"
-        f"{risk_text}\n\n"
+        f"{risk_block}"
         "### QUESTION\n"
         f"{qa_question}\n\n"
         f"{out_fmt}\n"

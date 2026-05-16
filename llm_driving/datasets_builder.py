@@ -31,6 +31,7 @@ from .config import (
     FUTURE_AWARE_HORIZON,
     USE_TEMPORAL_CAPTIONS,
     TEMPORAL_CAPTION_TOP_N,
+    USE_RISK_IN_PROMPT,
 )
 from llm_driving.eval_extras import enrich_qa_samples
 from llm_driving.risk_calculator import (
@@ -206,6 +207,10 @@ def _make_samples_from_frames(
         # cheap.
         risk_data = all_risk_data[idx]
         risk_text = get_risk_summary_text(risk_data)
+        # Ablation: when USE_RISK_IN_PROMPT is False, the ### RISK block is
+        # stripped from every Stage 2 prompt below. risk_text is still
+        # stored on samples for analysis but never enters the model input.
+        risk_block = f"### RISK\n{risk_text}\n\n" if USE_RISK_IN_PROMPT else ""
 
         # IMPORTANT: caption must NOT see risk_data (Option-B)
         frame_for_caption = dict(frame)
@@ -300,8 +305,7 @@ def _make_samples_from_frames(
             qa_input = (
                 "### OBSERVATION\n"
                 f"{caption}\n\n"
-                "### RISK\n"
-                f"{risk_text}\n\n"
+                f"{risk_block}"
                 "### QUESTION\n"
                 f"{qa_question}\n\n"
                 "### OUTPUT FORMAT\n"
@@ -352,8 +356,7 @@ def _make_samples_from_frames(
                 qa_input = (
                     "### OBSERVATION\n"
                     f"{caption}\n\n"
-                    "### RISK\n"
-                    f"{risk_text}\n\n"
+                    f"{risk_block}"
                     "### QUESTION\n"
                     f"{qa_question}\n\n"
                     "### OUTPUT FORMAT\n"
@@ -392,8 +395,7 @@ def _make_samples_from_frames(
             qa_input = (
                 "### OBSERVATION\n"
                 f"{caption}\n\n"
-                "### RISK\n"
-                f"{risk_text}\n\n"
+                f"{risk_block}"
                 "### QUESTION\n"
                 f"{qa_question}\n\n"
                 "### OUTPUT FORMAT\n"

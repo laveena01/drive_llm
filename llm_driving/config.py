@@ -7,10 +7,10 @@ from datetime import datetime
 # -----------------------------
 # nuScenes
 # -----------------------------
-# NUSC_ROOT = "/u/student/2021/cs21resch15003/nuscenes"
+NUSC_ROOT = "/u/student/2024/cs24mtech14014/nuscenes"
 # NUSC_VERSION = "v1.0-mini"          # later: "v1.0-trainval"
 
-NUSC_ROOT = "/u/student/2021/cs21resch15003/data/nuscenes"
+NUSC_ROOT = "/u/student/2024/cs24mtech14014/data/nuscenes"
 NUSC_VERSION = "v1.0-trainval"
 
 # -----------------------------
@@ -83,7 +83,7 @@ VECTOR_ENCODER_CONFIG = dict(
 #
 # When False, the data path produces single-frame samples (legacy behaviour
 # bit-for-bit) — useful as the K=1 ablation row for the thesis table.
-USE_TEMPORAL = True
+USE_TEMPORAL = False
 TEMPORAL_WINDOW = 4
 TEMPORAL_TRANSFORMER_LAYERS = 2
 TEMPORAL_TRANSFORMER_HEADS = 4
@@ -94,7 +94,7 @@ TEMPORAL_TRANSFORMER_DROPOUT = 0.1
 # object across all K frames). When False, falls back to Step 2's
 # sort-by-distance per-frame slotting (the buggy behaviour that produced
 # null results — kept for ablation parity).
-USE_TRACKED_TEMPORAL = True
+USE_TRACKED_TEMPORAL = False
 
 # Step 4: when True, the dataset builder adds an extra "action_future"
 # question per frame whose target is computed from the H-frame look-ahead
@@ -102,7 +102,7 @@ USE_TRACKED_TEMPORAL = True
 # a label channel that requires anticipation. The new question is tagged
 # `question_type="action_future"` so existing eval metrics (which filter
 # question_type=="action") remain comparable to Step 1 baseline.
-USE_FUTURE_AWARE_SUPERVISION = True
+USE_FUTURE_AWARE_SUPERVISION = False
 FUTURE_AWARE_HORIZON = 4
 # Per-sample loss weight applied to action_future questions during Stage 2
 # training. > 1.0 boosts the gradient signal from this question type so the
@@ -116,8 +116,16 @@ ACTION_FUTURE_LOSS_WEIGHT = 3.0
 # for the top-3 closest objects. Without this, Stage 1 captioning targets
 # don't reward encoding temporal info into text, so the temporal signal in
 # Stage 1's encoder gets discarded at the caption boundary.
-USE_TEMPORAL_CAPTIONS = True
+USE_TEMPORAL_CAPTIONS = False
 TEMPORAL_CAPTION_TOP_N = 3
+
+# Ablation flag: when False, the `### RISK\n<risk_text>` block is stripped
+# from every Stage 2 prompt (training, eval, inference). The risk_text
+# field is still computed and stored on samples (for analysis), but the
+# model never sees it as input. Tests the question "does the model need
+# risk handed to it explicitly, or can the encoder learn it from vectors?".
+# Default True = current behaviour (risk in prompt).
+USE_RISK_IN_PROMPT = False
 
 # Whether to freeze base FLAN-T5 weights (False = full fine-tuning, like the paper)
 FREEZE_BASE_MODEL = False
