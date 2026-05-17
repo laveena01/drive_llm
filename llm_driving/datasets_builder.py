@@ -264,6 +264,9 @@ def _make_samples_from_frames(
             # Step 2 / Part A: persist real ego_speed so it round-trips
             # through JSON and is available at inference + analysis time.
             "ego_speed": float(ego_speed) if ego_speed is not None else None,
+            # Scene-aware split needs scene_idx on captioning samples too.
+            "scene_idx": int(scene_idx),
+            "frame_in_scene": int(idx),
             **temporal_extras,
         })
 
