@@ -139,6 +139,28 @@ USE_RISK_IN_PROMPT = True
 OVERSAMPLE_HARD_BRAKE_LOW = True
 HARD_BRAKE_LOW_OVERSAMPLE_FACTOR = 5
 
+# Methodology-honesty fix: scene-aware train/val split.
+# Replaces random sample-level `train_test_split` (which placed nearby
+# frames from the same scene in both train and val) with a split that
+# groups by scene_idx — 20% of unique scenes go to val, all their
+# samples too. Justified by A2 diagnostic finding of 100% scene-level
+# leakage under the previous random split.
+USE_SCENE_LEVEL_SPLIT = True
+SCENE_LEVEL_SPLIT_TEST_SIZE = 0.2   # 20% of scenes go to val
+SCENE_LEVEL_SPLIT_SEED = 42          # match prior runs' seed for reproducibility
+
+# Methodology-honesty fix: continuous brake and accelerator values.
+# Replaces bucketed brake (7 values: {0, 20, 40, 50, 60, 80, 90}) and
+# bucketed accelerator (5 values: {0, 5, 10, 15, 20}) with smooth
+# integers derived from a composite risk score
+# (max of collision_risk and pedestrian_risk, both guaranteed in [0, 1]).
+# Justified by A1 diagnostic finding of template memorization in both
+# distributions. policy_label and steering remain discrete (used by
+# classification metrics).
+USE_CONTINUOUS_ACTIONS = True
+CONTINUOUS_BRAKE_MAX = 90   # matches current bucketed ceiling
+CONTINUOUS_ACCEL_MAX = 20   # matches current bucketed ceiling
+
 # Whether to freeze base FLAN-T5 weights (False = full fine-tuning, like the paper)
 FREEZE_BASE_MODEL = False
 

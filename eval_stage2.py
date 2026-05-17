@@ -173,16 +173,31 @@ def main() -> None:
         caption_model.eval()
         logger.info("[EVAL2] Stage 1 caption model loaded.")
 
-    # --- Dataset + reproduce same 80/20 split as training ---
+    # --- Dataset + reproduce same train/val split as training ---
     with open(qa_path, "r") as f:
         data = json.load(f)
     # E1+E2: attach future-aware oracle labels, risk transitions, and density
     # buckets to every QA sample. Idempotent: if a future build already wrote
     # these fields, the values will be overwritten with the same content.
     enrich_qa_samples(data, horizon=4)
-    full_ds = Dataset.from_list(data)
-    split = full_ds.train_test_split(test_size=0.2, seed=42)
-    eval_ds = split["test"]
+
+    # Reproduce the EXACT same train/val split used by training.py.
+    # When USE_SCENE_LEVEL_SPLIT=True, this groups by scene_idx; otherwise
+    # falls back to the random sample-level split.
+    if getattr(cfg, "USE_SCENE_LEVEL_SPLIT", False):
+        from llm_driving.training import _scene_aware_split
+        _, val_list = _scene_aware_split(
+            data,
+            test_size=getattr(cfg, "SCENE_LEVEL_SPLIT_TEST_SIZE", 0.2),
+            seed=getattr(cfg, "SCENE_LEVEL_SPLIT_SEED", 42),
+        )
+        eval_ds = Dataset.from_list(val_list)
+        full_ds_len = len(data)
+    else:
+        full_ds = Dataset.from_list(data)
+        split = full_ds.train_test_split(test_size=0.2, seed=42)
+        eval_ds = split["test"]
+        full_ds_len = len(full_ds)
     full_val_size = len(eval_ds)
 
     # Shard: stride-slice with samples[i::N]. Dataset.select preserves order.
@@ -190,11 +205,11 @@ def main() -> None:
         shard_indices = list(range(args.shard_idx, full_val_size, args.num_shards))
         eval_ds = eval_ds.select(shard_indices)
         logger.info(
-            f"[EVAL2] Total samples: {len(full_ds)} | Full val: {full_val_size} | "
+            f"[EVAL2] Total samples: {full_ds_len} | Full val: {full_val_size} | "
             f"This shard: {len(eval_ds)}"
         )
     else:
-        logger.info(f"[EVAL2] Total samples: {len(full_ds)} | Val: {len(eval_ds)}")
+        logger.info(f"[EVAL2] Total samples: {full_ds_len} | Val: {len(eval_ds)}")
 
     # --- Helpers ---
     def _gen_text_s2(prompt: str, max_new_tokens: int, ensure_paper: bool) -> str:

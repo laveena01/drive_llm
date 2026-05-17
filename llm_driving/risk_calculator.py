@@ -28,6 +28,8 @@ import math
 
 import numpy as np
 
+from . import config as cfg
+
 from .config import (
     DEFAULT_EGO_SPEED,
     RISK_FRONT_CONE_DEG,
@@ -453,6 +455,11 @@ def policy_from_risk(risk_data: FrameRiskData) -> Tuple[int, int, str, str, str]
     """
     Determine driving policy based on risk assessment.
     Returns: (accel, brake, steer, reason, policy_label)
+
+    When cfg.USE_CONTINUOUS_ACTIONS is True, the discrete bucketed
+    (accel, brake) values produced below are OVERRIDDEN at the end with
+    smooth integers derived from a composite risk score. policy_label
+    and steer remain discrete (used by classification metrics).
     """
     steer = "straight"
     rl = risk_data.risk_level
@@ -461,35 +468,40 @@ def policy_from_risk(risk_data: FrameRiskData) -> Tuple[int, int, str, str, str]
     max_ped = float(risk_data.max_pedestrian_risk)
 
     if risk_data.num_risk_objects == 0:
-        return 20, 0, steer, "No nearby obstacles detected.", "CONTINUE"
-
-    if rl == "CRITICAL":
+        accel, brake, reason, label = 20, 0, "No nearby obstacles detected.", "CONTINUE"
+    elif rl == "CRITICAL":
         if min_ttc is not None and min_ttc < 2.0:
-            return 0, 90, steer, f"Critical risk: TTC={min_ttc:.1f}s, emergency braking required.", "BRAKE"
-        return 0, 80, steer, f"Critical risk (collision={max_collision:.0%}), braking hard.", "BRAKE"
-
-    if rl == "HIGH":
+            accel, brake, reason, label = 0, 90, f"Critical risk: TTC={min_ttc:.1f}s, emergency braking required.", "BRAKE"
+        else:
+            accel, brake, reason, label = 0, 80, f"Critical risk (collision={max_collision:.0%}), braking hard.", "BRAKE"
+    elif rl == "HIGH":
         if max_ped >= 0.5:
-            return 0, 60, steer, f"High pedestrian risk ({max_ped:.0%}), reducing speed.", "BRAKE"
-        return 0, 50, steer, f"High risk (collision={max_collision:.0%}), slowing down.", "BRAKE"
-
-    if rl == "MODERATE":
+            accel, brake, reason, label = 0, 60, f"High pedestrian risk ({max_ped:.0%}), reducing speed.", "BRAKE"
+        else:
+            accel, brake, reason, label = 0, 50, f"High risk (collision={max_collision:.0%}), slowing down.", "BRAKE"
+    elif rl == "MODERATE":
         if min_ttc is not None and min_ttc < 4.0:
-            return 0, 40, steer, f"Moderate risk with low TTC={min_ttc:.1f}s, braking to increase safety margin.", "BRAKE"
+            accel, brake, reason, label = 0, 40, f"Moderate risk with low TTC={min_ttc:.1f}s, braking to increase safety margin.", "BRAKE"
+        elif max_ped >= 0.3:
+            accel, brake, reason, label = 5, 20, "Moderate pedestrian risk, proceed with caution.", "CAUTION"
+        else:
+            accel, brake, reason, label = 10, 20, f"Moderate risk (collision={max_collision:.0%}), proceed carefully.", "CAUTION"
+    elif rl == "LOW":
+        accel, brake, reason, label = 15, 0, "Low risk detected, maintaining awareness.", "CONTINUE"
+    else:
+        accel, brake, reason, label = 20, 0, "Minimal risk, safe to continue.", "CONTINUE"
 
-        # Otherwise keep it clearly CAUTION (not near the BRAKE threshold)
-        if max_ped >= 0.3:
-            return 5, 20, steer, "Moderate pedestrian risk, proceed with caution.", "CAUTION"
-        return 10, 20, steer, f"Moderate risk (collision={max_collision:.0%}), proceed carefully.", "CAUTION"
+    # Step 5-lite follow-up: continuous-action override.
+    # Replaces bucketed (accel, brake) with smooth integers from a
+    # composite risk score. policy_label and steer stay discrete.
+    if getattr(cfg, "USE_CONTINUOUS_ACTIONS", False):
+        composite_risk = max(max_collision, max_ped)
+        max_brake = int(getattr(cfg, "CONTINUOUS_BRAKE_MAX", 90))
+        max_accel = int(getattr(cfg, "CONTINUOUS_ACCEL_MAX", 20))
+        brake = max(0, min(max_brake, int(round(max_brake * composite_risk))))
+        accel = max(0, min(max_accel, int(round(max_accel * (1.0 - composite_risk)))))
 
-        # if max_ped >= 0.3:
-        #     return 5, 30, steer, "Moderate pedestrian risk, proceeding with caution.", "CAUTION"
-        # return 10, 20, steer, f"Moderate risk (collision={max_collision:.0%}), proceed carefully.", "CAUTION"
-
-    if rl == "LOW":
-        return 15, 0, steer, "Low risk detected, maintaining awareness.", "CONTINUE"
-
-    return 20, 0, steer, "Minimal risk, safe to continue.", "CONTINUE"
+    return accel, brake, steer, reason, label
 
 
 def compute_future_aware_action(

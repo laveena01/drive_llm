@@ -250,6 +250,14 @@ def _slice_metrics_for_outputs(outputs: List[Dict]) -> Dict:
     future_brake_correct = 0  # predicted BRAKE when future-required
     future_missed = 0
 
+    # Step 5-lite follow-up: tolerance-based brake metrics. With continuous
+    # brake targets, raw MAE understates real-world adequacy — an error of
+    # ≤5pp is practically negligible, ≤10pp is acceptable, ≤20pp is
+    # tolerable. Report all three alongside the strict MAE.
+    brake_within_5 = 0
+    brake_within_10 = 0
+    brake_within_20 = 0
+
     for out in outputs:
         if str(out.get("question_type") or "action").strip().lower() != "action":
             continue
@@ -269,8 +277,15 @@ def _slice_metrics_for_outputs(outputs: List[Dict]) -> Dict:
         pr_brk = out.get("pred_brake_pct")
         if gt_action == "BRAKE" and gt_brk is not None and pr_brk is not None:
             try:
-                brake_mae_sum += abs(float(pr_brk) - float(gt_brk))
+                diff = abs(float(pr_brk) - float(gt_brk))
+                brake_mae_sum += diff
                 brake_mae_n += 1
+                if diff <= 5:
+                    brake_within_5 += 1
+                if diff <= 10:
+                    brake_within_10 += 1
+                if diff <= 20:
+                    brake_within_20 += 1
             except Exception:
                 pass
 
@@ -292,6 +307,15 @@ def _slice_metrics_for_outputs(outputs: List[Dict]) -> Dict:
             float(brake_mae_sum / brake_mae_n) if brake_mae_n > 0 else 0.0
         ),
         "n_brake_mae_samples": int(brake_mae_n),
+        "brake_within_5pct": (
+            float(brake_within_5 / brake_mae_n) if brake_mae_n > 0 else 0.0
+        ),
+        "brake_within_10pct": (
+            float(brake_within_10 / brake_mae_n) if brake_mae_n > 0 else 0.0
+        ),
+        "brake_within_20pct": (
+            float(brake_within_20 / brake_mae_n) if brake_mae_n > 0 else 0.0
+        ),
         "future_brake_recall": (
             float(future_brake_correct / future_brake_total)
             if future_brake_total > 0

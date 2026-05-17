@@ -142,11 +142,22 @@ def main() -> None:
             sample["vectors"] = vectors.tolist()
             sample["num_objects"] = n
 
-    torch.manual_seed(cfg.SEED)
-    n_val = max(1, int(len(data) * 0.2))
-    n_train = len(data) - n_val
-    indices = torch.randperm(len(data)).tolist()
-    val_samples = [data[i] for i in indices[n_train:]]
+    # Reproduce the EXACT same train/val split used by training.py.
+    # When USE_SCENE_LEVEL_SPLIT=True, this groups by scene_idx; otherwise
+    # falls back to the random sample-level split.
+    if getattr(cfg, "USE_SCENE_LEVEL_SPLIT", False):
+        from llm_driving.training import _scene_aware_split
+        _, val_samples = _scene_aware_split(
+            data,
+            test_size=getattr(cfg, "SCENE_LEVEL_SPLIT_TEST_SIZE", 0.2),
+            seed=getattr(cfg, "SCENE_LEVEL_SPLIT_SEED", 42),
+        )
+    else:
+        torch.manual_seed(cfg.SEED)
+        n_val = max(1, int(len(data) * 0.2))
+        n_train = len(data) - n_val
+        indices = torch.randperm(len(data)).tolist()
+        val_samples = [data[i] for i in indices[n_train:]]
     full_val_size = len(val_samples)
 
     # Shard the val samples: shard i handles samples[i::N]. Stride-slicing keeps

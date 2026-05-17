@@ -248,9 +248,35 @@ def _format_compliance_5line(text: str) -> int:
     return 1
 
 def _map_text_to_action_label(text: str) -> str:
+    """Map model output text to a discrete action label.
+
+    Thresholds depend on whether brake values are bucketed (legacy) or
+    continuous (post Step 5-lite follow-up).
+
+    Bucketed brake values: {0, 20, 40, 50, 60, 80, 90}
+      → boundaries: BRAKE >= 30, CAUTION >= 5
+
+    Continuous brake values: any integer in [0, 90], derived from
+    composite_risk = max(collision_risk, pedestrian_risk).
+      → empirical boundaries (provisional, pending calibration):
+        BRAKE >= 40, CAUTION >= 10
+      Rationale: CONTINUE samples (LOW/MINIMAL risk) have composite_risk
+      typically < 0.1 → brake < ~10. CAUTION (MODERATE) has
+      composite_risk in [~0.1, ~0.4] → brake in ~[10, 40]. BRAKE
+      (HIGH/CRITICAL or MODERATE+TTC<4) has composite_risk >= ~0.4 →
+      brake >= ~40.
+    """
     b = _extract_brake_percent(text)
     if b is None:
         return "OTHER"
+    if getattr(cfg, "USE_CONTINUOUS_ACTIONS", False):
+        # Continuous-brake thresholds (pending empirical calibration)
+        if b >= 40:
+            return "BRAKE"
+        if b >= 10:
+            return "CAUTION"
+        return "CONTINUE"
+    # Bucketed (legacy) thresholds
     if b >= 30:
         return "BRAKE"
     if b >= 5:
@@ -376,6 +402,51 @@ def _tokenize_qa(batch, tokenizer):
     ]
     model_inputs["question_weight"] = weights
     return model_inputs
+
+
+# ===================================================================
+# Methodology-honesty fix: scene-aware train/val split
+# ===================================================================
+
+def _scene_aware_split(data, test_size: float = 0.2, seed: int = 42):
+    """Split a list of sample dicts by scene_idx.
+
+    test_size * unique_scenes are selected (deterministically by seed)
+    to form the val set; ALL samples from those scenes go to val. The
+    remaining scenes' samples go to train.
+
+    This replaces the random sample-level `train_test_split` (which
+    placed nearby frames from the same scene in both train and val,
+    causing 100% scene-level leakage per A2 diagnostic).
+
+    Args:
+        data: list of sample dicts, each having "scene_idx" field
+        test_size: fraction of unique scenes to put in val
+        seed: random seed for scene selection (deterministic)
+
+    Returns:
+        (train_list, val_list): two lists of dicts.
+    """
+    import random
+    rng = random.Random(seed)
+    scene_ids = sorted({s["scene_idx"] for s in data})
+    if not scene_ids:
+        logger.warning("[SCENE_SPLIT] No scene_idx found in data; falling back to empty split.")
+        return list(data), []
+    n_val_scenes = max(1, round(test_size * len(scene_ids)))
+    val_scene_set = set(rng.sample(scene_ids, n_val_scenes))
+    train, val = [], []
+    for s in data:
+        if s.get("scene_idx") in val_scene_set:
+            val.append(s)
+        else:
+            train.append(s)
+    logger.info(
+        f"[SCENE_SPLIT] {len(scene_ids)} unique scenes -> "
+        f"{len(scene_ids) - n_val_scenes} train / {n_val_scenes} val scenes. "
+        f"Samples: {len(train)} train / {len(val)} val."
+    )
+    return train, val
 
 
 # ===================================================================
@@ -510,12 +581,21 @@ def _train_stage1_text(captioning_path: str):
     with open(captioning_path, "r") as f:
         data = json.load(f)
 
-    full_ds = Dataset.from_list(data)
-    logger.info(f"[STAGE 1] Total samples: {len(full_ds)}")
+    logger.info(f"[STAGE 1] Total samples: {len(data)}")
 
-    split_ds = full_ds.train_test_split(test_size=0.2, seed=42)
-    train_ds = split_ds["train"]
-    eval_ds = split_ds["test"]
+    if getattr(cfg, "USE_SCENE_LEVEL_SPLIT", False):
+        train_list, val_list = _scene_aware_split(
+            data,
+            test_size=getattr(cfg, "SCENE_LEVEL_SPLIT_TEST_SIZE", 0.2),
+            seed=getattr(cfg, "SCENE_LEVEL_SPLIT_SEED", 42),
+        )
+        train_ds = Dataset.from_list(train_list)
+        eval_ds = Dataset.from_list(val_list)
+    else:
+        full_ds = Dataset.from_list(data)
+        split_ds = full_ds.train_test_split(test_size=0.2, seed=42)
+        train_ds = split_ds["train"]
+        eval_ds = split_ds["test"]
     logger.info(f"[STAGE 1] Train samples: {len(train_ds)}  |  Val samples: {len(eval_ds)}")
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
@@ -644,11 +724,18 @@ def _train_stage1_prefix(captioning_path: str):
 
     # Train/val split (deterministic across all processes)
     torch.manual_seed(cfg.SEED)
-    n_val = max(1, int(len(data) * 0.2))
-    n_train = len(data) - n_val
-    indices = torch.randperm(len(data)).tolist()
-    train_samples = [data[i] for i in indices[:n_train]]
-    val_samples = [data[i] for i in indices[n_train:]]
+    if getattr(cfg, "USE_SCENE_LEVEL_SPLIT", False):
+        train_samples, val_samples = _scene_aware_split(
+            data,
+            test_size=getattr(cfg, "SCENE_LEVEL_SPLIT_TEST_SIZE", 0.2),
+            seed=getattr(cfg, "SCENE_LEVEL_SPLIT_SEED", 42),
+        )
+    else:
+        n_val = max(1, int(len(data) * 0.2))
+        n_train = len(data) - n_val
+        indices = torch.randperm(len(data)).tolist()
+        train_samples = [data[i] for i in indices[:n_train]]
+        val_samples = [data[i] for i in indices[n_train:]]
     logger.info(f"[STAGE 1] Train: {len(train_samples)} | Val: {len(val_samples)}")
 
     # Build model
@@ -1085,12 +1172,21 @@ def _train_stage2_text(model_stage1, tokenizer, qa_path: str):
     with open(qa_path, "r") as f:
         data = json.load(f)
 
-    full_ds = Dataset.from_list(data)
-    logger.info(f"[STAGE 2] Total samples: {len(full_ds)}")
+    logger.info(f"[STAGE 2] Total samples: {len(data)}")
 
-    split_ds = full_ds.train_test_split(test_size=0.2, seed=42)
-    train_ds = split_ds["train"]
-    eval_ds = split_ds["test"]
+    if getattr(cfg, "USE_SCENE_LEVEL_SPLIT", False):
+        train_list, val_list = _scene_aware_split(
+            data,
+            test_size=getattr(cfg, "SCENE_LEVEL_SPLIT_TEST_SIZE", 0.2),
+            seed=getattr(cfg, "SCENE_LEVEL_SPLIT_SEED", 42),
+        )
+        train_ds = Dataset.from_list(train_list)
+        eval_ds = Dataset.from_list(val_list)
+    else:
+        full_ds = Dataset.from_list(data)
+        split_ds = full_ds.train_test_split(test_size=0.2, seed=42)
+        train_ds = split_ds["train"]
+        eval_ds = split_ds["test"]
     logger.info(f"[STAGE 2] Train samples: {len(train_ds)}  |  Val samples: {len(eval_ds)}")
 
     # Step 5-lite: oversample hard brake-future cases (LOW+brake_required_future)
@@ -1385,12 +1481,21 @@ def _train_stage2_with_lora(model_stage1, tokenizer, qa_path: str):
     with open(qa_path, "r") as f:
         data = json.load(f)
 
-    full_ds = Dataset.from_list(data)
-    logger.info(f"[STAGE 2] Total samples: {len(full_ds)}")
+    logger.info(f"[STAGE 2] Total samples: {len(data)}")
 
-    split_ds = full_ds.train_test_split(test_size=0.2, seed=42)
-    train_ds = split_ds["train"]
-    eval_ds = split_ds["test"]
+    if getattr(cfg, "USE_SCENE_LEVEL_SPLIT", False):
+        train_list, val_list = _scene_aware_split(
+            data,
+            test_size=getattr(cfg, "SCENE_LEVEL_SPLIT_TEST_SIZE", 0.2),
+            seed=getattr(cfg, "SCENE_LEVEL_SPLIT_SEED", 42),
+        )
+        train_ds = Dataset.from_list(train_list)
+        eval_ds = Dataset.from_list(val_list)
+    else:
+        full_ds = Dataset.from_list(data)
+        split_ds = full_ds.train_test_split(test_size=0.2, seed=42)
+        train_ds = split_ds["train"]
+        eval_ds = split_ds["test"]
     logger.info(f"[STAGE 2] Train: {len(train_ds)} | Val: {len(eval_ds)}")
 
     # Step 5-lite: oversample hard brake-future cases (LOW+brake_required_future)
