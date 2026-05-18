@@ -258,6 +258,17 @@ def _slice_metrics_for_outputs(outputs: List[Dict]) -> Dict:
     brake_within_10 = 0
     brake_within_20 = 0
 
+    # Row 4 v2: per-component risk-decomposition metrics (MAE + tolerance).
+    # Counted only on action samples where BOTH the GT and PRED for that
+    # component are present (i.e. USE_RISK_DECOMP_OUTPUT was on at build
+    # time AND the model emitted parseable risk lines).
+    risk_components = ("collision", "pedestrian", "uncertainty", "regulatory")
+    rc_mae_sum = {c: 0.0 for c in risk_components}
+    rc_n = {c: 0 for c in risk_components}
+    rc_within_5 = {c: 0 for c in risk_components}
+    rc_within_10 = {c: 0 for c in risk_components}
+    rc_within_20 = {c: 0 for c in risk_components}
+
     for out in outputs:
         if str(out.get("question_type") or "action").strip().lower() != "action":
             continue
@@ -296,6 +307,43 @@ def _slice_metrics_for_outputs(outputs: List[Dict]) -> Dict:
             else:
                 future_missed += 1
 
+        # Row 4 v2: per-component risk-decomposition MAE + tolerance.
+        for comp in risk_components:
+            gt_v = out.get(f"gt_{comp}_pct")
+            pr_v = out.get(f"pred_{comp}_pct")
+            if gt_v is None or pr_v is None:
+                continue
+            try:
+                diff = abs(float(pr_v) - float(gt_v))
+            except Exception:
+                continue
+            rc_mae_sum[comp] += diff
+            rc_n[comp] += 1
+            if diff <= 5:
+                rc_within_5[comp] += 1
+            if diff <= 10:
+                rc_within_10[comp] += 1
+            if diff <= 20:
+                rc_within_20[comp] += 1
+
+    # Build per-component metric dict (added to return below).
+    risk_decomp_metrics: Dict = {}
+    for comp in risk_components:
+        n = rc_n[comp]
+        risk_decomp_metrics[f"{comp}_risk_mae"] = (
+            float(rc_mae_sum[comp] / n) if n > 0 else 0.0
+        )
+        risk_decomp_metrics[f"n_{comp}_risk_samples"] = int(n)
+        risk_decomp_metrics[f"{comp}_risk_within_5pct"] = (
+            float(rc_within_5[comp] / n) if n > 0 else 0.0
+        )
+        risk_decomp_metrics[f"{comp}_risk_within_10pct"] = (
+            float(rc_within_10[comp] / n) if n > 0 else 0.0
+        )
+        risk_decomp_metrics[f"{comp}_risk_within_20pct"] = (
+            float(rc_within_20[comp] / n) if n > 0 else 0.0
+        )
+
     return {
         "n": int(total),
         "action_accuracy": float(correct / total) if total > 0 else 0.0,
@@ -327,6 +375,10 @@ def _slice_metrics_for_outputs(outputs: List[Dict]) -> Dict:
             if future_brake_total > 0
             else 0.0
         ),
+        # Row 4 v2: risk-decomposition per-component metrics. All zeros
+        # when USE_RISK_DECOMP_OUTPUT was False at build time (no GT
+        # risk components present on the outputs).
+        **risk_decomp_metrics,
     }
 
 

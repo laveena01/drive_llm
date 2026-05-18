@@ -12,7 +12,7 @@ Phase-3 update:
 - Keeps Phase-2 cleanup: DO NOT leak risk into lanGen captions (Option-B)
 """
 
-from typing import List, Dict
+from typing import List, Dict, Optional
 from collections import Counter
 import json
 import logging
@@ -32,6 +32,7 @@ from .config import (
     USE_TEMPORAL_CAPTIONS,
     TEMPORAL_CAPTION_TOP_N,
     USE_RISK_IN_PROMPT,
+    USE_RISK_DECOMP_OUTPUT,
 )
 from llm_driving.eval_extras import enrich_qa_samples
 from llm_driving.risk_calculator import (
@@ -51,16 +52,36 @@ _policy_log: List[Dict] = []
 # spot in the build log.
 _logged_first_ego_speed: bool = False
 
-PAPER_FORMAT_INSTRUCTION = (
-    "You are an AI Driver.\n"
-    "Return EXACTLY 5 lines (each on its own line), and nothing else:\n"
-    "Here are my actions:\n"
-    "- Accelerator pedal: <0-100>%\n"
-    "- Brake pedal: <0-100>%\n"
-    "- Steering: <left/straight/right>\n"
-    "Reason: <one short sentence>\n"
-    "Do NOT ask questions. Do NOT add extra text.\n"
-)
+if USE_RISK_DECOMP_OUTPUT:
+    # Row 4 v2: action target also exposes the 4 per-component risk
+    # values that drive the oracle policy (collision/pedestrian/
+    # uncertainty/regulatory). Fixed order matches the 0.40/0.30/0.20/0.10
+    # weighting in risk_calculator.calculate_risk_from_vectors.
+    PAPER_FORMAT_INSTRUCTION = (
+        "You are an AI Driver.\n"
+        "Return EXACTLY 9 lines (each on its own line), and nothing else:\n"
+        "Here are my actions:\n"
+        "- Accelerator pedal: <0-100>%\n"
+        "- Brake pedal: <0-100>%\n"
+        "- Steering: <left/straight/right>\n"
+        "- Collision risk: <0-100>%\n"
+        "- Pedestrian risk: <0-100>%\n"
+        "- Uncertainty risk: <0-100>%\n"
+        "- Regulatory risk: <0-100>%\n"
+        "Reason: <one short sentence>\n"
+        "Do NOT ask questions. Do NOT add extra text.\n"
+    )
+else:
+    PAPER_FORMAT_INSTRUCTION = (
+        "You are an AI Driver.\n"
+        "Return EXACTLY 5 lines (each on its own line), and nothing else:\n"
+        "Here are my actions:\n"
+        "- Accelerator pedal: <0-100>%\n"
+        "- Brake pedal: <0-100>%\n"
+        "- Steering: <left/straight/right>\n"
+        "Reason: <one short sentence>\n"
+        "Do NOT ask questions. Do NOT add extra text.\n"
+    )
 
 RISK_FORMAT_INSTRUCTION = (
     "Answer in 1-2 short lines using this template ONLY:\n"
@@ -98,18 +119,50 @@ RISK_QUESTIONS: List[str] = [
 ]
 
 
-def _paper_target(accel: int, brake: int, steer: str, reason: str) -> str:
+def _paper_target(
+    accel: int,
+    brake: int,
+    steer: str,
+    reason: str,
+    risk_components: Optional[Dict[str, float]] = None,
+) -> str:
+    """Build the Stage 2 action-target string.
+
+    When USE_RISK_DECOMP_OUTPUT=True AND `risk_components` is provided,
+    inserts 4 per-component risk lines (collision/pedestrian/
+    uncertainty/regulatory, each 0-100%) between Steering and Reason.
+    Otherwise emits the original 5-line paper format.
+
+    Risk component values come from FrameRiskData
+    (max_collision_risk, max_pedestrian_risk, max_uncertainty_risk,
+    max_regulatory_risk), each in [0, 1] — scaled to 0-100% here.
+    """
     accel = int(max(0, min(100, accel)))
     brake = int(max(0, min(100, brake)))
     if steer not in ("left", "straight", "right"):
         steer = "straight"
-    return (
-        "Here are my actions:\n"
-        f"- Accelerator pedal: {accel}%\n"
-        f"- Brake pedal: {brake}%\n"
-        f"- Steering: {steer}\n"
-        f"Reason: {reason}\n"
-    )
+
+    lines = [
+        "Here are my actions:",
+        f"- Accelerator pedal: {accel}%",
+        f"- Brake pedal: {brake}%",
+        f"- Steering: {steer}",
+    ]
+    if USE_RISK_DECOMP_OUTPUT and risk_components is not None:
+        def _pct(x):
+            try:
+                v = float(x)
+            except Exception:
+                v = 0.0
+            return int(max(0, min(100, round(100.0 * v))))
+
+        lines.append(f"- Collision risk: {_pct(risk_components.get('collision', 0.0))}%")
+        lines.append(f"- Pedestrian risk: {_pct(risk_components.get('pedestrian', 0.0))}%")
+        lines.append(f"- Uncertainty risk: {_pct(risk_components.get('uncertainty', 0.0))}%")
+        lines.append(f"- Regulatory risk: {_pct(risk_components.get('regulatory', 0.0))}%")
+
+    lines.append(f"Reason: {reason}")
+    return "\n".join(lines) + "\n"
 
 
 def _strip_any_risk_lines_from_caption(caption: str) -> str:
@@ -279,7 +332,17 @@ def _make_samples_from_frames(
 
         # --- action policy from risk ---
         accel, brake, steer, reason, policy_label = policy_from_risk(risk_data)
-        qa_target_action = _paper_target(accel, brake, steer, reason)
+        # Row 4 v2: pass per-component risk values so _paper_target can
+        # emit the 4 risk decomposition lines when USE_RISK_DECOMP_OUTPUT.
+        risk_components = {
+            "collision": float(getattr(risk_data, "max_collision_risk", 0.0)),
+            "pedestrian": float(getattr(risk_data, "max_pedestrian_risk", 0.0)),
+            "uncertainty": float(getattr(risk_data, "max_uncertainty_risk", 0.0)),
+            "regulatory": float(getattr(risk_data, "max_regulatory_risk", 0.0)),
+        }
+        qa_target_action = _paper_target(
+            accel, brake, steer, reason, risk_components=risk_components
+        )
 
         # frame-level index (stable across multiple questions)
         frame_idx_global = len(_policy_log)
@@ -353,7 +416,23 @@ def _make_samples_from_frames(
             fa_accel, fa_brake, fa_steer, fa_reason, fa_label = compute_future_aware_action(
                 future_window
             )
-            qa_target_future = _paper_target(fa_accel, fa_brake, fa_steer, fa_reason)
+            # Row 4 v2: emit max-over-window per-component risks so the
+            # action_future target's risk lines describe "max risk over
+            # the next H frames" — consistent with the future-aware
+            # semantics. Falls back to current frame for empty window.
+            if future_window:
+                fa_risk_components = {
+                    "collision": max(float(getattr(r, "max_collision_risk", 0.0)) for r in future_window),
+                    "pedestrian": max(float(getattr(r, "max_pedestrian_risk", 0.0)) for r in future_window),
+                    "uncertainty": max(float(getattr(r, "max_uncertainty_risk", 0.0)) for r in future_window),
+                    "regulatory": max(float(getattr(r, "max_regulatory_risk", 0.0)) for r in future_window),
+                }
+            else:
+                fa_risk_components = risk_components
+            qa_target_future = _paper_target(
+                fa_accel, fa_brake, fa_steer, fa_reason,
+                risk_components=fa_risk_components,
+            )
 
             for fqid, qa_question in enumerate(ACTION_FUTURE_QUESTIONS):
                 qa_input = (

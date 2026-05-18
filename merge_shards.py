@@ -184,6 +184,13 @@ def _recompute_stage2_metrics(outputs: List[Dict]) -> Dict:
     fmt_sum = 0.0
     parse_ok_sum = 0.0
 
+    # Row 4 v2: per-component risk-decomp MAE counters. Pull straight from
+    # the per-sample gt_<comp>_pct / pred_<comp>_pct fields written by
+    # eval_stage2.py — same pattern as brake_mae above.
+    _RC_COMPS = ("collision", "pedestrian", "uncertainty", "regulatory")
+    rc_mae_sum = {c: 0.0 for c in _RC_COMPS}
+    rc_n = {c: 0 for c in _RC_COMPS}
+
     for out in outputs:
         qtype = (out.get("question_type") or "action").strip().lower()
         gt_text = out.get("ground_truth", "")
@@ -206,6 +213,19 @@ def _recompute_stage2_metrics(outputs: List[Dict]) -> Dict:
                 if gt_brk is not None and pr_brk is not None:
                     brake_mae_sum_on_brake_gt += abs(float(pr_brk) - float(gt_brk))
                     brake_mae_count_on_brake_gt += 1
+
+            # Row 4 v2: per-component risk-decomp MAE. Pulled from the
+            # per-sample fields already on `out` (written by eval_stage2.py).
+            for _comp in _RC_COMPS:
+                gt_v = out.get(f"gt_{_comp}_pct")
+                pr_v = out.get(f"pred_{_comp}_pct")
+                if gt_v is None or pr_v is None:
+                    continue
+                try:
+                    rc_mae_sum[_comp] += abs(float(pr_v) - float(gt_v))
+                    rc_n[_comp] += 1
+                except Exception:
+                    pass
 
             if gt_action != "OTHER":
                 total += 1
@@ -231,7 +251,7 @@ def _recompute_stage2_metrics(outputs: List[Dict]) -> Dict:
                 if pr_rl == gt_rl.upper():
                     risk_correct += 1
 
-    return {
+    metrics_dict = {
         "action_accuracy": float(correct / total) if total > 0 else 0.0,
         "n_action_samples": int(total),
         "missed_brake_rate": (
@@ -263,6 +283,14 @@ def _recompute_stage2_metrics(outputs: List[Dict]) -> Dict:
             float(parse_ok_sum / max(1, total)) if total > 0 else 0.0
         ),
     }
+    # Row 4 v2: append per-component MAE + sample count to top-level metrics.
+    for _comp in _RC_COMPS:
+        n = rc_n[_comp]
+        metrics_dict[f"{_comp}_risk_mae"] = (
+            float(rc_mae_sum[_comp] / n) if n > 0 else 0.0
+        )
+        metrics_dict[f"n_{_comp}_risk_samples"] = int(n)
+    return metrics_dict
 
 
 def _merge_stage2(run_dir: str, num_shards: int) -> None:

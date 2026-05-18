@@ -80,6 +80,13 @@ class FrameRiskData:
     avg_total_risk: float
     num_risk_objects: int
     object_risks: List[Dict]
+    # Row 4 v2: per-frame aggregates for the remaining two of the four
+    # risk components. Needed by USE_RISK_DECOMP_OUTPUT so the action
+    # target can emit Collision/Pedestrian/Uncertainty/Regulatory lines.
+    # Defaults to 0.0 so older code paths and the empty-frame
+    # constructors don't need to be touched if the field isn't used.
+    max_uncertainty_risk: float = 0.0
+    max_regulatory_risk: float = 0.0
 
     def to_dict(self) -> Dict:
         return asdict(self)
@@ -280,6 +287,8 @@ def calculate_risk_from_vectors(
 
     max_collision = 0.0
     max_pedestrian = 0.0
+    max_uncertainty = 0.0
+    max_regulatory = 0.0
     min_ttc = float("inf")
 
     for i in range(use_n):
@@ -383,6 +392,8 @@ def calculate_risk_from_vectors(
         # Track global stats
         max_collision = max(max_collision, float(collision))
         max_pedestrian = max(max_pedestrian, float(ped))
+        max_uncertainty = max(max_uncertainty, float(unc_risk))
+        max_regulatory = max(max_regulatory, float(reg))
         per_obj_total.append(total)
 
         if ttc is not None and fw >= 0.3:
@@ -444,6 +455,8 @@ def calculate_risk_from_vectors(
         avg_total_risk=round(float(avg_risk), 3),
         num_risk_objects=int(effective_n),
         object_risks=object_risks,
+        max_uncertainty_risk=round(float(max_uncertainty), 3),
+        max_regulatory_risk=round(float(max_regulatory), 3),
     )
 
 

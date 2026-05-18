@@ -161,6 +161,37 @@ USE_CONTINUOUS_ACTIONS = True
 CONTINUOUS_BRAKE_MAX = 90   # matches current bucketed ceiling
 CONTINUOUS_ACCEL_MAX = 20   # matches current bucketed ceiling
 
+# Row 4 v2: GAT spatial encoder. Swaps the fully-connected
+# nn.TransformerEncoder inside VectorPrefixEncoder for a hand-rolled
+# multi-head Graph Attention layer with edge features (rel_x/rel_y/
+# rel_vx/rel_vy/dist between objects) and a k-NN + proximity adjacency
+# mask. Geometric inductive bias for driving: proximity matters,
+# relative motion encodes collision-relevant physics.
+USE_GAT = True
+GAT_K_NEAREST = 4               # k-nearest-neighbour graph degree (per object)
+GAT_PROXIMITY_THRESHOLD_M = 20.0  # objects within 20 m always edge-connected
+GAT_EDGE_DIM = 5                # [rel_x_ij, rel_y_ij, rel_vx_ij, rel_vy_ij, d_ij]
+GAT_N_HEADS = 4                 # match existing TransformerEncoder for parity
+GAT_N_LAYERS = 2                # match existing TransformerEncoder for parity
+
+# Thread the GAT flags into the VectorEncoderConfig dict (defined earlier
+# at line 61 before these flags existed).
+VECTOR_ENCODER_CONFIG.update(dict(
+    use_gat=USE_GAT,
+    gat_n_heads=GAT_N_HEADS,
+    gat_n_layers=GAT_N_LAYERS,
+    gat_edge_dim=GAT_EDGE_DIM,
+    gat_k_nearest=GAT_K_NEAREST,
+    gat_proximity_m=GAT_PROXIMITY_THRESHOLD_M,
+))
+
+# Row 4 v2: Risk-decomposition output. Adds 4 per-component risk lines
+# (Collision/Pedestrian/Uncertainty/Regulatory) to the action target,
+# turning the internal multi-dim risk score (N1) into an output-side
+# contribution. Forces Stage 2 to internalize the per-component
+# breakdown that drives the oracle, not just the aggregate risk_level.
+USE_RISK_DECOMP_OUTPUT = True
+
 # Whether to freeze base FLAN-T5 weights (False = full fine-tuning, like the paper)
 FREEZE_BASE_MODEL = False
 
@@ -208,7 +239,11 @@ STAGE2_BATCH_SIZE = 4
 STAGE2_LR = 2e-5
 STAGE2_WEIGHT_DECAY = 0.0
 STAGE2_MAX_INPUT_LEN = 384
-STAGE2_MAX_TARGET_LEN = 128
+# Row 4 v2: bumped 128 → 192 to fit the 4 new risk-decomp lines in the
+# action target (Collision/Pedestrian/Uncertainty/Regulatory). Each line
+# is ~12 tokens; 4 lines add ~48 tokens to the ~25-token action target.
+# 192 gives comfortable headroom for variable-length Reason text.
+STAGE2_MAX_TARGET_LEN = 192
 
 STAGE2_QUESTION = "How should the car drive in this situation and why?"
 
@@ -221,7 +256,11 @@ GEN_NO_REPEAT_NGRAM_SIZE = 8
 GEN_REPETITION_PENALTY = 1.5
 GEN_LENGTH_PENALTY = 1.0
 GEN_MAX_NEW_TOKENS_STAGE1 = 160
-GEN_MAX_NEW_TOKENS_STAGE2 = 80
+# Row 4 v2: bumped 80 → 160 to fit the 9-line action target under
+# USE_RISK_DECOMP_OUTPUT=True (4 extra risk lines × ~12 tokens each = ~48
+# additional tokens). Was at 80 (just enough for the 5-line target ~25
+# tokens + reason ~30 tokens). 160 leaves comfortable headroom.
+GEN_MAX_NEW_TOKENS_STAGE2 = 160
 
 # -----------------------------
 # Logging/saving

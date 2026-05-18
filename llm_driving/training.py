@@ -38,16 +38,36 @@ def _ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
 
-PAPER_FORMAT_INSTRUCTION = (
-    "\n\nYou are an AI Driver.\n"
-    "Return EXACTLY 5 lines (with newlines), and nothing else:\n"
-    "Here are my actions:\n"
-    "- Accelerator pedal: <0-100>%\n"
-    "- Brake pedal: <0-100>%\n"
-    "- Steering: <left/straight/right>\n"
-    "Reason: <one short sentence>\n"
-    "Do NOT ask questions. Do NOT add extra text.\n"
-)
+if getattr(cfg, "USE_RISK_DECOMP_OUTPUT", False):
+    # Row 4 v2: match the 9-line format used at build time by
+    # datasets_builder.PAPER_FORMAT_INSTRUCTION (with risk-decomp lines).
+    # Both copies of this constant MUST stay in lock-step or train/eval
+    # prompt formats diverge.
+    PAPER_FORMAT_INSTRUCTION = (
+        "\n\nYou are an AI Driver.\n"
+        "Return EXACTLY 9 lines (with newlines), and nothing else:\n"
+        "Here are my actions:\n"
+        "- Accelerator pedal: <0-100>%\n"
+        "- Brake pedal: <0-100>%\n"
+        "- Steering: <left/straight/right>\n"
+        "- Collision risk: <0-100>%\n"
+        "- Pedestrian risk: <0-100>%\n"
+        "- Uncertainty risk: <0-100>%\n"
+        "- Regulatory risk: <0-100>%\n"
+        "Reason: <one short sentence>\n"
+        "Do NOT ask questions. Do NOT add extra text.\n"
+    )
+else:
+    PAPER_FORMAT_INSTRUCTION = (
+        "\n\nYou are an AI Driver.\n"
+        "Return EXACTLY 5 lines (with newlines), and nothing else:\n"
+        "Here are my actions:\n"
+        "- Accelerator pedal: <0-100>%\n"
+        "- Brake pedal: <0-100>%\n"
+        "- Steering: <left/straight/right>\n"
+        "Reason: <one short sentence>\n"
+        "Do NOT ask questions. Do NOT add extra text.\n"
+    )
 
 RISK_FORMAT_INSTRUCTION = (
     "\n\nAnswer in 1-2 short lines using this template ONLY:\n"
@@ -197,31 +217,88 @@ def _extract_steer(text: str) -> Optional[str]:
     m = re.search(r"steering:\s*(left|straight|right)", t)
     return m.group(1) if m else None
 
+
+# Row 4 v2: extractors for the 4 risk-decomposition output lines
+# (Collision/Pedestrian/Uncertainty/Regulatory risk percentages). When
+# USE_RISK_DECOMP_OUTPUT=False, predictions won't contain these lines and
+# all extractors return None — eval-side code must handle None gracefully.
+
+def _extract_collision_pct(text: str) -> Optional[int]:
+    return _extract_pct_after(text, "collision risk:")
+
+def _extract_pedestrian_pct(text: str) -> Optional[int]:
+    return _extract_pct_after(text, "pedestrian risk:")
+
+def _extract_uncertainty_pct(text: str) -> Optional[int]:
+    return _extract_pct_after(text, "uncertainty risk:")
+
+def _extract_regulatory_pct(text: str) -> Optional[int]:
+    return _extract_pct_after(text, "regulatory risk:")
+
 def _extract_reason(text: str) -> Optional[str]:
     t = (text or "").strip()
     m = re.search(r"reason:\s*(.+)$", t, flags=re.IGNORECASE)
     return m.group(1).strip() if m else None
 
 def enforce_5_lines(text: str) -> Tuple[str, int]:
+    """Validate + reshape the model's action prediction into canonical form.
+
+    When `cfg.USE_RISK_DECOMP_OUTPUT=True`, the canonical form is 9 lines
+    (action triplet + 4 risk decomposition components + reason). Otherwise
+    the original 5 lines. The function name stays `enforce_5_lines` for
+    backward compatibility — all callers care about the (fixed, parse_ok)
+    return shape, not the exact line count.
+    """
     accel = _extract_accel_percent(text)
     brake = _extract_brake_percent(text)
     steer = _extract_steer(text)
     reason = _extract_reason(text)
 
-    ok = 1 if (accel is not None and brake is not None and steer is not None and reason is not None) else 0
+    use_decomp = bool(getattr(cfg, "USE_RISK_DECOMP_OUTPUT", False))
+    if use_decomp:
+        coll = _extract_collision_pct(text)
+        ped = _extract_pedestrian_pct(text)
+        unc = _extract_uncertainty_pct(text)
+        reg = _extract_regulatory_pct(text)
+        ok = 1 if (
+            accel is not None and brake is not None and steer is not None
+            and reason is not None
+            and coll is not None and ped is not None
+            and unc is not None and reg is not None
+        ) else 0
+    else:
+        coll = ped = unc = reg = None
+        ok = 1 if (accel is not None and brake is not None and steer is not None and reason is not None) else 0
 
     if accel is None: accel = 0
     if brake is None: brake = 0
     if steer not in ("left", "straight", "right"): steer = "straight"
     if not reason: reason = "N/A"
 
-    fixed = (
-        "Here are my actions:\n"
-        f"- Accelerator pedal: {accel}%\n"
-        f"- Brake pedal: {brake}%\n"
-        f"- Steering: {steer}\n"
-        f"Reason: {reason}\n"
-    )
+    if use_decomp:
+        if coll is None: coll = 0
+        if ped is None: ped = 0
+        if unc is None: unc = 0
+        if reg is None: reg = 0
+        fixed = (
+            "Here are my actions:\n"
+            f"- Accelerator pedal: {accel}%\n"
+            f"- Brake pedal: {brake}%\n"
+            f"- Steering: {steer}\n"
+            f"- Collision risk: {coll}%\n"
+            f"- Pedestrian risk: {ped}%\n"
+            f"- Uncertainty risk: {unc}%\n"
+            f"- Regulatory risk: {reg}%\n"
+            f"Reason: {reason}\n"
+        )
+    else:
+        fixed = (
+            "Here are my actions:\n"
+            f"- Accelerator pedal: {accel}%\n"
+            f"- Brake pedal: {brake}%\n"
+            f"- Steering: {steer}\n"
+            f"Reason: {reason}\n"
+        )
     return fixed, ok
 
 def _format_compliance_5line(text: str) -> int:
@@ -229,7 +306,10 @@ def _format_compliance_5line(text: str) -> int:
         return 0
     lines = [ln.rstrip("\n") for ln in (text or "").splitlines()]
     lines = [ln.strip() for ln in lines if ln.strip()]
-    if len(lines) != 5:
+
+    use_decomp = bool(getattr(cfg, "USE_RISK_DECOMP_OUTPUT", False))
+    expected_n = 9 if use_decomp else 5
+    if len(lines) != expected_n:
         return 0
     if not lines[0].lower().startswith("here are my actions"):
         return 0
@@ -239,8 +319,26 @@ def _format_compliance_5line(text: str) -> int:
         return 0
     if "steering:" not in lines[3].lower():
         return 0
-    if not lines[4].lower().startswith("reason:"):
-        return 0
+    if use_decomp:
+        # Row 4 v2: 4 risk-decomp lines between Steering and Reason.
+        if "collision risk:" not in lines[4].lower():
+            return 0
+        if "pedestrian risk:" not in lines[5].lower():
+            return 0
+        if "uncertainty risk:" not in lines[6].lower():
+            return 0
+        if "regulatory risk:" not in lines[7].lower():
+            return 0
+        if not lines[8].lower().startswith("reason:"):
+            return 0
+        if (_extract_collision_pct(text) is None
+                or _extract_pedestrian_pct(text) is None
+                or _extract_uncertainty_pct(text) is None
+                or _extract_regulatory_pct(text) is None):
+            return 0
+    else:
+        if not lines[4].lower().startswith("reason:"):
+            return 0
     if _extract_brake_percent(text) is None or _extract_accel_percent(text) is None:
         return 0
     if _extract_steer(text) is None:

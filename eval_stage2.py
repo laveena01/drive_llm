@@ -32,7 +32,7 @@ import json
 import logging
 import os
 import sys
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from datasets import Dataset
@@ -51,7 +51,11 @@ from llm_driving.training import (
     _build_stage2_prompt_from_caption,
     _ensure_paper_format,
     _extract_brake_percent,
+    _extract_collision_pct,
+    _extract_pedestrian_pct,
+    _extract_regulatory_pct,
     _extract_risk_level,
+    _extract_uncertainty_pct,
     _format_compliance_5line,
     _map_text_to_action_label,
     _print_eval_risk_summary,
@@ -315,6 +319,19 @@ def main() -> None:
         parse_ok_sum = 0.0
         outputs: List[Dict] = []
 
+        # Row 4 v2: per-component risk-decomposition MAE counters. Tracked
+        # only when both gt and pred values parse successfully on a given
+        # action sample. When USE_RISK_DECOMP_OUTPUT=False at build time,
+        # all counters stay at 0 → reported MAE = 0.0, n = 0 (harmless).
+        _RISK_DECOMP_COMPS = (
+            ("collision", _extract_collision_pct),
+            ("pedestrian", _extract_pedestrian_pct),
+            ("uncertainty", _extract_uncertainty_pct),
+            ("regulatory", _extract_regulatory_pct),
+        )
+        rc_mae_sum = {c: 0.0 for c, _ in _RISK_DECOMP_COMPS}
+        rc_n = {c: 0 for c, _ in _RISK_DECOMP_COMPS}
+
         for si, sample in enumerate(eval_ds):
             raw_input_text = sample["input"]
             gt_text = sample["target"]
@@ -326,6 +343,17 @@ def main() -> None:
             risk_level = sample.get("risk_level", None)
             gt_brake_pct: float | None = None
             pred_brake_pct: float | None = None
+            # Row 4 v2: per-component risk-decomp extraction (filled in
+            # the action branch below; left None for non-action questions
+            # so the eval_extras slice metrics ignore them).
+            gt_rc: Dict[str, Optional[int]] = {
+                "collision": None, "pedestrian": None,
+                "uncertainty": None, "regulatory": None,
+            }
+            pred_rc: Dict[str, Optional[int]] = {
+                "collision": None, "pedestrian": None,
+                "uncertainty": None, "regulatory": None,
+            }
 
             try:
                 if mode == "oracle_caption":
@@ -381,6 +409,20 @@ def main() -> None:
                                 float(pred_brake_pct) - float(gt_brake_pct)
                             )
                             brake_mae_count_on_brake_gt += 1
+
+                    # Row 4 v2: extract per-component risk values from
+                    # gt and pred. Both must parse cleanly to count toward
+                    # MAE. When USE_RISK_DECOMP_OUTPUT=False at build time,
+                    # gt_text contains no risk lines → all extractors
+                    # return None → nothing accumulates.
+                    for comp, extractor in _RISK_DECOMP_COMPS:
+                        gt_v = extractor(gt_text)
+                        pr_v = extractor(pred_fixed)
+                        gt_rc[comp] = gt_v
+                        pred_rc[comp] = pr_v
+                        if gt_v is not None and pr_v is not None:
+                            rc_mae_sum[comp] += abs(float(pr_v) - float(gt_v))
+                            rc_n[comp] += 1
 
                     if gt_action != "OTHER":
                         total += 1
@@ -443,6 +485,16 @@ def main() -> None:
                     "brake_required_future": sample.get("brake_required_future"),
                     "gt_brake_pct": gt_brake_pct,
                     "pred_brake_pct": pred_brake_pct,
+                    # Row 4 v2: per-component risk-decomp pred/gt for slice
+                    # metrics (eval_extras consumes these keys directly).
+                    "gt_collision_pct": gt_rc["collision"],
+                    "pred_collision_pct": pred_rc["collision"],
+                    "gt_pedestrian_pct": gt_rc["pedestrian"],
+                    "pred_pedestrian_pct": pred_rc["pedestrian"],
+                    "gt_uncertainty_pct": gt_rc["uncertainty"],
+                    "pred_uncertainty_pct": pred_rc["uncertainty"],
+                    "gt_regulatory_pct": gt_rc["regulatory"],
+                    "pred_regulatory_pct": pred_rc["regulatory"],
                     # Vectors carried only to support the hard-case dump (E3).
                     # Adds bytes to the per-shard predictions JSON but keeps
                     # everything self-contained for offline analysis.
@@ -475,6 +527,14 @@ def main() -> None:
             "format_compliance_action": float(fmt_sum / max(1, total)) if total > 0 else 0.0,
             "parse_ok_rate_action": float(parse_ok_sum / max(1, total)) if total > 0 else 0.0,
         }
+        # Row 4 v2: top-level per-component risk-decomp MAE. All zero (and
+        # n=0) when USE_RISK_DECOMP_OUTPUT=False at build time.
+        for comp, _ in _RISK_DECOMP_COMPS:
+            n = rc_n[comp]
+            metrics[f"{comp}_risk_mae"] = (
+                float(rc_mae_sum[comp] / n) if n > 0 else 0.0
+            )
+            metrics[f"n_{comp}_risk_samples"] = int(n)
         return metrics, outputs
 
     # --- Run eval passes ---
