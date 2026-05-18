@@ -132,9 +132,31 @@ def main():
     state.wait_for_everyone()
 
     # 2) Stage 1: Vector -> Caption pretraining
-    logger.info("\n[MAIN] Step 2/3: Training Stage 1 (vector → caption)...")
-    model_stage1, tokenizer = train_stage1(CAPTIONING_DATA_PATH)
-    logger.info("[MAIN] Step 2/3 DONE: Stage 1 training finished.")
+    # Skip if a best_checkpoint already exists in this run dir — supports
+    # cross-run reuse of Stage 1 (captioning data is risk-independent, so
+    # base v2 / base+risk v2 / base+risk+GAT v2 etc. can share Stage 1).
+    stage1_ckpt_dir = os.path.join(RUN_DIR, "stage1", "best_checkpoint")
+    if os.path.isdir(stage1_ckpt_dir):
+        logger.info(
+            f"\n[MAIN] Step 2/3: Found existing Stage 1 checkpoint at "
+            f"{stage1_ckpt_dir}. Skipping Stage 1 training."
+        )
+        import torch
+        from transformers import AutoTokenizer
+        from llm_driving.lora_utils import load_checkpoint
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model_stage1 = load_checkpoint(
+            model_name=cfg.MODEL_NAME,
+            checkpoint_dir=stage1_ckpt_dir,
+            device=device,
+            apply_lora_config=cfg.USE_LORA,
+        )
+        tokenizer = AutoTokenizer.from_pretrained(cfg.MODEL_NAME)
+        logger.info("[MAIN] Step 2/3 DONE: Stage 1 checkpoint loaded.")
+    else:
+        logger.info("\n[MAIN] Step 2/3: Training Stage 1 (vector → caption)...")
+        model_stage1, tokenizer = train_stage1(CAPTIONING_DATA_PATH)
+        logger.info("[MAIN] Step 2/3 DONE: Stage 1 training finished.")
 
     # 3) Stage 2: Driving QA finetuning
     logger.info("\n[MAIN] Step 3/3: Training Stage 2 (caption + question → action/answer)...")
