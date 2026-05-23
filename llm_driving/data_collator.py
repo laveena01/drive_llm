@@ -50,6 +50,7 @@ class VectorPrefixDataCollator:
         vector_dim: int = 8,
         padding: str = "max_length",
         temporal_window: int = 0,
+        pretokenized: bool = False,
     ):
         self.tokenizer = tokenizer
         self.max_input_length = max_input_length
@@ -61,6 +62,14 @@ class VectorPrefixDataCollator:
         # window fields are zero-padded so a partial dataset (or eval-time
         # samples that bypass the builder) does not crash.
         self.temporal_window = int(temporal_window)
+        # R7 v2: when True, features already carry tokenized fields
+        # (`input_ids`, `attention_mask`, `labels`) — produced upstream by
+        # `_tokenize_qa` for Stage 2. The collator then only stacks those
+        # tensors and adds vectors/num_objects, instead of re-tokenizing
+        # raw `input`/`target` strings (which Stage 2 features don't have).
+        # Also propagates `question_weight` if present so
+        # WeightedLossTrainer can read it from the batch.
+        self.pretokenized = bool(pretokenized)
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
         """
@@ -68,30 +77,49 @@ class VectorPrefixDataCollator:
         """
         batch_size = len(features)
 
-        # --- Tokenize text inputs ---
-        inputs_text = [f["input"] for f in features]
-        targets_text = [f["target"] for f in features]
+        if self.pretokenized:
+            # R7 v2 path: features already have tokenized input_ids /
+            # attention_mask / labels from _tokenize_qa. Just stack them.
+            def _stack_long(key: str) -> torch.Tensor:
+                rows = [torch.as_tensor(f[key], dtype=torch.long) for f in features]
+                return torch.stack(rows, dim=0)
 
-        model_inputs = self.tokenizer(
-            inputs_text,
-            max_length=self.max_input_length,
-            padding=self.padding,
-            truncation=True,
-            return_tensors="pt",
-        )
+            model_inputs: Dict[str, torch.Tensor] = {
+                "input_ids": _stack_long("input_ids"),
+                "attention_mask": _stack_long("attention_mask"),
+                "labels": _stack_long("labels"),
+            }
+            # Propagate per-sample loss weight (used by WeightedLossTrainer).
+            if any("question_weight" in f for f in features):
+                weights = [float(f.get("question_weight", 1.0)) for f in features]
+                model_inputs["question_weight"] = torch.tensor(
+                    weights, dtype=torch.float
+                )
+        else:
+            # --- Tokenize text inputs (Stage 1 captioning path) ---
+            inputs_text = [f["input"] for f in features]
+            targets_text = [f["target"] for f in features]
 
-        labels = self.tokenizer(
-            text_target=targets_text,
-            max_length=self.max_target_length,
-            padding=self.padding,
-            truncation=True,
-            return_tensors="pt",
-        )
+            model_inputs = self.tokenizer(
+                inputs_text,
+                max_length=self.max_input_length,
+                padding=self.padding,
+                truncation=True,
+                return_tensors="pt",
+            )
 
-        # Replace padding token id with -100 so loss ignores padding
-        label_ids = labels["input_ids"]
-        label_ids[label_ids == self.tokenizer.pad_token_id] = -100
-        model_inputs["labels"] = label_ids
+            labels = self.tokenizer(
+                text_target=targets_text,
+                max_length=self.max_target_length,
+                padding=self.padding,
+                truncation=True,
+                return_tensors="pt",
+            )
+
+            # Replace padding token id with -100 so loss ignores padding
+            label_ids = labels["input_ids"]
+            label_ids[label_ids == self.tokenizer.pad_token_id] = -100
+            model_inputs["labels"] = label_ids
 
         # --- Build single-frame vector tensors (always) ---
         vectors_batch = torch.zeros(batch_size, self.max_objects, self.vector_dim)

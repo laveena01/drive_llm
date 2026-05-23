@@ -401,6 +401,17 @@ def _tokenize_qa(batch, tokenizer):
         for qt in qtypes
     ]
     model_inputs["question_weight"] = weights
+
+    # R7 v2 (USE_STAGE2_VECTOR_PREFIX=True): preserve per-sample vector
+    # fields so the Stage 2 data collator (VectorPrefixDataCollator) can
+    # stack them into the batch and the trainer can pass them through to
+    # VectorPrefixT5.forward(). For plain-T5 Stage 2 (existing behavior)
+    # these fields are harmless extras — HF Trainer with
+    # remove_unused_columns=False simply ignores them.
+    if "vectors" in batch:
+        model_inputs["vectors"] = list(batch["vectors"])
+    if "num_objects" in batch:
+        model_inputs["num_objects"] = list(batch["num_objects"])
     return model_inputs
 
 
@@ -534,7 +545,34 @@ class WeightedLossTrainer(Trainer):
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         question_weight = inputs.pop("question_weight", None)
-        outputs = model(**inputs)
+        # R7 v2 (USE_STAGE2_VECTOR_PREFIX=True): the data collator adds raw
+        # vector tensors to the batch so VectorPrefixT5 can inject a
+        # vector-prefix alongside the text input. Pop them unconditionally
+        # so plain-T5 Stage 2 (existing behavior) still works — plain T5's
+        # forward would raise on unknown kwargs.
+        vectors = inputs.pop("vectors", None)
+        num_objects = inputs.pop("num_objects", None)
+        # Temporal kwargs are only emitted by the collator when
+        # temporal_window > 0. R7 v2 uses temporal_window=0, so these are
+        # normally absent. Pop defensively anyway so future temporal R7
+        # variants can plug in without re-touching this trainer.
+        vectors_window = inputs.pop("vectors_window", None)
+        num_objects_window = inputs.pop("num_objects_window", None)
+        window_len = inputs.pop("window_len", None)
+        object_present_mask = inputs.pop("object_present_mask", None)
+
+        if vectors is not None:
+            outputs = model(
+                **inputs,
+                vectors=vectors,
+                num_objects=num_objects,
+                vectors_window=vectors_window,
+                num_objects_window=num_objects_window,
+                window_len=window_len,
+                object_present_mask=object_present_mask,
+            )
+        else:
+            outputs = model(**inputs)
 
         if question_weight is None:
             loss = outputs.loss
@@ -1832,10 +1870,487 @@ def _train_stage2_with_lora(model_stage1, tokenizer, qa_path: str):
 
 
 # ---------------------------
+# Stage 2 training (R7 v2: VectorPrefixT5 with direct vector channel)
+# ---------------------------
+
+class _VectorPrefixWeightedLossTrainer(WeightedLossTrainer):
+    """R7 v2 Stage 2 trainer.
+
+    Subclass of :class:`WeightedLossTrainer` that persists VectorPrefixT5
+    using :func:`llm_driving.lora_utils.save_checkpoint` instead of HF's
+    default :meth:`save_pretrained`. The default would silently drop the
+    custom ``vector_encoder`` submodule weights — see the R7 v2 plan,
+    "Checkpoint save/load — known gotcha (highest implementation risk)".
+
+    Auto-save during training is preserved (HF Trainer calls
+    ``_save_checkpoint`` on each ``save_strategy`` trigger) so we keep
+    crash-safety. ``load_best_model_at_end`` MUST be left False — the
+    default HF reload path reads ``pytorch_model.bin`` / ``model.safetensors``
+    and would skip ``vector_encoder.pt``.
+    """
+
+    def _save_checkpoint(self, model, trial, metrics=None):
+        from .lora_utils import save_checkpoint as _save_vp
+
+        run_dir = self.args.output_dir
+        ckpt_dir = os.path.join(run_dir, f"checkpoint-{self.state.global_step}")
+        unwrapped = self.accelerator.unwrap_model(model) \
+            if hasattr(self, "accelerator") else model
+        epoch_int = int(self.state.epoch) if self.state.epoch is not None else None
+        _save_vp(unwrapped, ckpt_dir, epoch=epoch_int)
+
+        # Mirror HF Trainer's other side-effects so resume / save_total_limit work.
+        os.makedirs(ckpt_dir, exist_ok=True)
+        self.state.save_to_json(os.path.join(ckpt_dir, "trainer_state.json"))
+        try:
+            if self.tokenizer is not None:
+                self.tokenizer.save_pretrained(ckpt_dir)
+        except Exception:
+            # Tokenizer save is best-effort; never let it block training.
+            logger.warning(
+                "[STAGE 2 - R7] tokenizer.save_pretrained failed in checkpoint dir; continuing."
+            )
+
+        # Honour save_total_limit by deleting old checkpoint dirs.
+        if self.args.save_total_limit is not None and self.args.save_total_limit > 0:
+            self._rotate_checkpoints_r7(run_dir)
+
+    def _rotate_checkpoints_r7(self, run_dir: str):
+        import glob
+        import shutil
+        ckpt_dirs = sorted(
+            glob.glob(os.path.join(run_dir, "checkpoint-*")),
+            key=lambda p: int(p.rsplit("-", 1)[-1]) if p.rsplit("-", 1)[-1].isdigit() else -1,
+        )
+        if len(ckpt_dirs) <= self.args.save_total_limit:
+            return
+        for old in ckpt_dirs[: len(ckpt_dirs) - self.args.save_total_limit]:
+            try:
+                shutil.rmtree(old)
+                logger.info(f"[STAGE 2 - R7] Rotated out old checkpoint: {old}")
+            except Exception:
+                logger.warning(f"[STAGE 2 - R7] Failed to delete old checkpoint {old}")
+
+    def save_model(self, output_dir=None, _internal_call: bool = False):
+        from .lora_utils import save_checkpoint as _save_vp
+
+        out = output_dir or self.args.output_dir
+        unwrapped = self.accelerator.unwrap_model(self.model) \
+            if hasattr(self, "accelerator") else self.model
+        _save_vp(unwrapped, out, epoch=None)
+        try:
+            if self.tokenizer is not None:
+                self.tokenizer.save_pretrained(out)
+        except Exception:
+            logger.warning("[STAGE 2 - R7] tokenizer.save_pretrained failed in save_model; continuing.")
+
+
+def _train_stage2_with_vector_prefix(model_stage1, tokenizer, qa_path: str):
+    """R7 v2: Stage 2 = fresh VectorPrefixT5 with its own independent vector
+    encoder + T5. Consumes BOTH the Stage 1 caption (as text input) AND the
+    vector prefix (injected at the embedding level). Stage 1 stays in the
+    inference path; its caption is part of Stage 2's text prompt.
+
+    See plan: "Direct Vector Prefix to Stage 2 (R7 v2)".
+    """
+    from .vector_prefix_t5 import VectorPrefixT5
+    from .vector_encoder import VectorEncoderConfig, parse_vec_str
+    from .data_collator import VectorPrefixDataCollator
+    from .lora_utils import save_checkpoint as _save_vp
+
+    logger.info("\n" + "=" * 80)
+    logger.info("[STAGE 2 - R7 VECTOR-PREFIX] Driving QA finetuning started.")
+    logger.info(f"[STAGE 2] Loading QA data from: {qa_path}")
+
+    # Keep Stage 1 for caption generation during eval (separate model).
+    caption_model = model_stage1
+    caption_model.eval()
+
+    # Build a FRESH VectorPrefixT5 for Stage 2 — independent vector encoder
+    # + independent T5. Stage 1 trained on caption supervision; Stage 2 will
+    # train on action supervision. They communicate only via the caption
+    # text fed into Stage 2's input prompt.
+    encoder_config = VectorEncoderConfig(**cfg.VECTOR_ENCODER_CONFIG)
+    model_stage2 = VectorPrefixT5(
+        model_name=cfg.MODEL_NAME,
+        encoder_config=encoder_config,
+        tokenizer=tokenizer,
+        use_temporal=False,  # R7 v2 keeps temporal off (isolated from R6 ablation)
+    )
+
+    if cfg.FREEZE_BASE_MODEL:
+        model_stage2.freeze_t5_base()
+        logger.info("[STAGE 2 - R7] T5 base frozen; vector encoder remains trainable.")
+    else:
+        for p in model_stage2.parameters():
+            p.requires_grad = True
+        logger.info("[STAGE 2 - R7] Full fine-tuning enabled (T5 + vector encoder).")
+
+    model_stage2.train()
+
+    with open(qa_path, "r") as f:
+        data = json.load(f)
+    logger.info(f"[STAGE 2 - R7] Total samples: {len(data)}")
+
+    if getattr(cfg, "USE_SCENE_LEVEL_SPLIT", False):
+        train_list, val_list = _scene_aware_split(
+            data,
+            test_size=getattr(cfg, "SCENE_LEVEL_SPLIT_TEST_SIZE", 0.2),
+            seed=getattr(cfg, "SCENE_LEVEL_SPLIT_SEED", 42),
+        )
+        train_ds = Dataset.from_list(train_list)
+        eval_ds = Dataset.from_list(val_list)
+    else:
+        full_ds = Dataset.from_list(data)
+        split_ds = full_ds.train_test_split(test_size=0.2, seed=42)
+        train_ds = split_ds["train"]
+        eval_ds = split_ds["test"]
+    logger.info(f"[STAGE 2 - R7] Train: {len(train_ds)} | Val: {len(eval_ds)}")
+
+    if getattr(cfg, "OVERSAMPLE_HARD_BRAKE_LOW", False):
+        train_ds = _oversample_hard_brake_low(
+            train_ds, int(getattr(cfg, "HARD_BRAKE_LOW_OVERSAMPLE_FACTOR", 5))
+        )
+        logger.info(
+            f"[STAGE 2 - R7] After oversampling — train: {len(train_ds)}, val unchanged: {len(eval_ds)}"
+        )
+
+    def tokenize_fn(batch):
+        return _tokenize_qa(batch, tokenizer)
+
+    logger.info("[STAGE 2 - R7] Tokenizing datasets (preserving vectors + num_objects)...")
+    # NOTE: remove_columns drops the raw text columns (`input`, `target`,
+    # `vec_str`, etc.) but _tokenize_qa re-adds `vectors`/`num_objects` to
+    # the output dict, so they survive into the collator.
+    tokenized_train = train_ds.map(
+        tokenize_fn, batched=True, remove_columns=train_ds.column_names
+    )
+    tokenized_eval = eval_ds.map(
+        tokenize_fn, batched=True, remove_columns=eval_ds.column_names
+    )
+
+    _ensure_dir(STAGE2_OUTPUT_DIR)
+    logger.info(f"[STAGE 2 - R7] Output directory: {STAGE2_OUTPUT_DIR}")
+
+    collator = VectorPrefixDataCollator(
+        tokenizer=tokenizer,
+        max_input_length=cfg.STAGE2_MAX_INPUT_LEN,
+        max_target_length=cfg.STAGE2_MAX_TARGET_LEN,
+        max_objects=cfg.MAX_OBJECTS,
+        vector_dim=cfg.VECTOR_DIM,
+        padding="max_length",
+        temporal_window=0,  # R7 v2: single-frame vectors only
+        pretokenized=True,  # features already have input_ids/labels from _tokenize_qa
+    )
+
+    training_args = TrainingArguments(
+        output_dir=STAGE2_OUTPUT_DIR,
+        per_device_train_batch_size=cfg.STAGE2_BATCH_SIZE,
+        gradient_accumulation_steps=4,
+        num_train_epochs=cfg.STAGE2_EPOCHS,
+        fp16=False,
+        optim="adafactor",
+        learning_rate=cfg.STAGE2_LR,
+        max_grad_norm=1.0,
+        logging_steps=cfg.LOGGING_STEPS,
+        eval_strategy=cfg.EVAL_STRATEGY,
+        save_strategy=cfg.SAVE_STRATEGY,
+        save_total_limit=cfg.SAVE_TOTAL_LIMIT,
+        disable_tqdm=cfg.DISABLE_TQDM,
+        # CRITICAL (R7 plan): default HF reload reads pytorch_model.bin and
+        # silently skips our `vector_encoder.pt`. Keep False; eval scripts
+        # load via lora_utils.load_checkpoint() at inference time.
+        load_best_model_at_end=False,
+        remove_unused_columns=False,
+    )
+
+    trainer = _VectorPrefixWeightedLossTrainer(
+        model=model_stage2,
+        args=training_args,
+        train_dataset=tokenized_train,
+        eval_dataset=tokenized_eval,
+        tokenizer=tokenizer,
+        data_collator=collator,
+    )
+
+    logger.info("[STAGE 2 - R7] Starting training...")
+    trainer.train()
+    logger.info("[STAGE 2 - R7] Training finished.")
+
+    # Manual final save: both the canonical `best_checkpoint` dir (used by
+    # eval_stage2.py + counterfactual_eval.py) and `final_checkpoint`. We
+    # don't track validation-loss-best mid-training (HF Trainer's
+    # load_best_model_at_end is disabled), so "best" here is "final".
+    final_dir = os.path.join(STAGE2_OUTPUT_DIR, "final_checkpoint")
+    best_dir = os.path.join(STAGE2_OUTPUT_DIR, "best_checkpoint")
+    unwrapped = trainer.accelerator.unwrap_model(model_stage2) \
+        if hasattr(trainer, "accelerator") else model_stage2
+    _save_vp(unwrapped, final_dir, epoch=cfg.STAGE2_EPOCHS)
+    _save_vp(unwrapped, best_dir, epoch=cfg.STAGE2_EPOCHS)
+    try:
+        tokenizer.save_pretrained(final_dir)
+        tokenizer.save_pretrained(best_dir)
+    except Exception:
+        logger.warning("[STAGE 2 - R7] tokenizer.save_pretrained failed; continuing.")
+    logger.info(f"[STAGE 2 - R7] Saved final + best checkpoints to {STAGE2_OUTPUT_DIR}")
+
+    raw_eval = trainer.evaluate()
+    logger.info(f"[STAGE 2 - R7] Raw eval output: {raw_eval}")
+
+    # --- Inline eval (skipped in multi-GPU; run eval_stage2.py separately). ---
+    model_stage2.eval()
+    device = next(model_stage2.parameters()).device
+
+    def _gen_stage2_with_vectors(
+        prompt: str,
+        vectors_t: torch.Tensor,
+        num_obj_t: torch.Tensor,
+        max_new_tokens: int,
+        ensure_paper: bool,
+    ) -> str:
+        if ensure_paper:
+            prompt = _ensure_paper_format(prompt)
+        text_inputs = tokenizer(
+            prompt,
+            return_tensors="pt",
+            max_length=cfg.STAGE2_MAX_INPUT_LEN,
+            truncation=True,
+        ).to(device)
+        pred_ids = model_stage2.generate(
+            input_ids=text_inputs["input_ids"],
+            attention_mask=text_inputs["attention_mask"],
+            vectors=vectors_t.to(device),
+            num_objects=num_obj_t.to(device),
+            max_new_tokens=max_new_tokens,
+            num_beams=cfg.GEN_NUM_BEAMS,
+            early_stopping=cfg.GEN_EARLY_STOPPING,
+            no_repeat_ngram_size=cfg.GEN_NO_REPEAT_NGRAM_SIZE,
+            repetition_penalty=cfg.GEN_REPETITION_PENALTY,
+        )
+        return tokenizer.decode(pred_ids[0], skip_special_tokens=True)
+
+    def _vectors_tensor_from_sample(sample: Dict) -> Tuple[torch.Tensor, torch.Tensor]:
+        if "vectors" in sample and sample["vectors"]:
+            vectors = sample["vectors"]
+            n = int(sample.get("num_objects", sample.get("use_n", 0)))
+        else:
+            vec_str = sample.get("vec_str", "")
+            vectors_np, n = parse_vec_str(vec_str, cfg.MAX_OBJECTS, cfg.VECTOR_DIM)
+            vectors = vectors_np.tolist()
+        return (
+            torch.tensor([vectors], dtype=torch.float32),
+            torch.tensor([n], dtype=torch.long),
+        )
+
+    def _gen_caption_from_stage1(sample: Dict) -> str:
+        """Run Stage 1 (VectorPrefixT5) to generate a caption for Stage 2."""
+        if "vectors" in sample and sample["vectors"]:
+            vectors = sample["vectors"]
+            n = int(sample.get("num_objects", sample.get("use_n", 0)))
+        else:
+            vec_str = sample.get("vec_str", "")
+            vectors_np, n = parse_vec_str(vec_str, cfg.MAX_OBJECTS, cfg.VECTOR_DIM)
+            vectors = vectors_np.tolist()
+        cap_device = caption_model.device
+        vectors_t = torch.tensor([vectors], dtype=torch.float32).to(cap_device)
+        num_obj_t = torch.tensor([n], dtype=torch.long).to(cap_device)
+        text_inputs = tokenizer(
+            cfg.STAGE1_TEXT_PROMPT,
+            return_tensors="pt",
+            max_length=cfg.STAGE1_MAX_INPUT_LEN,
+            truncation=True,
+        ).to(cap_device)
+        pred_ids = caption_model.generate(
+            vectors=vectors_t,
+            num_objects=num_obj_t,
+            input_ids=text_inputs["input_ids"],
+            attention_mask=text_inputs["attention_mask"],
+            max_new_tokens=cfg.GEN_MAX_NEW_TOKENS_STAGE1,
+            num_beams=cfg.GEN_NUM_BEAMS,
+            early_stopping=cfg.GEN_EARLY_STOPPING,
+            no_repeat_ngram_size=cfg.GEN_NO_REPEAT_NGRAM_SIZE,
+            repetition_penalty=cfg.GEN_REPETITION_PENALTY,
+        )
+        return tokenizer.decode(pred_ids[0], skip_special_tokens=True)
+
+    def run_eval(mode: str) -> Tuple[Dict, List[Dict]]:
+        correct = 0
+        total = 0
+        missed_brake = 0
+        brake_total = 0
+        unsafe_continue_high = 0
+        highcrit_total = 0
+        brake_mae_sum_on_brake_gt = 0.0
+        brake_mae_count_on_brake_gt = 0
+        risk_correct = 0
+        risk_total = 0
+        bleu_sum = 0.0
+        rouge_sum = 0.0
+        fmt_sum = 0.0
+        parse_ok_sum = 0.0
+        outputs: List[Dict] = []
+
+        for si, sample in enumerate(eval_ds):
+            raw_input_text = sample["input"]
+            gt_text = sample["target"]
+            qtype = (sample.get("question_type") or "action").strip().lower()
+            question = sample.get("question", "How should the car drive in this situation and why?")
+            risk_text = sample.get("risk_text", "")
+            risk_level = sample.get("risk_level", None)
+
+            try:
+                if mode == "oracle_caption":
+                    stage2_prompt = raw_input_text
+                    caption_used = None
+                else:
+                    caption_pred = _gen_caption_from_stage1(sample)
+                    caption_used = caption_pred
+                    stage2_prompt = _build_stage2_prompt_from_caption(
+                        caption_pred, risk_text=risk_text, qa_question=question, question_type=qtype
+                    )
+
+                vectors_t, num_obj_t = _vectors_tensor_from_sample(sample)
+                pred_raw = _gen_stage2_with_vectors(
+                    stage2_prompt,
+                    vectors_t=vectors_t,
+                    num_obj_t=num_obj_t,
+                    max_new_tokens=cfg.GEN_MAX_NEW_TOKENS_STAGE2,
+                    ensure_paper=(qtype == "action"),
+                )
+
+                if qtype == "action":
+                    pred_fixed, parse_ok = enforce_5_lines(pred_raw)
+                    gt_action = _map_text_to_action_label(gt_text)
+                    pred_action = _map_text_to_action_label(pred_fixed)
+                    rl = (sample.get("risk_level") or "").strip().upper()
+                    if rl in ("HIGH", "CRITICAL"):
+                        highcrit_total += 1
+                        if pred_action == "CONTINUE":
+                            unsafe_continue_high += 1
+                    if gt_action == "BRAKE":
+                        gt_brk = _extract_brake_percent(gt_text)
+                        pr_brk = _extract_brake_percent(pred_fixed)
+                        if gt_brk is not None and pr_brk is not None:
+                            brake_mae_sum_on_brake_gt += abs(float(pr_brk) - float(gt_brk))
+                            brake_mae_count_on_brake_gt += 1
+                    if gt_action != "OTHER":
+                        total += 1
+                        if gt_action == pred_action:
+                            correct += 1
+                        if gt_action == "BRAKE":
+                            brake_total += 1
+                            if pred_action != "BRAKE":
+                                missed_brake += 1
+                    bleu_sum += bleu1(pred_fixed, gt_text)
+                    rouge_sum += rouge_l_f1(pred_fixed, gt_text)
+                    fmt_sum += float(_format_compliance_5line(pred_fixed))
+                    parse_ok_sum += float(parse_ok)
+                else:
+                    gt_rl = (risk_level or _extract_risk_level(gt_text) or "")
+                    pr_rl = (_extract_risk_level(pred_raw) or "")
+                    if gt_rl:
+                        risk_total += 1
+                        if pr_rl == gt_rl.upper():
+                            risk_correct += 1
+                    pred_fixed = pred_raw
+                    gt_action = "OTHER"
+                    pred_action = "OTHER"
+                    parse_ok = 0
+
+            except Exception:
+                logger.exception(f"[STAGE 2 - R7][EVAL] Failed on eval sample idx={si} (mode={mode}).")
+                pred_raw = ""
+                pred_fixed = ""
+                caption_used = None
+                gt_action = "OTHER"
+                pred_action = "OTHER"
+                parse_ok = 0
+
+            outputs.append({
+                "mode": mode,
+                "question_type": qtype,
+                "question": question,
+                "input": stage2_prompt if mode != "oracle_caption" else raw_input_text,
+                "ground_truth": gt_text,
+                "prediction_raw": pred_raw,
+                "prediction_fixed": pred_fixed,
+                "gt_action": gt_action,
+                "pred_action": pred_action,
+                "parse_ok": int(parse_ok),
+                "caption_used": caption_used,
+                "risk_level": risk_level,
+            })
+
+        metrics = {
+            "action_accuracy": float(correct / total) if total > 0 else 0.0,
+            "n_action_samples": int(total),
+            "missed_brake_rate": float(missed_brake / brake_total) if brake_total > 0 else 0.0,
+            "n_brake_gt": int(brake_total),
+            "unsafe_continue_high_rate": float(unsafe_continue_high / highcrit_total) if highcrit_total > 0 else 0.0,
+            "n_highcrit_action_samples": int(highcrit_total),
+            "brake_mae_on_brake_gt": float(brake_mae_sum_on_brake_gt / brake_mae_count_on_brake_gt) if brake_mae_count_on_brake_gt > 0 else 0.0,
+            "n_brake_mae_samples": int(brake_mae_count_on_brake_gt),
+            "risk_level_accuracy": float(risk_correct / risk_total) if risk_total > 0 else 0.0,
+            "n_risk_samples": int(risk_total),
+            "bleu1_action": float(bleu_sum / max(1, total)) if total > 0 else 0.0,
+            "rougeL_f1_action": float(rouge_sum / max(1, total)) if total > 0 else 0.0,
+            "format_compliance_action": float(fmt_sum / max(1, total)) if total > 0 else 0.0,
+            "parse_ok_rate_action": float(parse_ok_sum / max(1, total)) if total > 0 else 0.0,
+        }
+        return metrics, outputs
+
+    is_multi_gpu_s2 = int(os.environ.get("WORLD_SIZE", "1")) > 1
+    if not hasattr(trainer, 'is_world_process_zero') or trainer.is_world_process_zero():
+        if not is_multi_gpu_s2:
+            logger.info("[STAGE 2 - R7] Computing metrics: oracle_caption...")
+            oracle_metrics, oracle_outputs = run_eval("oracle_caption")
+            logger.info(f"[STAGE 2 - R7] oracle_caption metrics: {oracle_metrics}")
+            _print_eval_risk_summary(oracle_outputs, "oracle_caption")
+
+            logger.info("[STAGE 2 - R7] Computing metrics: stage1_caption...")
+            stage1_metrics, stage1_outputs = run_eval("stage1_caption")
+            logger.info(f"[STAGE 2 - R7] stage1_caption metrics: {stage1_metrics}")
+            _print_eval_risk_summary(stage1_outputs, "stage1_caption")
+
+            eval_metrics: Dict = {}
+            if isinstance(raw_eval, dict):
+                for k, v in raw_eval.items():
+                    try:
+                        eval_metrics[k] = float(v)
+                    except Exception:
+                        eval_metrics[k] = v
+            eval_metrics["oracle_caption"] = oracle_metrics
+            eval_metrics["stage1_caption"] = stage1_metrics
+
+            metrics_path = os.path.join(STAGE2_OUTPUT_DIR, "eval_metrics.json")
+            with open(metrics_path, "w") as f:
+                json.dump(eval_metrics, f, indent=2)
+            logger.info(f"[STAGE 2 - R7] Saved eval metrics to {metrics_path}")
+
+            with open(os.path.join(STAGE2_OUTPUT_DIR, "val_predictions_oracle_caption.json"), "w") as f:
+                json.dump(oracle_outputs, f, indent=2)
+            with open(os.path.join(STAGE2_OUTPUT_DIR, "val_predictions_stage1_caption.json"), "w") as f:
+                json.dump(stage1_outputs, f, indent=2)
+        else:
+            logger.info(
+                "[STAGE 2 - R7] Multi-GPU mode — skipping in-training eval/predictions. "
+                f"Run 'python eval_stage2.py --run {cfg.RUN_ID}' for full val predictions + metrics."
+            )
+
+    logger.info("[STAGE 2 - R7] Done.\n" + "=" * 80)
+    return model_stage2
+
+
+# ---------------------------
 # Stage 2 entry point (dispatch)
 # ---------------------------
 
 def train_stage2(model_stage1, tokenizer, qa_path: str):
+    # R7 v2: when USE_STAGE2_VECTOR_PREFIX=True, build a fresh VectorPrefixT5
+    # for Stage 2 alongside the Stage 1 caption channel. Takes precedence
+    # over the older USE_VECTOR_PREFIX-only dispatch.
+    if getattr(cfg, "USE_STAGE2_VECTOR_PREFIX", False):
+        return _train_stage2_with_vector_prefix(model_stage1, tokenizer, qa_path)
     if cfg.USE_VECTOR_PREFIX:
         return _train_stage2_with_lora(model_stage1, tokenizer, qa_path)
     else:

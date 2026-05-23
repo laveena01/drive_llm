@@ -161,6 +161,19 @@ USE_CONTINUOUS_ACTIONS = True
 CONTINUOUS_BRAKE_MAX = 90   # matches current bucketed ceiling
 CONTINUOUS_ACCEL_MAX = 20   # matches current bucketed ceiling
 
+# R7 v2: Direct Vector Prefix to Stage 2.
+# When True, Stage 2 is trained as a `VectorPrefixT5` (its own independent
+# vector encoder + T5) instead of plain `AutoModelForSeq2SeqLM`. The model
+# consumes BOTH the Stage 1 caption (as text input) AND a direct vector
+# prefix (injected at the embedding level). Stage 1 architecture is
+# unchanged — its caption stays in the inference path, preserving the
+# two-stage interpretability story. See plan: "Direct Vector Prefix to
+# Stage 2 (R7 v2)".
+#
+# This flag is independent of `USE_VECTOR_PREFIX` (which gates Stage 1).
+# R7 v2 stack: USE_VECTOR_PREFIX=True (Stage 1) + USE_STAGE2_VECTOR_PREFIX=True (Stage 2).
+USE_STAGE2_VECTOR_PREFIX = True
+
 # Whether to freeze base FLAN-T5 weights (False = full fine-tuning, like the paper)
 FREEZE_BASE_MODEL = False
 
