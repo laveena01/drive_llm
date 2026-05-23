@@ -46,7 +46,11 @@ from llm_driving.eval_extras import (
     extract_hard_cases,
 )
 from llm_driving.logging_utils import setup_logging
-from llm_driving.lora_utils import load_checkpoint as load_stage1_checkpoint
+from llm_driving.lora_utils import load_checkpoint as load_vp_checkpoint
+# Backward-compat alias — eval_stage2 historically used this name for the
+# Stage 1 loader. Under R7 v2, the same function also loads Stage 2 when
+# `USE_STAGE2_VECTOR_PREFIX=True`.
+load_stage1_checkpoint = load_vp_checkpoint
 from llm_driving.training import (
     _build_stage2_prompt_from_caption,
     _ensure_paper_format,
@@ -91,6 +95,26 @@ def _parse_args() -> argparse.Namespace:
         "--skip_risk_masked",
         action="store_true",
         help="Skip the risk_masked_caption evaluation pass (Step 5-lite ablation column).",
+    )
+    # R7 v2 caption-ablation modes (Stage 1 necessity test, plan section
+    # "Stage 1 necessity test — E0-E3 caption ablation"). E0 is identical to
+    # `oracle_caption` so it's not a separate flag. E1/E2/E3 only run when
+    # Stage 2 is VectorPrefixT5 (USE_STAGE2_VECTOR_PREFIX=True); for plain
+    # Stage 2 they're a no-op (vectors aren't consumed) and are skipped.
+    p.add_argument(
+        "--skip_e1",
+        action="store_true",
+        help="Skip E1 (vectors + EMPTY caption + risk + question) ablation pass.",
+    )
+    p.add_argument(
+        "--skip_e2",
+        action="store_true",
+        help="Skip E2 (EMPTY vectors + caption + risk + question) ablation pass.",
+    )
+    p.add_argument(
+        "--skip_e3",
+        action="store_true",
+        help="Skip E3 (EMPTY vectors + EMPTY caption + risk + question) floor.",
     )
     p.add_argument(
         "--shard_idx",
@@ -156,8 +180,29 @@ def main() -> None:
         logger.info(f"[EVAL2] Sharding     : shard {args.shard_idx} of {args.num_shards}")
 
     # --- Load Stage 2 (action model) + tokenizer ---
-    tokenizer = AutoTokenizer.from_pretrained(stage2_dir)
-    model_stage2 = AutoModelForSeq2SeqLM.from_pretrained(stage2_dir).to(device)
+    # R7 v2 branch: when Stage 2 was trained as VectorPrefixT5, load via
+    # lora_utils.load_checkpoint (recovers vector_encoder.pt + T5 weights).
+    # Plain-T5 Stage 2 (legacy) still uses AutoModelForSeq2SeqLM.
+    stage2_is_vp = bool(getattr(cfg, "USE_STAGE2_VECTOR_PREFIX", False))
+    # R7 saves to stage2/best_checkpoint/; older runs save tokenizer + safetensors
+    # directly under stage2/. Prefer best_checkpoint when it exists for tokenizer too.
+    stage2_ckpt_for_load = os.path.join(stage2_dir, "best_checkpoint")
+    if not os.path.isdir(stage2_ckpt_for_load):
+        stage2_ckpt_for_load = stage2_dir
+    tokenizer = AutoTokenizer.from_pretrained(stage2_ckpt_for_load)
+    if stage2_is_vp:
+        logger.info(
+            "[EVAL2] USE_STAGE2_VECTOR_PREFIX=True — loading Stage 2 as VectorPrefixT5 "
+            f"from {stage2_ckpt_for_load}"
+        )
+        model_stage2 = load_vp_checkpoint(
+            model_name=cfg.MODEL_NAME,
+            checkpoint_dir=stage2_ckpt_for_load,
+            device=device,
+            apply_lora_config=False,  # R7 v2 trains full FT, not LoRA
+        )
+    else:
+        model_stage2 = AutoModelForSeq2SeqLM.from_pretrained(stage2_dir).to(device)
     model_stage2.eval()
     logger.info("[EVAL2] Stage 2 model loaded.")
 
@@ -212,20 +257,70 @@ def main() -> None:
         logger.info(f"[EVAL2] Total samples: {full_ds_len} | Val: {len(eval_ds)}")
 
     # --- Helpers ---
-    def _gen_text_s2(prompt: str, max_new_tokens: int, ensure_paper: bool) -> str:
+    def _vectors_from_sample(sample: Dict) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Build (vectors, num_objects) tensors of shape (1, M, D) / (1,).
+        Falls back to parse_vec_str if raw `vectors` is missing."""
+        if sample.get("vectors"):
+            vectors = sample["vectors"]
+            n = int(sample.get("num_objects", sample.get("use_n", 0)))
+        else:
+            vec_str = sample.get("vec_str", "")
+            vectors_arr, n = parse_vec_str(vec_str, cfg.MAX_OBJECTS, cfg.VECTOR_DIM)
+            vectors = vectors_arr.tolist()
+        return (
+            torch.tensor([vectors], dtype=torch.float32),
+            torch.tensor([n], dtype=torch.long),
+        )
+
+    def _empty_vectors() -> Tuple[torch.Tensor, torch.Tensor]:
+        """Zero-filled vectors with num_objects=0 — used for E2/E3 ablation."""
+        return (
+            torch.zeros(1, cfg.MAX_OBJECTS, cfg.VECTOR_DIM, dtype=torch.float32),
+            torch.zeros(1, dtype=torch.long),
+        )
+
+    def _gen_text_s2(
+        prompt: str,
+        max_new_tokens: int,
+        ensure_paper: bool,
+        vectors_t: torch.Tensor = None,
+        num_obj_t: torch.Tensor = None,
+    ) -> str:
+        """Run Stage 2 generation. Under R7 v2 (`stage2_is_vp=True`) the
+        VectorPrefixT5 also receives per-sample vectors via prefix injection;
+        if no override is provided the caller is responsible for passing the
+        sample's real vectors. Plain-T5 path ignores vector kwargs."""
         if ensure_paper:
             prompt = _ensure_paper_format(prompt)
         inputs = tokenizer(
-            prompt, return_tensors="pt", max_length=384, truncation=True
+            prompt, return_tensors="pt", max_length=cfg.STAGE2_MAX_INPUT_LEN,
+            truncation=True,
         ).to(device)
-        pred_ids = model_stage2.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            num_beams=cfg.GEN_NUM_BEAMS,
-            early_stopping=cfg.GEN_EARLY_STOPPING,
-            no_repeat_ngram_size=cfg.GEN_NO_REPEAT_NGRAM_SIZE,
-            repetition_penalty=cfg.GEN_REPETITION_PENALTY,
-        )
+        if stage2_is_vp:
+            if vectors_t is None or num_obj_t is None:
+                raise ValueError(
+                    "[EVAL2] VectorPrefixT5 Stage 2 requires vectors_t + num_obj_t at generate-time."
+                )
+            pred_ids = model_stage2.generate(
+                input_ids=inputs["input_ids"],
+                attention_mask=inputs["attention_mask"],
+                vectors=vectors_t.to(device),
+                num_objects=num_obj_t.to(device),
+                max_new_tokens=max_new_tokens,
+                num_beams=cfg.GEN_NUM_BEAMS,
+                early_stopping=cfg.GEN_EARLY_STOPPING,
+                no_repeat_ngram_size=cfg.GEN_NO_REPEAT_NGRAM_SIZE,
+                repetition_penalty=cfg.GEN_REPETITION_PENALTY,
+            )
+        else:
+            pred_ids = model_stage2.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                num_beams=cfg.GEN_NUM_BEAMS,
+                early_stopping=cfg.GEN_EARLY_STOPPING,
+                no_repeat_ngram_size=cfg.GEN_NO_REPEAT_NGRAM_SIZE,
+                repetition_penalty=cfg.GEN_REPETITION_PENALTY,
+            )
         return tokenizer.decode(pred_ids[0], skip_special_tokens=True)
 
     def _gen_caption_from_vectors(sample: Dict) -> str:
@@ -328,7 +423,14 @@ def main() -> None:
             pred_brake_pct: float | None = None
 
             try:
+                # Default vector channel: under R7 use the sample's real
+                # vectors; under plain-T5 these are unused.
+                vectors_t, num_obj_t = (None, None)
+                if stage2_is_vp:
+                    vectors_t, num_obj_t = _vectors_from_sample(sample)
+
                 if mode == "oracle_caption":
+                    # R7 E0 equivalent — full prompt + real vectors.
                     stage2_prompt = raw_input_text
                     caption_used = None
                 elif mode == "risk_masked_caption":
@@ -346,7 +448,47 @@ def main() -> None:
                         qa_question=question,
                         question_type=qtype,
                     )
+                elif mode == "e1_vectors_only":
+                    # R7 v2 caption ablation: real vectors + EMPTY caption.
+                    # Measures whether Stage 2 can produce correct actions
+                    # from the vector channel alone. If E1 ≈ oracle_caption,
+                    # caption is being ignored under R7 → reframe Stage 1 as
+                    # interpretability-only hook in the thesis.
+                    caption_used = ""
+                    stage2_prompt = _build_stage2_prompt_from_caption(
+                        "",
+                        risk_text=risk_text,
+                        qa_question=question,
+                        question_type=qtype,
+                    )
+                elif mode == "e2_caption_only":
+                    # R7 v2 caption ablation: oracle caption + EMPTY vectors.
+                    # Measures whether the vector channel is being used at
+                    # all. If E2 ≈ oracle_caption, the vector prefix is
+                    # wasted compute (caption alone is sufficient).
+                    oracle_cap = sample.get("oracle_caption_debug", "") or ""
+                    caption_used = oracle_cap
+                    stage2_prompt = _build_stage2_prompt_from_caption(
+                        oracle_cap,
+                        risk_text=risk_text,
+                        qa_question=question,
+                        question_type=qtype,
+                    )
+                    vectors_t, num_obj_t = _empty_vectors()
+                elif mode == "e3_risk_only":
+                    # R7 v2 caption ablation: EMPTY vectors + EMPTY caption.
+                    # Risk-text-only floor — what the model can do from the
+                    # `### RISK` line plus the question alone.
+                    caption_used = ""
+                    stage2_prompt = _build_stage2_prompt_from_caption(
+                        "",
+                        risk_text=risk_text,
+                        qa_question=question,
+                        question_type=qtype,
+                    )
+                    vectors_t, num_obj_t = _empty_vectors()
                 else:
+                    # mode == "stage1_caption"
                     caption_pred = _gen_caption_from_vectors(sample)
                     caption_used = caption_pred
                     stage2_prompt = _build_stage2_prompt_from_caption(
@@ -360,6 +502,8 @@ def main() -> None:
                     stage2_prompt,
                     max_new_tokens=cfg.GEN_MAX_NEW_TOKENS_STAGE2,
                     ensure_paper=(qtype == "action"),
+                    vectors_t=vectors_t,
+                    num_obj_t=num_obj_t,
                 )
 
                 if qtype == "action":
@@ -566,6 +710,30 @@ def main() -> None:
         combined_metrics["risk_masked_caption"] = _finalize_mode(
             "risk_masked_caption", rm_metrics, rm_outputs
         )
+
+    # --- R7 v2 caption-ablation passes (E1/E2/E3) ---
+    # Only meaningful when Stage 2 is VectorPrefixT5: E2/E3 zero out the
+    # vector channel. Skipping these on plain-T5 Stage 2 because vectors
+    # are not consumed (E2 == oracle, E3 == risk_masked).
+    if stage2_is_vp:
+        ablation_modes = [
+            ("e1_vectors_only", args.skip_e1, "E1 (vectors + EMPTY caption)"),
+            ("e2_caption_only", args.skip_e2, "E2 (EMPTY vectors + caption)"),
+            ("e3_risk_only",    args.skip_e3, "E3 (EMPTY vectors + EMPTY caption)"),
+        ]
+        for mode_name, skip_flag, desc in ablation_modes:
+            if skip_flag:
+                logger.info(f"[EVAL2] Skipping {desc} (--skip_{mode_name.split('_')[0]} set)")
+                continue
+            logger.info(f"[EVAL2] Running {desc} pass...")
+            m_metrics, m_outputs = run_eval(mode_name)
+            logger.info(f"[EVAL2] {mode_name} metrics: {m_metrics}")
+            _print_eval_risk_summary(m_outputs, mode_name)
+            preds_path = os.path.join(stage2_dir, _pred_filename(mode_name))
+            with open(preds_path, "w") as f:
+                json.dump(_strip_vectors_for_preds(m_outputs), f, indent=2)
+            logger.info(f"[EVAL2] Wrote {len(m_outputs)} {mode_name} preds to {preds_path}")
+            combined_metrics[mode_name] = _finalize_mode(mode_name, m_metrics, m_outputs)
 
     # --- Merge + write eval_metrics.json ---
     # Sharded mode: write shard-local metrics to eval_metrics_shard{i}.json.
