@@ -7,8 +7,8 @@ from datetime import datetime
 # -----------------------------
 # nuScenes
 # -----------------------------
-NUSC_ROOT = "/u/student/2024/cs24mtech14014/nuscenes"
-# NUSC_VERSION = "v1.0-mini"          # later: "v1.0-trainval"
+#NUSC_ROOT = "/u/student/2024/cs24mtech14014/nuscenes"
+#NUSC_VERSION = "v1.0-mini"          # later: "v1.0-trainval"
 
 NUSC_ROOT = "/u/student/2024/cs24mtech14014/data/nuscenes"
 NUSC_VERSION = "v1.0-trainval"
@@ -83,7 +83,7 @@ VECTOR_ENCODER_CONFIG = dict(
 #
 # When False, the data path produces single-frame samples (legacy behaviour
 # bit-for-bit) — useful as the K=1 ablation row for the thesis table.
-USE_TEMPORAL = False
+USE_TEMPORAL = True
 TEMPORAL_WINDOW = 4
 TEMPORAL_TRANSFORMER_LAYERS = 2
 TEMPORAL_TRANSFORMER_HEADS = 4
@@ -94,7 +94,7 @@ TEMPORAL_TRANSFORMER_DROPOUT = 0.1
 # object across all K frames). When False, falls back to Step 2's
 # sort-by-distance per-frame slotting (the buggy behaviour that produced
 # null results — kept for ablation parity).
-USE_TRACKED_TEMPORAL = False
+USE_TRACKED_TEMPORAL = True
 
 # Step 4: when True, the dataset builder adds an extra "action_future"
 # question per frame whose target is computed from the H-frame look-ahead
@@ -116,7 +116,7 @@ ACTION_FUTURE_LOSS_WEIGHT = 3.0
 # for the top-3 closest objects. Without this, Stage 1 captioning targets
 # don't reward encoding temporal info into text, so the temporal signal in
 # Stage 1's encoder gets discarded at the caption boundary.
-USE_TEMPORAL_CAPTIONS = False
+USE_TEMPORAL_CAPTIONS = True
 TEMPORAL_CAPTION_TOP_N = 3
 
 # Ablation flag: when False, the `### RISK\n<risk_text>` block is stripped
@@ -190,7 +190,7 @@ VECTOR_ENCODER_CONFIG.update(dict(
 # turning the internal multi-dim risk score (N1) into an output-side
 # contribution. Forces Stage 2 to internalize the per-component
 # breakdown that drives the oracle, not just the aggregate risk_level.
-USE_RISK_DECOMP_OUTPUT = True
+USE_RISK_DECOMP_OUTPUT = False
 
 # Whether to freeze base FLAN-T5 weights (False = full fine-tuning, like the paper)
 FREEZE_BASE_MODEL = False
